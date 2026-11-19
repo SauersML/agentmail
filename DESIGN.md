@@ -182,7 +182,7 @@ Visibility:
 
 Differences from the old server:
 
-- `who`/`/api/names` lists names from replicated senders plus local callers. A reader that never sends is known
+- `who`/`/api/names` lists every member-list name, plus replicated senders and local callers. A non-member reader that never sends is known
   only to its own node.
 - Message JSON has extra fields: `env` (the envelope id), `mode`, and `imported`.
 
