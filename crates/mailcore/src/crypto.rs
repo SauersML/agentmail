@@ -97,11 +97,22 @@ pub fn seal_det(plain: &[u8], ad: &[u8], recipients: &[PublicKey], det: Option<[
 
 /// Opens the body with `me`'s key if one of the wraps is for it. `Ok(None)`: not addressed to this key.
 pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<Vec<u8>>> {
+    let Some(mut ck) = content_key(epk, keys, me)? else { return Ok(None) };
+    let plain = decrypt(ciphertext, ad, &ck);
+    ck.zeroize();
+    Ok(Some(plain?))
+}
+
+/// The content key, if one of the wraps is for `me`.
+pub fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
     let my_pub = me.public();
     let Some(w) = keys.iter().find(|w| w.to == my_pub) else { return Ok(None) };
-    if ciphertext.len() < 24 + 16 {
-        bail!("ciphertext too short");
-    }
+    unwrap(epk, &w.k, me).map(Some)
+}
+
+/// Unwraps one wrap made for `me` under ephemeral key `epk`.
+pub fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
+    let my_pub = me.public();
     let sk = me.x25519_secret();
     let shared = sk.diffie_hellman(&XPublic::from(*epk));
     if !shared.was_contributory() {
@@ -110,16 +121,37 @@ pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: 
     let rx = XPublic::from(&sk).to_bytes();
     let mut wk = wrap_key(epk, &rx, shared.as_bytes());
     let ck = ChaCha20Poly1305::new((&wk).into())
-        .decrypt(&[0u8; 12].into(), Payload { msg: &w.k, aad: &my_pub })
+        .decrypt(&[0u8; 12].into(), Payload { msg: k, aad: &my_pub })
         .map_err(|_| anyhow!("key unwrap failed"));
     wk.zeroize();
-    let mut ck: [u8; 32] = ck?.try_into().map_err(|_| anyhow!("bad content key"))?;
+    ck?.try_into().map_err(|_| anyhow!("bad content key"))
+}
+
+/// A fresh wrap of `ck` for one more recipient (a node that joined after the envelope was written): (epk, wrapped).
+pub fn wrap_for(ck: &[u8; 32], recipient: &PublicKey) -> Result<([u8; 32], Vec<u8>)> {
+    let esk = StaticSecret::from(crate::random_bytes::<32>());
+    let epk = XPublic::from(&esk).to_bytes();
+    let rx = x25519_public(recipient)?;
+    let shared = esk.diffie_hellman(&XPublic::from(rx));
+    if !shared.was_contributory() {
+        bail!("recipient key is low order");
+    }
+    let mut wk = wrap_key(&epk, &rx, shared.as_bytes());
+    let k = ChaCha20Poly1305::new((&wk).into())
+        .encrypt(&[0u8; 12].into(), Payload { msg: ck, aad: recipient })
+        .map_err(|_| anyhow!("wrap failed"));
+    wk.zeroize();
+    Ok((epk, k?))
+}
+
+pub fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
+    if ciphertext.len() < 24 + 16 {
+        bail!("ciphertext too short");
+    }
     let (nonce, body) = ciphertext.split_at(24);
-    let plain = XChaCha20Poly1305::new((&ck).into())
+    XChaCha20Poly1305::new(ck.into())
         .decrypt(nonce.into(), Payload { msg: body, aad: ad })
-        .map_err(|_| anyhow!("body decrypt failed"));
-    ck.zeroize();
-    Ok(Some(plain?))
+        .map_err(|_| anyhow!("body decrypt failed"))
 }
 
 const BLOB_AD: &[u8] = b"agent-mail/blob/v1";
@@ -176,5 +208,11 @@ mod tests {
         let mut keys = s.keys.clone();
         keys[0].to = c.public();
         assert!(open(&s.ciphertext, b"hdr", &s.epk, &keys, &c).is_err());
+        // A later grant: a re-wraps the content key for c, and c opens with it; b cannot use c's grant.
+        let ck = content_key(&s.epk, &s.keys, &a).unwrap().unwrap();
+        let (epk2, k2) = wrap_for(&ck, &c.public()).unwrap();
+        let ck2 = unwrap(&epk2, &k2, &c).unwrap();
+        assert_eq!(decrypt(&s.ciphertext, b"hdr", &ck2).unwrap(), b"hello");
+        assert!(unwrap(&epk2, &k2, &b).is_err());
     }
 }

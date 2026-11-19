@@ -2,7 +2,8 @@
 //! anti-entropy (a small request/response protocol on its own ALPN) runs with each member node on every gossip
 //! NeighborUp and every `sync_secs`: exchange member lists (the newest operator-signed one wins), compare per-day hashes
 //! of envelope-id sets, list ids of the days that differ, fetch the missing envelopes, then fetch attachment blobs
-//! referenced by stored envelopes and not yet here. Only member nodes may connect at all (an after-handshake hook
+//! referenced by stored envelopes and not yet here, then ask for grants (the content key re-wrapped for this node) for
+//! members-mode envelopes written before this node joined the list. Only member nodes may connect at all (an after-handshake hook
 //! checks the current member list), since envelopes carry sender tokens.
 
 use std::collections::BTreeMap;
@@ -33,6 +34,7 @@ const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 const MAX_RESP: usize = 64 << 20;
 const IDS_PER_GET: usize = 200;
+const GRANTS_PER_CALL: usize = 500;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +44,8 @@ enum Req {
     Get { ids: Vec<String> },
     Members,
     Blob { id: String },
+    /// Content keys re-wrapped for the asking node, for members-mode envelopes it stored before it joined.
+    Grants { ids: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -56,6 +60,8 @@ struct Resp {
     members: Option<MemberList>,
     #[serde(default)]
     blob: Option<String>,
+    #[serde(default)]
+    grants: BTreeMap<String, mailcore::envelope::Grant>,
 }
 
 /// Rejects every connection (both directions) from or to a key that is not a node on the current member list.
@@ -89,8 +95,9 @@ impl ProtocolHandler for SyncProto {
                 Err(_) => return Ok(()),
             };
             let node = self.node.clone();
+            let peer = *conn.remote_id().as_bytes();
             let req = recv.read_to_end(MAX_REQ).await.map_err(AcceptError::from_err)?;
-            let resp = tokio::task::spawn_blocking(move || answer(&node, &req))
+            let resp = tokio::task::spawn_blocking(move || answer(&node, &peer, &req))
                 .await
                 .map_err(AcceptError::from_err)?
                 .map_err(|e| AcceptError::from_boxed(e.into()))?;
@@ -106,7 +113,8 @@ impl std::fmt::Debug for Node {
     }
 }
 
-fn answer(node: &Node, req: &[u8]) -> Result<Vec<u8>> {
+/// `peer`: the asking node's key (its iroh endpoint id is its Ed25519 node key).
+fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
     let req: Req = serde_json::from_slice(req).context("bad sync request")?;
     let mut r = Resp::default();
     match req {
@@ -123,6 +131,10 @@ fn answer(node: &Node, req: &[u8]) -> Result<Vec<u8>> {
         }
         Req::Members => r.members = Some(node.members.read().unwrap().clone()),
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
+        Req::Grants { ids } => {
+            let ids: Vec<String> = ids.into_iter().take(GRANTS_PER_CALL).collect();
+            r.grants = node.grants_for(&ids, peer)?;
+        }
     }
     Ok(serde_json::to_vec(&r)?)
 }
@@ -235,6 +247,22 @@ impl Ctx {
                     }
                     _ => tracing::warn!("blob {} from {} does not match its id", &id[..12], peer.fmt_short()),
                 }
+            }
+        }
+        // Members-mode mail written before this node joined was not wrapped for it: ask for grants.
+        let unreadable = node.store.unreadable(GRANTS_PER_CALL)?;
+        if !unreadable.is_empty() {
+            let grants = call(&conn, &Req::Grants { ids: unreadable }).await?.grants;
+            let mut opened = 0;
+            for (id, g) in &grants {
+                match node.apply_grant(id, g) {
+                    Ok(true) => opened += 1,
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!("grant for {} from {} refused: {e:#}", &id[..12.min(id.len())], peer.fmt_short()),
+                }
+            }
+            if opened > 0 {
+                tracing::info!("{} bodies opened with grants from {}", opened, peer.fmt_short());
             }
         }
         conn.close(0u32.into(), b"done");

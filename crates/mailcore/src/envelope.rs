@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 use crate::crypto::{self, Wrapped};
 use crate::keys::{self, fmt_key, parse_key, PublicKey, Seed};
@@ -85,6 +86,13 @@ pub fn post_digest(salt: &[u8], text: &str, blob_ids: &[String]) -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WrappedKey {
     pub to: String,
+    pub k: String,
+}
+
+/// The content key of one envelope wrapped for a node that joined later (see `Envelope::grant`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Grant {
+    pub epk: String,
     pub k: String,
 }
 
@@ -227,6 +235,36 @@ impl Envelope {
             None => Ok(None),
             Some(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
         }
+    }
+
+    fn parts(&self) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
+        let ct = b64u_decode(&self.ciphertext).ok_or_else(|| anyhow!("bad ciphertext"))?;
+        let epk: [u8; 32] =
+            b64u_decode(&self.epk).and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad epk"))?;
+        Ok((ct, epk, header_ad(self.v, &self.thread, &self.from, &self.to, self.mode, &self.ts)))
+    }
+
+    /// A grant: the content key re-wrapped by `me` (who can open the envelope) for `to`, a node that joined after it
+    /// was written. `None` if `me` cannot open it. Grants travel outside the envelope; a wrong one just fails to open.
+    pub fn grant(&self, me: &Seed, to: &PublicKey) -> Result<Option<Grant>> {
+        let (_, epk, _) = self.parts()?;
+        let Some(mut ck) = crypto::content_key(&epk, &self.wraps()?, me)? else { return Ok(None) };
+        let r = crypto::wrap_for(&ck, to);
+        ck.zeroize();
+        let (gepk, k) = r?;
+        Ok(Some(Grant { epk: b64u(&gepk), k: b64u(&k) }))
+    }
+
+    /// Opens the body with a grant made for `me`. The body AEAD (header as AD, ciphertext hashed into the id the node
+    /// signed) authenticates the result whoever made the grant.
+    pub fn open_grant(&self, g: &Grant, me: &Seed) -> Result<Body> {
+        let (ct, _, ad) = self.parts()?;
+        let gepk: [u8; 32] = b64u_decode(&g.epk).and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad grant epk"))?;
+        let k = b64u_decode(&g.k).ok_or_else(|| anyhow!("bad grant key"))?;
+        let mut ck = crypto::unwrap(&gepk, &k, me)?;
+        let plain = crypto::decrypt(&ct, &ad, &ck);
+        ck.zeroize();
+        Ok(serde_json::from_slice(&plain?)?)
     }
 
     /// Everything a receiver checks before storing: shape, id, the node's signature and membership, and the sender's
@@ -461,6 +499,13 @@ mod tests {
         let (a, b) = (mk(), mk());
         assert_eq!(a.id, b.id);
         assert_eq!(a.open(&w.alice).unwrap().unwrap().text, "old mail");
+        // A node that joined later reads it through a grant from one that can.
+        let late = Seed::generate();
+        assert!(a.open(&late).unwrap().is_none());
+        let g = a.grant(&w.alice, &late.public()).unwrap().unwrap();
+        assert_eq!(a.open_grant(&g, &late).unwrap().text, "old mail");
+        assert!(a.open_grant(&g, &w.alice).is_err());
+        assert!(a.grant(&late, &w.alice.public()).unwrap().is_none());
     }
 
     fn tok(w: &World, name: &str) -> String {

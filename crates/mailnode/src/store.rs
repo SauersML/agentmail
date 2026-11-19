@@ -536,6 +536,21 @@ impl Store {
     }
 
     /// Blob ids some stored envelope references that this node does not hold yet.
+    /// Members-mode envelopes stored without a readable body (written before this node was on the member list).
+    pub fn unreadable(&self, limit: usize) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' ORDER BY id LIMIT ?")?;
+        let out = st.query_map([limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(out)
+    }
+
+    /// Fills in the body of a row stored unreadable (after a grant). False if it already had one.
+    pub fn set_body(&self, env_id: &str, text: &str, files: &str) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let n = db.execute("UPDATE messages SET text = ?, files = ? WHERE env_id = ? AND text IS NULL", (text, files, env_id))?;
+        Ok(n > 0)
+    }
+
     pub fn missing_blobs(&self) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare("SELECT blobs FROM messages WHERE blobs != '[]'")?;

@@ -2,12 +2,12 @@
 //! announce), accept a replicated envelope (verify, decrypt if we can, store), and the old server's read-side rules
 //! (names, reaches, addressed rows, message formatting).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use mailcore::addr::{self, addressed_to, is_broadcast, norm};
-use mailcore::envelope::Draft;
+use mailcore::envelope::{Draft, Grant};
 use mailcore::keys::Seed;
 use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode, TokenPolicy};
 use serde_json::{json, Value};
@@ -473,6 +473,34 @@ impl Node {
         let row = Arc::new(row);
         let _ = self.events.send(row.clone());
         Ok(Some(row))
+    }
+
+    /// Grants for a node that joined later: members-mode envelopes only (private mail stays with its recipients), and
+    /// only to a node on the current member list.
+    pub fn grants_for(&self, ids: &[String], to: &mailcore::keys::PublicKey) -> Result<BTreeMap<String, Grant>> {
+        let mut out = BTreeMap::new();
+        if !self.members.read().unwrap().is_node(to) {
+            return Ok(out);
+        }
+        for raw in self.store.envelopes(ids)? {
+            let env: Envelope = serde_json::from_str(&raw)?;
+            if env.mode == Mode::Members {
+                if let Ok(Some(g)) = env.grant(&self.seed, to) {
+                    out.insert(env.id.clone(), g);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fills in a body this node could not read, from a grant. True if the row is readable now.
+    pub fn apply_grant(&self, id: &str, g: &Grant) -> Result<bool> {
+        let Some(raw) = self.store.envelopes(&[id.to_string()])?.pop() else { return Ok(false) };
+        let env: Envelope = serde_json::from_str(&raw)?;
+        let body = env.open_grant(g, &self.seed)?;
+        env.check_body(&body)?;
+        let text: String = body.text.chars().take(MAX_TEXT as usize).collect();
+        self.store.set_body(id, &text, &serde_json::to_string(&body.files)?)
     }
 
     /* Names */
