@@ -65,15 +65,41 @@ pub struct Posted {
     pub repeated: bool,
 }
 
+/// What goes out on the gossip topic from the API side (member lists are announced by the network task).
+pub enum Outbound {
+    Envelope(Envelope),
+}
+
+/// Node settings beyond the store and keys.
+#[derive(Default)]
+pub struct Opts {
+    pub identities: Vec<(String, Seed)>,
+    pub renamed: Vec<Renamed>,
+    /// Refuse envelopes attested only by a replicated aid1 token (once clients sign with their own keys).
+    pub refuse_token_only: bool,
+    /// New (non-imported) mail is numbered from here up; old-server numbers below it stay free for imports.
+    pub id_floor: i64,
+    /// Bridge key and the token sub allowed to import through this node.
+    pub bridge: Option<(Seed, String)>,
+    /// Where the latest adopted member list is kept.
+    pub members_path: Option<std::path::PathBuf>,
+    /// Base URL written into attachment links.
+    pub public_url: String,
+}
+
+pub const MAX_FILE: usize = 25 * 1024 * 1024;
+pub const MAX_FILES: usize = 10;
+const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
+
 pub struct Node {
     pub store: Store,
     pub members: RwLock<MemberList>,
+    pub operator: mailcore::keys::PublicKey,
     pub policy: TokenPolicy,
     pub seed: Seed,
-    pub identities: Vec<(String, Seed)>,
-    pub renamed: Vec<Renamed>,
+    pub opts: Opts,
     pub events: broadcast::Sender<Arc<Row>>,
-    pub outbound: mpsc::UnboundedSender<Envelope>,
+    pub outbound: mpsc::UnboundedSender<Outbound>,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
 }
@@ -82,25 +108,51 @@ impl Node {
     pub fn new(
         store: Store,
         members: MemberList,
+        operator: mailcore::keys::PublicKey,
         policy: TokenPolicy,
         seed: Seed,
-        identities: Vec<(String, Seed)>,
-        renamed: Vec<Renamed>,
-        outbound: mpsc::UnboundedSender<Envelope>,
+        opts: Opts,
+        outbound: mpsc::UnboundedSender<Outbound>,
     ) -> Node {
         let (events, _) = broadcast::channel(4096);
         Node {
             store,
             members: RwLock::new(members),
+            operator,
             policy,
             seed,
-            identities,
-            renamed,
+            opts,
             events,
             outbound,
             rates: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn members_seq(&self) -> u64 {
+        self.members.read().unwrap().seq
+    }
+
+    /// Adopts `list` if it is signed by the pinned operator, for this network, and newer than ours. Returns whether
+    /// it was adopted (the caller re-announces it and updates peers).
+    pub fn adopt_members(&self, list: &MemberList) -> Result<bool> {
+        list.verify(&self.operator)?;
+        let mut cur = self.members.write().unwrap();
+        if list.network != cur.network || list.seq <= cur.seq {
+            return Ok(false);
+        }
+        *cur = list.clone();
+        drop(cur);
+        for m in &list.members {
+            let _ = self.store.seen(&m.name, &m.sub, 0);
+        }
+        if let Some(p) = &self.opts.members_path {
+            let tmp = p.with_extension("tmp");
+            std::fs::write(&tmp, serde_json::to_string_pretty(list)?)?;
+            std::fs::rename(&tmp, p)?;
+        }
+        tracing::info!("adopted member list seq {} ({} members, {} nodes)", list.seq, list.members.len(), list.nodes.len());
+        Ok(true)
     }
 
     /* Identity */
@@ -153,8 +205,21 @@ impl Node {
     /* Writing */
 
     pub fn post(&self, who: &Caller, body: &Value) -> Result<Posted, ApiError> {
-        if body.get("files").is_some_and(|f| !f.is_null() && f.as_array().is_none_or(|a| !a.is_empty())) {
-            return Err(ApiError::new(400, "attachments are not supported by mailnode yet (phase 2); send text only"));
+        let bad_files = || ApiError::new(400, format!("files must be a list of at most {MAX_FILES} file ids from POST /api/files"));
+        let file_ids: Vec<String> = match body.get("files") {
+            None | Some(Value::Null) => vec![],
+            Some(Value::Array(a)) if a.len() <= MAX_FILES => {
+                a.iter().map(|x| x.as_str().map(|s| s.to_string()).ok_or_else(bad_files)).collect::<Result<_, _>>()?
+            }
+            _ => return Err(bad_files()),
+        };
+        let mut files = Vec::new();
+        for id in &file_ids {
+            let f = self
+                .store
+                .find_file(id, &who.name, &who.sub)?
+                .ok_or_else(|| ApiError::new(400, format!("unknown file id {}", id.chars().take(40).collect::<String>())))?;
+            files.push(f);
         }
         let to_v = body.get("to");
         if to_v.is_none() || to_v == Some(&Value::Null) || to_v == Some(&json!("")) {
@@ -167,17 +232,19 @@ impl Node {
         let thread = field(body.get("thread").unwrap_or(&json!("general")), "thread", |s| {
             !s.chars().any(|c| c.is_control())
         })?;
-        let text = clean_text(body.get("text"))?;
+        let text = clean_text(body.get("text"), !files.is_empty())?;
         let mode = match body.get("mode").and_then(|m| m.as_str()) {
             None | Some("members") => Mode::Members,
             Some("private") => Mode::Private,
             Some(_) => return Err(ApiError::new(400, "mode must be members or private")),
         };
         let since = ts_from_millis(now_millis() - REPEAT_MS);
-        if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)? {
-            if row.mode == mode.as_str() {
-                let reaches = self.reaches(&to, &who.sub)?;
-                return Ok(Posted { row, reaches, repeated: true });
+        if files.is_empty() {
+            if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)? {
+                if row.mode == mode.as_str() {
+                    let reaches = self.reaches(&to, &who.sub)?;
+                    return Ok(Posted { row, reaches, repeated: true });
+                }
             }
         }
         self.rate(&who.sub, "message", 120)?;
@@ -198,18 +265,59 @@ impl Node {
                 keys
             }
         };
+        // Signed by the sender's own key (islandmail.py sends `signed: {ts, salt, sig}`), or token-attested.
+        let (ts, attest, salt) = match body.get("signed").filter(|s| s.is_object()) {
+            Some(s) => {
+                let raw_thread = body.get("thread").and_then(|t| t.as_str()).unwrap_or("general");
+                if body["to"].as_str() != Some(to.as_str())
+                    || raw_thread != thread
+                    || body["text"].as_str() != Some(text.as_str())
+                {
+                    return Err(ApiError::new(400, "signed post: to, thread and text must be sent already normalized (NFC, no control or format characters, \\n line ends)"));
+                }
+                let ts = s["ts"].as_str().unwrap_or("").to_string();
+                let t = mailcore::parse_ts(&ts).ok_or_else(|| ApiError::new(400, "signed post: ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
+                if (t - now_millis()).abs() > 300_000 {
+                    return Err(ApiError::new(400, "signed post: ts is more than 5 minutes from the node's clock"));
+                }
+                let salt = s["salt"]
+                    .as_str()
+                    .and_then(mailcore::b64u_decode)
+                    .filter(|b| (16..=64).contains(&b.len()))
+                    .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16-64 bytes, base64url"))?;
+                let m = members
+                    .member_by_name(&who.name)
+                    .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
+                let key = mailcore::keys::parse_key(&m.key)?;
+                let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
+                let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
+                let sig = s["sig"].as_str().unwrap_or("").to_string();
+                let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, st.as_bytes(), &b));
+                if !ok {
+                    return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key on the member list", who.name)));
+                }
+                (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
+            }
+            None => {
+                if self.opts.refuse_token_only {
+                    return Err(ApiError::new(400, "this node accepts only mail signed with the sender's own key (islandmail.py signs it)"));
+                }
+                (now_ts(), Attest::Aid1 { token: who.token.clone() }, String::new())
+            }
+        };
         let parents = self.store.heads(&thread)?;
-        let b = Body { text: text.clone(), files: vec![] };
+        let b = Body { text: text.clone(), files: files.clone(), salt };
         let env = Envelope::seal(
             Draft {
                 thread: &thread,
                 parents,
-                ts: now_ts(),
+                ts,
                 from: &who.name,
                 to: &to,
                 mode,
                 body: &b,
-                attest: Attest::Aid1 { token: who.token.clone() },
+                blobs: file_ids.clone(),
+                attest,
                 recipients: &recipients,
             },
             &self.seed,
@@ -217,16 +325,116 @@ impl Node {
         // Refuse to write what no other node would accept (e.g. this node is not on the member list).
         let v = env
             .verify(&members, &self.policy, now_millis())
+            .and_then(|v| env.check_body(&b).map(|_| v))
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
         let readers = (mode == Mode::Private).then(|| readers_for(&members, &to, &who.name));
+        let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         let row = self
             .store
-            .insert(&env, &v, Some(&text), readers.as_deref(), now_millis())?
+            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
             .ok_or_else(|| ApiError::new(500, "envelope id collision"))?;
         let _ = self.events.send(Arc::new(row.clone()));
-        let _ = self.outbound.send(env);
+        let _ = self.outbound.send(Outbound::Envelope(env));
         let reaches = self.reaches(&to, &who.sub)?;
         Ok(Posted { row, reaches, repeated: false })
+    }
+
+    /// Bridge: one message from the old server, kept under its old number where free, signed by the bridge key, sealed
+    /// deterministically (the same old message imported twice is the same envelope). Returns (row, already there).
+    pub fn import_old(&self, who: &Caller, m: &Value) -> Result<(Row, bool), ApiError> {
+        let Some((bseed, bsub)) = &self.opts.bridge else { return Err(ApiError::new(404, "no such endpoint")) };
+        if &who.sub != bsub {
+            return Err(ApiError::new(403, "only the bridge identity may import"));
+        }
+        let old_id = m["id"].as_i64().filter(|&x| x > 0).ok_or_else(|| ApiError::new(400, "id must be a positive integer"))?;
+        if let Some(row) = self.store.by_imported(old_id)? {
+            return Ok((row, true));
+        }
+        let s = |k: &str| -> Result<String, ApiError> {
+            m[k].as_str()
+                .filter(|v| !v.is_empty() && v.chars().count() <= MAX_FIELD && !v.chars().any(|c| c.is_control()))
+                .map(|v| v.to_string())
+                .ok_or_else(|| ApiError::new(400, format!("{k} must be 1-{MAX_FIELD} characters")))
+        };
+        let (ts, from, to, thread) = (s("ts")?, s("from")?, s("to")?, s("thread")?);
+        if mailcore::parse_ts(&ts).is_none() {
+            return Err(ApiError::new(400, "ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"));
+        }
+        let text = m["text"].as_str().ok_or_else(|| ApiError::new(400, "text must be a string"))?.to_string();
+        let files: Vec<Value> = m["files"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .take(MAX_FILES)
+                    .map(|f| json!({ "id": f["id"], "name": f["name"], "type": f["type"], "size": f["size"], "old": true }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let sub = m["sub"].as_str().unwrap_or("").to_string();
+        let verified = m["verified"].as_bool().unwrap_or(false);
+        let members = self.members.read().unwrap().clone();
+        let b = Body { text: text.clone(), files: files.clone(), salt: String::new() };
+        let mut h = blake3::Hasher::new_derive_key("agent-mail v1 import det");
+        h.update(bseed.bytes());
+        h.update(&old_id.to_le_bytes());
+        let env = Envelope::seal_with(
+            Draft {
+                thread: &thread,
+                parents: self.store.heads(&thread)?,
+                ts,
+                from: &from,
+                to: &to,
+                mode: Mode::Members,
+                body: &b,
+                blobs: vec![],
+                attest: Attest::Import { old_id: old_id as u64, sub, verified },
+                recipients: &members.all_keys(),
+            },
+            bseed,
+            Some(*h.finalize().as_bytes()),
+        )?;
+        let v = env
+            .verify(&members, &self.policy, now_millis())
+            .map_err(|e| ApiError::new(503, format!("this node cannot import: {e}")))?;
+        let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
+        match self.store.insert(&env, &v, Some(&text), &files_json, None, now_millis(), self.opts.id_floor)? {
+            Some(row) => {
+                let _ = self.events.send(Arc::new(row.clone()));
+                let _ = self.outbound.send(Outbound::Envelope(env));
+                Ok((row, false))
+            }
+            None => Ok((self.store.by_imported(old_id)?.ok_or_else(|| ApiError::new(500, "import vanished"))?, true)),
+        }
+    }
+
+    /// POST /api/files: encrypt and keep the upload until a message attaches it.
+    pub fn upload(&self, who: &Caller, name: &str, ty: &str, data: &[u8]) -> Result<Value, ApiError> {
+        if data.len() > MAX_FILE {
+            return Err(ApiError::new(413, format!("body is over {MAX_FILE} bytes")));
+        }
+        self.rate(&who.sub, "upload", 60)?;
+        if self.store.uploaded_bytes(&who.sub)? + data.len() as i64 > MAX_FILES_PER_SUB {
+            return Err(ApiError::new(507, "you have stored the most attachments one sender may"));
+        }
+        let (blob, key) = mailcore::crypto::seal_blob(data)?;
+        let id = blake3::hash(&blob).to_hex().to_string();
+        let now = now_millis();
+        self.store.put_blob(&id, &blob, now)?;
+        self.store.add_upload(&id, &who.sub, name, ty, data.len() as i64, &mailcore::b64u(&key), now)?;
+        Ok(json!({ "id": id, "name": name, "type": ty, "size": data.len() }))
+    }
+
+    /// GET /api/files/{id}: (metadata, plaintext) for a viewer allowed to read a message carrying it.
+    pub fn download(&self, id: &str, who: &Caller) -> Result<(Value, Vec<u8>), ApiError> {
+        let f = self.store.find_file(id, &who.name, &who.sub)?.ok_or_else(|| ApiError::new(404, "no such file"))?;
+        let blob = self.store.get_blob(id)?.ok_or_else(|| ApiError::new(404, "that file has not reached this node yet; try again soon"))?;
+        let key: [u8; 32] = f["key"]
+            .as_str()
+            .and_then(mailcore::b64u_decode)
+            .and_then(|k| k.try_into().ok())
+            .ok_or_else(|| ApiError::new(500, "bad file key"))?;
+        let plain = mailcore::crypto::open_blob(&blob, &key)?;
+        Ok((f, plain))
     }
 
     /// A replicated envelope. Ok(None): already here. Err: refused (bad signature, token, member, shape).
@@ -236,18 +444,27 @@ impl Node {
         }
         let members = self.members.read().unwrap().clone();
         let v = env.verify(&members, &self.policy, now_millis())?;
+        if v.attest == "token" && self.opts.refuse_token_only {
+            anyhow::bail!("token-attested envelopes are refused by this node");
+        }
         let mut body = env.open(&self.seed).unwrap_or(None);
         if body.is_none() {
-            for (_, s) in &self.identities {
+            for (_, s) in &self.opts.identities {
                 if let Ok(Some(b)) = env.open(s) {
                     body = Some(b);
                     break;
                 }
             }
         }
+        if let Some(b) = &body {
+            env.check_body(b)?;
+        }
+        let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
         let text: Option<String> = body.map(|b| b.text.chars().take(MAX_TEXT as usize).collect());
         let readers = (env.mode == Mode::Private).then(|| readers_for(&members, &env.to, &env.from));
-        let Some(row) = self.store.insert(&env, &v, text.as_deref(), readers.as_deref(), now_millis())? else {
+        let Some(row) =
+            self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
+        else {
             return Ok(None);
         };
         if v.imported.is_none() {
@@ -261,7 +478,7 @@ impl Node {
     /* Names */
 
     fn renames(&self) -> impl Iterator<Item = &Renamed> {
-        self.renamed.iter().filter(|r| !r.name.is_empty() && !r.sub.is_empty() && !r.now.is_empty())
+        self.opts.renamed.iter().filter(|r| !r.name.is_empty() && !r.sub.is_empty() && !r.now.is_empty())
     }
 
     /// The names mail to this agent may be addressed to: its own, and the names it had before a rename.
@@ -411,7 +628,35 @@ pub fn field(v: &Value, name: &str, ok: impl Fn(&str) -> bool) -> Result<String,
     Ok(s)
 }
 
-pub fn clean_text(v: Option<&Value>) -> Result<String, ApiError> {
+/// The old server's fileName(): the last path segment, no format/control characters or quotes, at most 200 chars.
+pub fn file_name(raw: Option<&str>) -> String {
+    let base = raw.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
+    let s: String = base
+        .nfc()
+        .filter(|&c| !is_format_char(c) && !(c as u32 <= 0x1F || c as u32 == 0x7F || c == '"'))
+        .collect::<String>()
+        .trim()
+        .chars()
+        .take(200)
+        .collect();
+    if s.is_empty() { "file".into() } else { s }
+}
+
+/// The old server's mimeType(): a plain type/subtype or application/octet-stream.
+pub fn mime_type(raw: Option<&str>) -> String {
+    let t = raw.unwrap_or("").split(';').next().unwrap_or("").trim().to_lowercase();
+    let ok_part = |p: &str| {
+        let mut cs = p.chars();
+        cs.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && cs.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || ".+-".contains(c))
+    };
+    match t.split_once('/') {
+        Some((a, b)) if ok_part(a) && ok_part(b) => t,
+        _ => "application/octet-stream".into(),
+    }
+}
+
+pub fn clean_text(v: Option<&Value>, allow_empty: bool) -> Result<String, ApiError> {
     let Some(s) = v.and_then(|v| v.as_str()) else { return Err(ApiError::new(400, "text must be a string")) };
     let s: String = s.nfc().collect::<String>().replace("\r\n", "\n").replace('\r', "\n");
     let s: String = s
@@ -421,14 +666,20 @@ pub fn clean_text(v: Option<&Value>) -> Result<String, ApiError> {
     if s.encode_utf16().count() > MAX_TEXT as usize {
         return Err(ApiError::new(413, format!("text is over {MAX_TEXT} characters; attach it as a file")));
     }
-    if s.trim().is_empty() {
+    if s.trim().is_empty() && !allow_empty {
         return Err(ApiError::new(400, "text is empty"));
     }
     Ok(s)
 }
 
+impl Node {
+    pub fn fmt(&self, r: &Row, max_text: usize) -> String {
+        format_message(r, max_text, &self.opts.public_url)
+    }
+}
+
 /// The old server's formatMessage: one header line the mailbox writes, then the sender's text, every line quoted.
-pub fn format_message(r: &Row, max_text: usize) -> String {
+pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
     let text = r.text.clone().unwrap_or_default();
     let shown: String = text.chars().take(max_text).collect();
     let full = r.len.max(text.chars().count() as i64);
@@ -437,6 +688,25 @@ pub fn format_message(r: &Row, max_text: usize) -> String {
         format!("{shown}\n[… {} more characters; get #{} for all of it]", full - shown_n, r.id)
     } else {
         shown
+    };
+    let files = crate::store::public_files(&r.files);
+    let body = match files.as_array() {
+        Some(a) if !a.is_empty() => {
+            let list: Vec<String> = a
+                .iter()
+                .map(|f| {
+                    let id = f["id"].as_str().unwrap_or("");
+                    let url = if f["old"] == json!(true) {
+                        format!("https://mail.gnome.science/api/files/{id}")
+                    } else {
+                        format!("{base}/api/files/{id}")
+                    };
+                    format!("{} ({} bytes) {url}", f["name"].as_str().unwrap_or("file"), f["size"])
+                })
+                .collect();
+            format!("{body}\n[attachments: {}]", list.join("; "))
+        }
+        _ => body,
     };
     let from = if r.verified {
         format!("{} [{}]", r.sender, r.sender_sub)
@@ -454,8 +724,14 @@ mod tests {
     use mailcore::keys::fmt_key;
     use mailcore::{Member, NodeEntry};
 
-    fn setup() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Envelope>) {
+    fn setup() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>) {
+        let (n, home, b, l, rx, _) = setup_full();
+        (n, home, b, l, rx)
+    }
+
+    fn setup_full() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>, Seed) {
         let (home, op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
+        let alice_copy = Seed::from_bytes(*alice.bytes());
         let mut list = MemberList {
             v: 1,
             network: "t".into(),
@@ -475,8 +751,14 @@ mod tests {
         let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, rx) = mpsc::unbounded_channel();
-        let node = Node::new(Store::open(&path).unwrap(), list.clone(), policy, node_a, vec![], vec![], tx);
-        (node, home, node_b, list, rx)
+        let opts = Opts { id_floor: 1, public_url: "http://x".into(), ..Default::default() };
+        let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), policy, node_a, opts, tx);
+        (node, home, node_b, list, rx, alice_copy)
+    }
+
+    fn env_of(o: Outbound) -> Envelope {
+        let Outbound::Envelope(e) = o;
+        e
     }
 
     fn token(home: &Seed) -> String {
@@ -500,7 +782,7 @@ mod tests {
     }
 
     fn envelope(writer: &Seed, list: &MemberList, home: &Seed, text: &str) -> Envelope {
-        let body = Body { text: text.into(), files: vec![] };
+        let body = Body { text: text.into(), ..Default::default() };
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -510,6 +792,7 @@ mod tests {
                 to: "all",
                 mode: Mode::Members,
                 body: &body,
+                blobs: vec![],
                 attest: Attest::Aid1 { token: token(home) },
                 recipients: &list.all_keys(),
             },
@@ -547,12 +830,65 @@ mod tests {
         let who = node.verify(&token(&home)).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(!p.repeated);
-        let out = rx.try_recv().expect("gossiped");
+        let out = env_of(rx.try_recv().expect("gossiped"));
         assert_eq!(out.id, p.row.env_id);
+        assert_eq!(p.row.attest, "token");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
         let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
-        assert_eq!(rx.try_recv().unwrap().parents, vec![p.row.env_id.clone()], "parents = thread heads");
+        assert_eq!(env_of(rx.try_recv().unwrap()).parents, vec![p.row.env_id.clone()], "parents = thread heads");
         assert!(p3.row.id > p.row.id);
+    }
+
+    fn signed(alice: &Seed, to: &str, thread: &str, text: &str, files: &[String], ts: &str) -> Value {
+        let salt = mailcore::random_bytes::<16>();
+        let digest = mailcore::envelope::post_digest(&salt, text, files);
+        let st = mailcore::envelope::post_statement("a.alice", to, thread, Mode::Members, ts, &digest);
+        json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(st.as_bytes())) })
+    }
+
+    #[test]
+    fn signed_post_path() {
+        let (node, home, _b, _l, mut rx, alice) = setup_full();
+        let who = node.verify(&token(&home)).unwrap();
+        let ts = now_ts();
+        let p = node
+            .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&alice, "all", "t", "signed", &[], &ts) }))
+            .unwrap();
+        assert_eq!(p.row.attest, "agent");
+        let e = env_of(rx.try_recv().unwrap());
+        assert!(matches!(e.attest, Attest::Agent { .. }));
+        assert_eq!(e.ts, ts);
+        // A signature over other text, or by another key, is refused.
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&alice, "all", "t", "orig", &[], &ts) }));
+        assert_eq!(bad.err().unwrap().status, 401);
+        let mallory = Seed::generate();
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x", "signed": signed(&mallory, "all", "t", "x", &[], &ts) }));
+        assert_eq!(bad.err().unwrap().status, 401);
+        // Old timestamps are refused.
+        let old = ts_from_millis(now_millis() - 3_600_000);
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&alice, "all", "t", "y", &[], &old) }));
+        assert_eq!(bad.err().unwrap().status, 400);
+    }
+
+    #[test]
+    fn attachments_roundtrip_and_signed_digest_covers_them() {
+        let (node, home, _b, _l, mut rx, alice) = setup_full();
+        let who = node.verify(&token(&home)).unwrap();
+        let f = node.upload(&who, "a.txt", "text/plain", b"attached bytes").unwrap();
+        let id = f["id"].as_str().unwrap().to_string();
+        let ts = now_ts();
+        let p = node
+            .post(&who, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
+                                 "signed": signed(&alice, "all", "t", "see file", &[id.clone()], &ts) }))
+            .unwrap();
+        let e = env_of(rx.try_recv().unwrap());
+        assert_eq!(e.blobs, vec![id.clone()]);
+        let m = p.row.to_message();
+        assert_eq!(m["files"][0]["id"], json!(id));
+        assert!(m["files"][0].get("key").is_none(), "blob key never shown");
+        let (_, bytes) = node.download(&id, &who).unwrap();
+        assert_eq!(bytes, b"attached bytes");
+        assert!(node.download("0".repeat(64).as_str(), &who).is_err());
     }
 }

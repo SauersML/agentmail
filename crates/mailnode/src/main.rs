@@ -91,12 +91,22 @@ async fn run(path: &Path) -> Result<()> {
     let cfg = config::Config::load(path)?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     let seed = cfg.node_seed()?;
-    let members = cfg.members()?;
+    let members = cfg.best_members()?;
     if !members.is_node(&seed.public()) {
         bail!("this node's key {} is not on the member list; add it and re-sign", fmt_key(&seed.public()));
     }
     let policy = cfg.policy()?;
     let identities = cfg.identities();
+    let bridge = match &cfg.bridge {
+        Some(b) => {
+            let s = config::read_seed(&b.key_file)?;
+            if !members.is_bridge(&s.public()) {
+                bail!("bridge key {} is not under bridges in the member list", fmt_key(&s.public()));
+            }
+            Some((s, b.sub.clone()))
+        }
+        None => None,
+    };
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),
@@ -111,7 +121,17 @@ async fn run(path: &Path) -> Result<()> {
         store.seen(&m.name, &m.sub, 0)?;
     }
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
-    let node = Arc::new(node::Node::new(store, members, policy, seed, identities, cfg.renamed.clone(), out_tx));
+    let opts = node::Opts {
+        identities,
+        renamed: cfg.renamed.clone(),
+        refuse_token_only: cfg.refuse_token_only,
+        id_floor: cfg.id_floor,
+        bridge,
+        members_path: Some(cfg.adopted_members_path()),
+        public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
+    };
+    let operator = mailcore::keys::parse_key(&cfg.operator_key)?;
+    let node = Arc::new(node::Node::new(store, members, operator, policy, seed, opts, out_tx));
     let _net = net::start(&cfg, node.clone(), out_rx).await?;
 
     let state = api::AppState {

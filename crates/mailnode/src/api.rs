@@ -1,6 +1,7 @@
 //! The compat API on 127.0.0.1: the old server's routes and semantics (islandmail src/index.js) for /api/me,
 //! /api/messages, /api/threads, /api/names, /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket), with Bearer aid1
-//! auth checked offline the same way. TODO(phase 2): POST/GET /api/files, the web reader, /login + session cookies.
+//! auth checked offline the same way; POST/GET /api/files (encrypted, content-addressed blobs); POST
+//! /api/bridge/import for the history bridge. Not here: the web reader, /login + session cookies.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -58,6 +59,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/threads", get(threads))
         .route("/api/names", get(names))
         .route("/api/stream", get(stream))
+        .route(
+            "/api/files",
+            axum::routing::post(upload).layer(axum::extract::DefaultBodyLimit::max(crate::node::MAX_FILE + 1)),
+        )
+        .route("/api/files/{id}", get(download))
+        .route("/api/bridge/import", axum::routing::post(bridge_import))
         .route("/mcpl", get(mcpl::handler))
         .fallback(|| async { ApiError::new(404, "no such endpoint") })
         .with_state(state)
@@ -116,7 +123,10 @@ async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, A
     let who = caller(&s, &headers)?;
     Ok(json_resp(
         json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "island": s.node.policy.iss,
-                "last_id": s.node.store.last_id()? }),
+                "last_id": s.node.store.last_id()?,
+                "node": mailcore::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
+                "features": ["signed-post", "private", "files"],
+                "refuse_token_only": s.node.opts.refuse_token_only }),
         200,
     ))
 }
@@ -172,6 +182,75 @@ async fn names(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): Raw
     caller(&s, &headers)?;
     let p = params(&raw);
     Ok(json_resp(json!({ "names": s.node.names_list(p.get("prefix").map(|s| s.as_str()).unwrap_or(""))? }), 200))
+}
+
+async fn upload(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let who = caller(&s, &headers)?;
+    let p = params(&raw);
+    let name = crate::node::file_name(p.get("name").map(|s| s.as_str()));
+    let ty = crate::node::mime_type(headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()));
+    let node = s.node.clone();
+    let f = tokio::task::spawn_blocking(move || node.upload(&who, &name, &ty, &body))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "file": f }), 201))
+}
+
+const INLINE_TYPES: [&str; 5] = ["image/png", "image/jpeg", "image/gif", "image/webp", "text/plain"];
+
+async fn download(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, ApiError> {
+    let who = caller(&s, &headers)?;
+    if !mailcore::envelope::is_id(&id) {
+        return Err(ApiError::new(404, "no such file"));
+    }
+    let node = s.node.clone();
+    let (f, bytes) = tokio::task::spawn_blocking(move || node.download(&id, &who))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let ty = f["type"].as_str().unwrap_or("application/octet-stream").to_string();
+    let name = f["name"].as_str().unwrap_or("file").to_string();
+    let inline = INLINE_TYPES.contains(&ty.as_str()) && params(&raw).get("download").map(|s| s.as_str()) != Some("1");
+    let ct = if !inline {
+        "application/octet-stream".to_string()
+    } else if ty == "text/plain" {
+        "text/plain; charset=utf-8".to_string()
+    } else {
+        ty
+    };
+    let enc: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>().replace('+', "%20");
+    let mut r = Response::new(Body::from(bytes));
+    let h = r.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_str(&ct).unwrap_or(HeaderValue::from_static("application/octet-stream")));
+    if let Ok(v) = HeaderValue::from_str(&format!("{}; filename*=UTF-8''{enc}", if inline { "inline" } else { "attachment" })) {
+        h.insert(header::CONTENT_DISPOSITION, v);
+    }
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
+    Ok(r)
+}
+
+/// The history bridge: one old-server message in, kept under its old number. Only the configured bridge identity.
+async fn bridge_import(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let who = caller(&s, &headers)?;
+    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
+    let node = s.node.clone();
+    let (row, existed) = tokio::task::spawn_blocking(move || node.import_old(&who, &v))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "message": row.to_message(), "existed": existed }), if existed { 200 } else { 201 }))
 }
 
 fn sse_event(m: &Value) -> String {

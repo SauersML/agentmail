@@ -35,8 +35,14 @@ CREATE TABLE IF NOT EXISTS messages (
   imported INTEGER,
   parents TEXT NOT NULL,
   env TEXT NOT NULL,
-  received INTEGER NOT NULL);
+  received INTEGER NOT NULL,
+  attest TEXT NOT NULL DEFAULT 'token',
+  blobs TEXT NOT NULL DEFAULT '[]');
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread, id);
+CREATE INDEX IF NOT EXISTS messages_imported ON messages (imported);
+CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
+  size INTEGER NOT NULL, key TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_day ON messages (day, env_id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages (sender_sub, ts);
 CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, sub TEXT NOT NULL, seen INTEGER NOT NULL);
@@ -61,6 +67,20 @@ pub struct Row {
     pub verified: bool,
     pub imported: Option<i64>,
     pub parents: Vec<String>,
+    pub attest: String,
+}
+
+/// Attachment metadata as clients see it (the blob key never leaves the node).
+pub fn public_files(files: &str) -> serde_json::Value {
+    let mut v: serde_json::Value = serde_json::from_str(files).unwrap_or(json!([]));
+    if let Some(a) = v.as_array_mut() {
+        for f in a {
+            if let Some(o) = f.as_object_mut() {
+                o.remove("key");
+            }
+        }
+    }
+    v
 }
 
 impl Row {
@@ -77,9 +97,9 @@ impl Row {
         let shown = text.chars().count() as i64;
         let mut m = json!({
             "id": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
-            "text": text, "files": serde_json::from_str::<serde_json::Value>(&self.files).unwrap_or(json!([])),
+            "text": text, "files": public_files(&self.files),
             "len": self.len, "sub": self.sender_sub, "verified": self.verified,
-            "env": self.env_id, "mode": self.mode,
+            "env": self.env_id, "mode": self.mode, "attest": self.attest,
         });
         if self.len > shown {
             m["truncated"] = json!(self.len);
@@ -108,7 +128,7 @@ pub struct Store {
 }
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
-                    length(text) AS len, files, readers, verified, imported, parents";
+                    length(text) AS len, files, readers, verified, imported, parents, attest";
 
 fn visible_sql() -> &'static str {
     "(text IS NOT NULL AND (mode = 'members' OR instr(readers, ?) > 0))"
@@ -132,6 +152,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         verified: r.get::<_, i64>(12)? != 0,
         imported: r.get(13)?,
         parents: serde_json::from_str(&parents).unwrap_or_default(),
+        attest: r.get(15)?,
     })
 }
 
@@ -161,18 +182,24 @@ impl Store {
     }
 
     /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key).
+    /// `files`: the body's attachment list as JSON (with blob keys; "[]" when unreadable). `id_floor`: new
+    /// non-imported mail is numbered from here up, so the old server's numbers below it stay free for imports.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &self,
         env: &Envelope,
         v: &Verified,
         text: Option<&str>,
+        files: &str,
         readers: Option<&str>,
         received_ms: i64,
+        id_floor: i64,
     ) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
-        // Imported history keeps its old number when that number is free here (phase 2 bridge).
+        let max: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?;
+        // Imported history keeps its old number when that number is free here (bridge).
         let explicit = match v.imported {
             Some(old) if old > 0 => db
                 .query_row("SELECT 1 FROM messages WHERE id = ?", [old as i64], |_| Ok(()))
@@ -181,9 +208,15 @@ impl Store {
                 .then_some(old as i64),
             _ => None,
         };
+        let explicit = match explicit {
+            Some(x) => Some(x),
+            None if v.imported.is_none() && max < id_floor => Some(id_floor),
+            None => None, // AUTOINCREMENT: above the highest id ever used
+        };
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (id, env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, verified, imported, parents, env, received) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             readers, verified, imported, parents, env, received, attest, blobs, files) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 explicit,
                 env.id,
@@ -200,7 +233,10 @@ impl Store {
                 v.imported.map(|x| x as i64),
                 parents,
                 json,
-                received_ms
+                received_ms,
+                v.attest,
+                serde_json::to_string(&env.blobs)?,
+                files
             ],
         )?;
         if n == 0 {
@@ -473,6 +509,95 @@ impl Store {
             params![sub, id],
         )?;
         Ok(())
+    }
+
+    /// The row an old-server message was imported as, if any.
+    pub fn by_imported(&self, old_id: i64) -> Result<Option<Row>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, old_id], read_row)
+            .optional()?)
+    }
+
+    /* Attachments */
+
+    pub fn put_blob(&self, id: &str, data: &[u8], now_ms: i64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO blobs (id, data, size, created) VALUES (?, ?, ?, ?)",
+            params![id, data, data.len() as i64, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_blob(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row("SELECT data FROM blobs WHERE id = ?", [id], |r| r.get(0)).optional()?)
+    }
+
+    /// Blob ids some stored envelope references that this node does not hold yet.
+    pub fn missing_blobs(&self) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT blobs FROM messages WHERE blobs != '[]'")?;
+        let lists: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut have = db.prepare("SELECT 1 FROM blobs WHERE id = ?")?;
+        let mut out = Vec::new();
+        for l in lists {
+            for id in serde_json::from_str::<Vec<String>>(&l).unwrap_or_default() {
+                if have.query_row([&id], |_| Ok(())).optional()?.is_none() && !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_upload(&self, id: &str, owner: &str, name: &str, ty: &str, size: i64, key: &str, now_ms: i64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO uploads (id, owner, name, type, size, key, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![id, owner, name, ty, size, key, now_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn uploaded_bytes(&self, owner: &str) -> Result<i64> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row("SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner = ?", [owner], |r| r.get(0))?)
+    }
+
+    /// A file reference {id, name, type, size, key} the viewer may use: its own upload, or an attachment of a message
+    /// it can read.
+    pub fn find_file(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Option<serde_json::Value>> {
+        let db = self.db.lock().unwrap();
+        let up = db
+            .query_row(
+                "SELECT name, type, size, key FROM uploads WHERE id = ? AND owner = ?",
+                [id, viewer_sub],
+                |r| {
+                    Ok(json!({ "id": id, "name": r.get::<_, String>(0)?, "type": r.get::<_, String>(1)?,
+                               "size": r.get::<_, i64>(2)?, "key": r.get::<_, String>(3)? }))
+                },
+            )
+            .optional()?;
+        if up.is_some() {
+            return Ok(up);
+        }
+        let mut st = db.prepare(&format!(
+            "SELECT files FROM messages WHERE instr(blobs, ?) > 0 AND {} ORDER BY id LIMIT 20",
+            visible_sql()
+        ))?;
+        let rows: Vec<String> = st
+            .query_map(params![id, format!(",{},", norm(viewer))], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for files in rows {
+            let v: serde_json::Value = serde_json::from_str(&files).unwrap_or(json!([]));
+            if let Some(f) = v.as_array().and_then(|a| a.iter().find(|f| f["id"] == json!(id) && f.get("key").is_some())) {
+                return Ok(Some(f.clone()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn count(&self) -> Result<i64> {

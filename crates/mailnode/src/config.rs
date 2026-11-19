@@ -62,6 +62,30 @@ pub struct Config {
     pub sync_secs: u64,
     #[serde(default)]
     pub renamed: Vec<Renamed>,
+    /// Refuse token-only (unsigned) mail, once every client signs with its own key.
+    #[serde(default)]
+    pub refuse_token_only: bool,
+    /// New mail is numbered from here up, leaving the old server's numbers free for the bridge's imports.
+    #[serde(default = "default_floor")]
+    pub id_floor: i64,
+    /// Present on the one node the bridge talks to.
+    #[serde(default)]
+    pub bridge: Option<BridgeConfig>,
+    /// Base URL for attachment links in formatted mail (default http://<api_listen>).
+    #[serde(default)]
+    pub public_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct BridgeConfig {
+    /// Hex seed of the bridge key (listed under `bridges` in the member list).
+    pub key_file: PathBuf,
+    /// The token sub of the bridge identity allowed to call POST /api/bridge/import.
+    pub sub: String,
+}
+
+fn default_floor() -> i64 {
+    1
 }
 
 fn default_api() -> String {
@@ -90,7 +114,28 @@ impl Config {
         if let Some(d) = c.identities_dir.as_mut() {
             fix(d);
         }
+        if let Some(b) = c.bridge.as_mut() {
+            fix(&mut b.key_file);
+        }
         Ok(c)
+    }
+
+    pub fn adopted_members_path(&self) -> PathBuf {
+        self.data_dir.join("members.latest.json")
+    }
+
+    /// The configured member list, or the newer one this node adopted from the network earlier.
+    pub fn best_members(&self) -> Result<MemberList> {
+        let file = self.members()?;
+        let op = parse_key(&self.operator_key)?;
+        let adopted = std::fs::read_to_string(self.adopted_members_path())
+            .ok()
+            .and_then(|r| serde_json::from_str::<MemberList>(&r).ok())
+            .filter(|l| l.verify(&op).is_ok() && l.network == file.network);
+        Ok(match adopted {
+            Some(a) if a.seq > file.seq => a,
+            _ => file,
+        })
     }
 
     pub fn policy(&self) -> Result<TokenPolicy> {

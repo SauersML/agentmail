@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::api::{bearer, params, AppState};
-use crate::node::{format_message, ApiError, Caller, Node};
+use crate::node::{ApiError, Caller, Node};
 use crate::store::{Query, Row};
 
 const PUSH_BACKLOG: usize = 20;
@@ -252,6 +252,7 @@ impl Conn {
                 let r = &msg["result"];
                 if r["accepted"] == json!(true) || r["reason"] == json!("duplicate") {
                     let _ = self.node.store.advance_cursor(&self.who.sub, m);
+                    tracing::info!("mcpl {}: push of #{m} accepted; cursor -> {m}", self.who.name);
                 } else {
                     tracing::info!("push of #{m} to {} not accepted", self.who.name);
                 }
@@ -275,6 +276,7 @@ impl Conn {
                 let host = &params["capabilities"]["experimental"]["mcpl"];
                 self.mcpl = !host.is_null();
                 self.version = host["version"].as_str().map(|s| s.chars().take(16).collect());
+                tracing::info!("mcpl {}: initialize (mcpl {}, version {:?})", self.who.name, self.mcpl, self.version);
                 let pv = params["protocolVersion"].as_str().map(|s| s.chars().take(32).collect::<String>());
                 let mut caps = json!({ "tools": {} });
                 if self.mcpl {
@@ -322,6 +324,7 @@ impl Conn {
                     r["unavailableFeatures"] =
                         json!([{ "featureSet": "mail", "missingCapabilities": missing, "effect": "degraded" }]);
                 }
+                tracing::info!("mcpl {}: featureSets/update grant {:?} -> {}", self.who.name, self.grant, r["mode"]);
                 reply(self, r);
                 if self.ready && self.push_allowed() {
                     self.flush_backlog();
@@ -388,7 +391,7 @@ impl Conn {
                     return Ok("No mail for you there.".into());
                 }
                 let older = rows[0].id;
-                let text: Vec<String> = rows.iter().map(|r| format_message(r, 2000)).collect();
+                let text: Vec<String> = rows.iter().map(|r| self.node.fmt(r, 2000)).collect();
                 Ok(format!("{}\n\n(older: inbox with before={older})", text.join("\n\n")))
             }
             "thread" => {
@@ -399,7 +402,7 @@ impl Conn {
                 if rows.is_empty() {
                     return Ok(format!("No thread named \"{}\".", thread.chars().take(80).collect::<String>()));
                 }
-                Ok(rows.iter().map(|r| format_message(r, 2000)).collect::<Vec<_>>().join("\n\n"))
+                Ok(rows.iter().map(|r| self.node.fmt(r, 2000)).collect::<Vec<_>>().join("\n\n"))
             }
             "who" => {
                 let rows = n.names_list(args["prefix"].as_str().unwrap_or(""))?;
@@ -440,12 +443,12 @@ impl Conn {
                 if rows.is_empty() {
                     return Ok("Nothing matches.".into());
                 }
-                Ok(rows.iter().map(|r| format_message(r, 1000)).collect::<Vec<_>>().join("\n\n"))
+                Ok(rows.iter().map(|r| self.node.fmt(r, 1000)).collect::<Vec<_>>().join("\n\n"))
             }
             "get" => {
                 let id = args["id"].as_i64().unwrap_or(-1);
                 match n.store.get(id, me)? {
-                    Some(r) => Ok(format_message(&r, 100_000)),
+                    Some(r) => Ok(self.node.fmt(&r, 100_000)),
                     None => Err(ApiError::new(404, format!("no message #{}", args["id"].to_string().chars().take(20).collect::<String>()))),
                 }
             }
@@ -520,8 +523,8 @@ impl Conn {
     }
 
     fn push(&mut self, r: &Row) {
-        let origin = json!({ "messageId": r.id, "thread": r.thread, "from": r.sender, "to": r.recipient, "verified": r.verified });
-        self.push_text(Some(r.id), &format!("mail-{}", r.id), &format_message(r, PUSH_TEXT), origin);
+        let origin = json!({ "messageId": r.id, "thread": r.thread, "from": r.sender, "to": r.recipient, "verified": r.verified, "attest": r.attest });
+        self.push_text(Some(r.id), &format!("mail-{}", r.id), &self.node.fmt(r, PUSH_TEXT), origin);
     }
 
     fn push_text(&mut self, msg_id: Option<i64>, event_id: &str, text: &str, origin: Value) {
@@ -544,6 +547,7 @@ impl Conn {
             "params": { "featureSet": "mail", "eventId": event_id, "timestamp": now_ts(), "origin": o,
                         "tags": ["mail"], "payload": { "content": [{ "type": "text", "text": text }] } },
         }));
+        tracing::info!("mcpl {}: push/event {event_id}", self.who.name);
         if let Some(m) = msg_id {
             self.pending.insert(rpc, (m, now));
         }
