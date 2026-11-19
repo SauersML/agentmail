@@ -45,11 +45,41 @@ impl Mode {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Attest {
-    /// The sender's aid1 token, minted by the home for audience "mail".
+    /// The sender's aid1 token, minted by the home for audience "mail" ("token-attested"; to be refused later).
     Aid1 { token: String },
+    /// Signed by the sender's own Ed25519 key (the member list's key for `from`) over `post_statement`:
+    /// the header fields and `digest` = hex SHA-256(salt || text || 0x00 || comma-joined blob ids). The salt is in
+    /// the encrypted body, so the digest cannot be used to guess short texts.
+    Agent { key: String, digest: String, sig: String },
     /// A message copied from the old server (phase 2 bridge). `old_id` is its number there; the envelope is signed by
     /// a bridge key the member list names under `bridges`.
     Import { old_id: u64, sub: String, verified: bool },
+}
+
+impl Attest {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Attest::Aid1 { .. } => "token",
+            Attest::Agent { .. } => "agent",
+            Attest::Import { .. } => "import",
+        }
+    }
+}
+
+/// What the sender's key signs. Plain text so clients without a JSON canonicalizer (islandmail.py) build it exactly.
+pub fn post_statement(from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str) -> String {
+    format!("agent-mail-post|v1|{from}|{to}|{thread}|{}|{ts}|{digest}", mode.as_str())
+}
+
+/// hex SHA-256(salt || text || 0x00 || blob ids joined by ",")
+pub fn post_digest(salt: &[u8], text: &str, blob_ids: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt);
+    h.update(text.as_bytes());
+    h.update([0u8]);
+    h.update(blob_ids.join(",").as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -75,6 +105,10 @@ pub struct Envelope {
     /// Ephemeral X25519 public key for the key wraps.
     pub epk: String,
     pub keys: Vec<WrappedKey>,
+    /// Encrypted attachment blobs (hex BLAKE3 of each blob's ciphertext), in body.files order. In the clear so nodes
+    /// that cannot read the body still replicate the blobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blobs: Vec<String>,
     pub attest: Attest,
     /// The writing node's key (or the bridge's, for imports).
     pub node: String,
@@ -85,9 +119,13 @@ pub struct Envelope {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct Body {
     pub text: String,
-    /// Phase 2: file references (content hashes). Always empty in phase 1.
+    /// Attachments: {id (blob id), name, type, size, key (b64url blob key)}; imported rows keep the old server's
+    /// file metadata ({id, name, type, size, old: true}).
     #[serde(default)]
     pub files: Vec<serde_json::Value>,
+    /// b64url salt of the sender's digest (Attest::Agent only).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub salt: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +136,8 @@ pub struct Verified {
     pub imported: Option<u64>,
     /// False only for imported rows the old server marked unverified.
     pub verified: bool,
+    /// "agent" (sender's key), "token" (aid1 token only) or "import".
+    pub attest: &'static str,
 }
 
 pub struct Draft<'a> {
@@ -108,6 +148,7 @@ pub struct Draft<'a> {
     pub to: &'a str,
     pub mode: Mode,
     pub body: &'a Body,
+    pub blobs: Vec<String>,
     pub attest: Attest,
     pub recipients: &'a [PublicKey],
 }
@@ -119,9 +160,15 @@ fn header_ad(v: u32, thread: &str, from: &str, to: &str, mode: Mode, ts: &str) -
 
 impl Envelope {
     pub fn seal(d: Draft<'_>, node: &Seed) -> Result<Envelope> {
+        Self::seal_with(d, node, None)
+    }
+
+    /// `det`: derive the content key, nonce and ephemeral key from this secret instead of randomness, so sealing the
+    /// same input twice gives the same envelope id (bridge imports: re-importing an old message is a no-op).
+    pub fn seal_with(d: Draft<'_>, node: &Seed, det: Option<[u8; 32]>) -> Result<Envelope> {
         let plain = serde_json::to_vec(d.body)?;
         let ad = header_ad(VERSION, d.thread, d.from, d.to, d.mode, &d.ts);
-        let sealed = crypto::seal(&plain, &ad, d.recipients)?;
+        let sealed = crypto::seal_det(&plain, &ad, d.recipients, det)?;
         let mut env = Envelope {
             v: VERSION,
             id: blake3::hash(&sealed.ciphertext).to_hex().to_string(),
@@ -134,6 +181,7 @@ impl Envelope {
             ciphertext: b64u(&sealed.ciphertext),
             epk: b64u(&sealed.epk),
             keys: sealed.keys.iter().map(|w| WrappedKey { to: fmt_key(&w.to), k: b64u(&w.k) }).collect(),
+            blobs: d.blobs,
             attest: d.attest,
             node: fmt_key(&node.public()),
             sig: String::new(),
@@ -227,15 +275,58 @@ impl Envelope {
                 if p.name != self.from {
                     bail!("from ({}) is not the token's name ({})", self.from, p.name);
                 }
-                Ok(Verified { sender_sub: p.sub, sender_kind: p.kind, imported: None, verified: true })
+                Ok(Verified { sender_sub: p.sub, sender_kind: p.kind, imported: None, verified: true, attest: "token" })
+            }
+            Attest::Agent { key, digest, sig } => {
+                if !members.is_node(&node) {
+                    bail!("written by a node that is not a member");
+                }
+                let m = members.member_by_name(&self.from).ok_or_else(|| anyhow!("{} is not on the member list", self.from))?;
+                let k = parse_key(key)?;
+                if parse_key(&m.key)? != k {
+                    bail!("signed by a key that is not {}'s key on the member list", self.from);
+                }
+                if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    bail!("bad digest");
+                }
+                let st = post_statement(&self.from, &self.to, &self.thread, self.mode, &self.ts, digest);
+                let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
+                if !keys::verify(&k, st.as_bytes(), &s) {
+                    bail!("sender signature does not verify");
+                }
+                Ok(Verified { sender_sub: m.sub.clone(), sender_kind: "agent".into(), imported: None, verified: true, attest: "agent" })
             }
             Attest::Import { old_id, sub, verified } => {
                 if !members.is_bridge(&node) {
                     bail!("import signed by a key that is not a member bridge");
                 }
-                Ok(Verified { sender_sub: sub.clone(), sender_kind: String::new(), imported: Some(*old_id), verified: *verified })
+                Ok(Verified {
+                    sender_sub: sub.clone(),
+                    sender_kind: String::new(),
+                    imported: Some(*old_id),
+                    verified: *verified,
+                    attest: "import",
+                })
             }
         }
+    }
+
+    /// For readers, after decrypting: an agent-signed envelope's digest must match the body it carries, and the
+    /// body's attachments must be the header's blobs.
+    pub fn check_body(&self, body: &Body) -> Result<()> {
+        let ids: Vec<String> = body.files.iter().filter_map(|f| f["id"].as_str().map(|s| s.to_string())).collect();
+        let blob_ids: Vec<String> =
+            body.files.iter().filter(|f| f.get("key").is_some()).filter_map(|f| f["id"].as_str().map(|s| s.to_string())).collect();
+        if blob_ids != self.blobs {
+            bail!("body attachments do not match the header's blobs");
+        }
+        if let Attest::Agent { digest, .. } = &self.attest {
+            let salt = b64u_decode(&body.salt).ok_or_else(|| anyhow!("bad salt"))?;
+            if &post_digest(&salt, &body.text, &ids) != digest {
+                bail!("body does not match the sender's signed digest");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -267,7 +358,7 @@ mod tests {
     }
 
     fn env(w: &World, from: &str, to: &str, mode: Mode, token: String) -> Envelope {
-        let body = Body { text: format!("hi from {from}"), files: vec![] };
+        let body = Body { text: format!("hi from {from}"), ..Default::default() };
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
             Mode::Private => w.members.private_keys(to, from),
@@ -281,12 +372,95 @@ mod tests {
                 to,
                 mode,
                 body: &body,
+                blobs: vec![],
                 attest: Attest::Aid1 { token },
                 recipients: &recipients,
             },
             &w.node,
         )
         .unwrap()
+    }
+
+    /// An envelope signed by `signer` as `from` (the agent-key path), with the given body text.
+    fn signed_env(w: &World, from: &str, signer: &Seed, text: &str, ts: String) -> Envelope {
+        let salt = crate::random_bytes::<16>();
+        let digest = post_digest(&salt, text, &[]);
+        let st = post_statement(from, "all", "t", Mode::Members, &ts, &digest);
+        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(st.as_bytes())) };
+        let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
+        Envelope::seal(
+            Draft {
+                thread: "t",
+                parents: vec![],
+                ts,
+                from,
+                to: "all",
+                mode: Mode::Members,
+                body: &body,
+                blobs: vec![],
+                attest,
+                recipients: &w.members.all_keys(),
+            },
+            &w.node,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn agent_signed_envelopes() {
+        let w = world();
+        let p = policy(&w.home);
+        let now = crate::now_millis();
+        let e = signed_env(&w, "a.alice", &w.alice, "signed by alice", crate::now_ts());
+        let v = e.verify(&w.members, &p, now).unwrap();
+        assert_eq!((v.attest, v.sender_sub.as_str()), ("agent", "agent:a.alice@test"));
+        let body = e.open(&w.node).unwrap().unwrap();
+        e.check_body(&body).unwrap();
+        // Bob's key claiming to be alice.
+        let e = signed_env(&w, "a.alice", &w.bob, "forged", crate::now_ts());
+        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not a.alice's key"));
+        // Not on the member list at all.
+        let stranger = Seed::generate();
+        let e = signed_env(&w, "x.stranger", &stranger, "who", crate::now_ts());
+        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not on the member list"));
+        // A header changed by the node after the sender signed (re-signed by the node so only the agent sig breaks).
+        let mut e = signed_env(&w, "a.alice", &w.alice, "to all", crate::now_ts());
+        e.to = "a.bob".into();
+        e.sig = b64u(&w.node.sign(&e.signing_bytes()));
+        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("sender signature"));
+        // A body swapped by the node under alice's signed digest: verify passes (header intact), check_body refuses.
+        let good = signed_env(&w, "a.alice", &w.alice, "original", crate::now_ts());
+        let mut body = good.open(&w.node).unwrap().unwrap();
+        body.text = "tampered".into();
+        assert!(good.check_body(&body).unwrap_err().to_string().contains("digest"));
+    }
+
+    #[test]
+    fn deterministic_seal_gives_same_id() {
+        let w = world();
+        let body = Body { text: "old mail".into(), ..Default::default() };
+        let mk = || {
+            Envelope::seal_with(
+                Draft {
+                    thread: "t",
+                    parents: vec![],
+                    ts: "2026-01-01T00:00:00.000Z".into(),
+                    from: "a.alice",
+                    to: "all",
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: Attest::Import { old_id: 7, sub: "agent:a.alice@test".into(), verified: true },
+                    recipients: &w.members.all_keys(),
+                },
+                &w.node,
+                Some([9u8; 32]),
+            )
+            .unwrap()
+        };
+        let (a, b) = (mk(), mk());
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.open(&w.alice).unwrap().unwrap().text, "old mail");
     }
 
     fn tok(w: &World, name: &str) -> String {

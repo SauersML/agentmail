@@ -40,18 +40,38 @@ fn wrap_key(epk: &[u8; 32], recipient_x: &[u8; 32], shared: &[u8; 32]) -> [u8; 3
 }
 
 pub fn seal(plain: &[u8], ad: &[u8], recipients: &[PublicKey]) -> Result<Sealed> {
+    seal_det(plain, ad, recipients, None)
+}
+
+/// With `det`, the content key, nonce and ephemeral key are derived from it and the input (same input, same output).
+pub fn seal_det(plain: &[u8], ad: &[u8], recipients: &[PublicKey], det: Option<[u8; 32]>) -> Result<Sealed> {
     if recipients.is_empty() {
         bail!("no recipient keys");
     }
-    let mut ck: [u8; 32] = crate::random_bytes();
-    let nonce: [u8; 24] = crate::random_bytes();
+    let derive = |label: &str| -> [u8; 32] {
+        let d = det.expect("det");
+        let mut h = blake3::Hasher::new_derive_key(label);
+        h.update(&d);
+        h.update(ad);
+        h.update(plain);
+        for r in recipients {
+            h.update(r);
+        }
+        *h.finalize().as_bytes()
+    };
+    let mut ck: [u8; 32] = if det.is_some() { derive("agent-mail v1 det content key") } else { crate::random_bytes() };
+    let nonce: [u8; 24] = if det.is_some() {
+        derive("agent-mail v1 det nonce")[..24].try_into().unwrap()
+    } else {
+        crate::random_bytes()
+    };
     let body = XChaCha20Poly1305::new((&ck).into())
         .encrypt((&nonce).into(), Payload { msg: plain, aad: ad })
         .map_err(|_| anyhow!("encrypt failed"))?;
     let mut ciphertext = nonce.to_vec();
     ciphertext.extend_from_slice(&body);
 
-    let esk = StaticSecret::from(crate::random_bytes::<32>());
+    let esk = StaticSecret::from(if det.is_some() { derive("agent-mail v1 det ephemeral") } else { crate::random_bytes::<32>() });
     let epk = XPublic::from(&esk).to_bytes();
     let mut keys = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -102,8 +122,42 @@ pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: 
     Ok(Some(plain?))
 }
 
+const BLOB_AD: &[u8] = b"agent-mail/blob/v1";
+
+/// An attachment: its own random key (carried inside the envelope body, so it is wrapped like the body), nonce (24)
+/// || XChaCha20-Poly1305 ciphertext. The blob id is hex BLAKE3 of the result.
+pub fn seal_blob(plain: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+    let key: [u8; 32] = crate::random_bytes();
+    let nonce: [u8; 24] = crate::random_bytes();
+    let ct = XChaCha20Poly1305::new((&key).into())
+        .encrypt((&nonce).into(), Payload { msg: plain, aad: BLOB_AD })
+        .map_err(|_| anyhow!("encrypt failed"))?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&ct);
+    Ok((out, key))
+}
+
+pub fn open_blob(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
+    if blob.len() < 24 + 16 {
+        bail!("blob too short");
+    }
+    let (nonce, ct) = blob.split_at(24);
+    XChaCha20Poly1305::new(key.into())
+        .decrypt(nonce.into(), Payload { msg: ct, aad: BLOB_AD })
+        .map_err(|_| anyhow!("blob decrypt failed"))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blob_roundtrip() {
+        let (b, k) = super::seal_blob(b"file bytes").unwrap();
+        assert_eq!(super::open_blob(&b, &k).unwrap(), b"file bytes");
+        let mut bad = b.clone();
+        bad[30] ^= 1;
+        assert!(super::open_blob(&bad, &k).is_err());
+    }
+
     use super::*;
 
     #[test]
