@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Two nodes with relay "n0" and NO addresses in the member list: they must find each other through n0's address
-lookup and relays (the setup for hosts with no open port). Throwaway keys.
+"""Two nodes with NO addresses in the member list and the given relay setting ("n0", our relay URL, or a JSON list):
+they must find each other through the relays alone (the setup for hosts with no open port). Throwaway keys.
 
-  python3 tests/n0_pair.py --bin target/debug/mailnode [--workdir DIR]
+  python3 tests/relay_pair.py --bin target/debug/mailnode --relay '["http://IP:PORT"]' [--workdir DIR]
 """
 import argparse
 import json
@@ -20,9 +20,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True)
     ap.add_argument("--workdir", default=None)
+    ap.add_argument("--relay", default="\"n0\"", help="JSON: \"n0\", \"http://...\" or a list")
     a = ap.parse_args()
     bin_ = os.path.abspath(a.bin)
-    work = os.path.abspath(a.workdir or "n0-%d" % int(time.time()))
+    work = os.path.abspath(a.workdir or "relay-%d" % int(time.time()))
     if os.path.exists(work):
         shutil.move(work, work + ".old-%d" % int(time.time()))
     os.makedirs(os.path.join(work, "keys"))
@@ -39,16 +40,16 @@ def main():
             "data_dir": os.path.join(work, "data" + h), "api_listen": "127.0.0.1:%d" % free_port(),
             "iroh_port": free_port(socket.SOCK_DGRAM), "node_key_file": k("node" + h), "operator_key": pub["operator"],
             "members_file": os.path.join(work, "members.json"), "home": {"key": pub["home"], "iss": "home.test"},
-            "relay": "n0", "sync_secs": 5})
+            "relay": json.loads(a.relay), "sync_secs": 5})
     tok = {n: run(bin_, "mint-token", k("home"), "home.test", "t." + n, "agent:%s@test" % n, "3600") for n in ("alice", "bob")}
     try:
-        check("A starts (relay n0)", nodes["A"].start())
-        check("B starts (relay n0)", nodes["B"].start())
+        check("A starts (relay %s)" % a.relay, nodes["A"].start())
+        check("B starts", nodes["B"].start())
         st, _ = req("POST", nodes["A"].port, "/api/messages", tok["alice"], {"to": "t.bob", "text": "over n0"})
         check("post on A", st == 201)
         got, dt = wait_for(lambda: [m for m in req("GET", nodes["B"].port, "/api/messages?after=0", tok["bob"])[1]["messages"]
                                     if m["text"] == "over n0"], timeout=120, every=1)
-        check("B receives it with no configured addresses (n0 lookup + relay)", got, "%.1fs" % dt)
+        check("B receives it with no configured addresses (relays only)", got, "%.1fs" % dt)
     finally:
         for n in nodes.values():
             n.stop()

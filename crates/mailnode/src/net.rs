@@ -17,7 +17,7 @@ use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
@@ -35,6 +35,8 @@ const MAX_REQ: usize = 1 << 20;
 const MAX_RESP: usize = 64 << 20;
 const IDS_PER_GET: usize = 200;
 const GRANTS_PER_CALL: usize = 500;
+/// Our own relay URLs from the config (set once at start).
+static OWN_RELAYS: std::sync::OnceLock<Vec<RelayUrl>> = std::sync::OnceLock::new();
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -181,9 +183,20 @@ fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
             }
             let Ok(id) = EndpointId::from_bytes(&key) else { continue };
             let mut a = EndpointAddr::new(id);
+            let mut has_relay = false;
             for s in &n.addrs {
                 if let Ok(sa) = s.parse::<SocketAddr>() {
                     a = a.with_ip_addr(sa);
+                } else if let Ok(u) = s.parse::<RelayUrl>() {
+                    a = a.with_relay_url(u);
+                    has_relay = true;
+                }
+            }
+            // A peer with no listed relay is assumed reachable through our own relay(s), so nodes find each other
+            // without n0's address lookup.
+            if !has_relay {
+                for u in OWN_RELAYS.get().into_iter().flatten() {
+                    a = a.with_relay_url(u.clone());
                 }
             }
             lookup.add_endpoint_info(a);
@@ -273,15 +286,34 @@ impl Ctx {
 pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedReceiver<Outbound>) -> Result<Net> {
     let gate = MemberGate { node: node.clone() };
     let lookup = MemoryLookup::new();
-    let builder = match cfg.relay.as_str() {
-        "disabled" => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
-        "n0" => Endpoint::builder(presets::N0),
-        url if url.starts_with("http") => {
-            let u: RelayUrl = url.parse().map_err(|e| anyhow!("relay url {url}: {e}"))?;
-            Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Custom(u.into()))
+    let entries = cfg.relay.entries();
+    let mut own = Vec::new();
+    let mut n0 = false;
+    for e in &entries {
+        match e.as_str() {
+            "disabled" => {}
+            "n0" => n0 = true,
+            url if url.starts_with("http") => own.push(url.parse::<RelayUrl>().map_err(|err| anyhow!("relay url {url}: {err}"))?),
+            other => return Err(anyhow!("relay entries are disabled, n0, or relay URLs, not {other}")),
         }
-        other => return Err(anyhow!("relay must be disabled, n0, or a relay URL, not {other}")),
+    }
+    if entries.iter().any(|e| e == "disabled") && entries.len() > 1 {
+        return Err(anyhow!("relay \"disabled\" cannot be combined with other entries"));
+    }
+    let _ = OWN_RELAYS.set(own.clone());
+    let builder = match (own.is_empty(), n0) {
+        (true, false) => Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled),
+        (true, true) => Endpoint::builder(presets::N0),
+        (false, with_n0) => {
+            let map = RelayMap::from_iter(own.iter().cloned());
+            if with_n0 {
+                map.extend(&iroh::defaults::prod::default_relay_map());
+            }
+            let preset = if with_n0 { Endpoint::builder(presets::N0) } else { Endpoint::builder(presets::Minimal) };
+            preset.relay_mode(RelayMode::Custom(map))
+        }
     };
+    tracing::info!("relays: {}", if entries.is_empty() { "disabled".to_string() } else { entries.join(", ") });
     let endpoint = builder
         .secret_key(SecretKey::from_bytes(node.seed.bytes()))
         .address_lookup(lookup.clone())

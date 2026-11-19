@@ -78,7 +78,7 @@ class Node:
             json.dump(self.cfg, f, indent=1)
         log = open(os.path.join(self.work, self.name + ".log"), "a")
         self.proc = subprocess.Popen([self.bin, "run", path], stdout=log, stderr=subprocess.STDOUT,
-                                     env=dict(os.environ, RUST_LOG="mailnode=info,iroh=warn,iroh_gossip=warn"))
+                                     env=dict(os.environ, RUST_LOG=os.environ.get("MAILNODE_LOG", "mailnode=info,iroh=warn,iroh_gossip=warn")))
         ok, _ = wait_for(lambda: self._up(), timeout=30)
         return ok
 

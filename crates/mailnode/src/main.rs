@@ -21,11 +21,11 @@ use anyhow::{bail, Context, Result};
 use mailcore::keys::fmt_key;
 use mailcore::MemberList;
 
+const USAGE: &str = "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
+     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS";
+
 fn usage() -> ! {
-    eprintln!(
-        "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
-         mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS"
-    );
+    eprintln!("{USAGE}");
     std::process::exit(2)
 }
 
@@ -75,6 +75,10 @@ async fn main() -> Result<()> {
                 jti: None,
             };
             println!("{}", mailcore::token::mint(&home, &p));
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("mailnode {}: peer-to-peer agent mail node (see README.md)\n{USAGE}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => usage(),

@@ -164,9 +164,13 @@ the node signs imports with `bridge.key_file`, a key under `bridges`).
 
 ## Relays
 
-`relay` is `disabled` (direct addresses from the member list), `n0` (n0's public relays + address lookup), or the URL
-of our own `iroh-relay`. Relays see only QUIC between endpoint keys. Running our own relay needs a host with a public
-TCP/UDP port (HTTPS 443 + QUIC); the RunPod test pod exposes only TCP 22, so no own relay was run.
+`relay` is `disabled` (direct addresses from the member list), `n0` (n0's public relays + address lookup), a URL of
+our own `iroh-relay`, or a list mixing URLs and `n0` (our relays first, n0 as fallback). Peers with no relay listed in
+the member list are looked up at our own relays, so nodes configured with only our relay find each other without n0.
+Relays see only QUIC between endpoint keys, so plain HTTP on the relay port is acceptable. `relay/boot.sh` is the start
+command of the relay pod: it fetches the official iroh-relay v1.4.1 release (pinned SHA-256), writes the config, and
+keeps the relay running; it reruns on every pod start, so no volume is needed. The relay allows every endpoint;
+`access.allowlist` in its config can restrict it to member node keys.
 
 ## Threat model
 
@@ -190,6 +194,5 @@ TCP/UDP port (HTTPS 443 + QUIC); the RunPod test pod exposes only TCP 22, so no 
 ## Not done
 
 - The web reader and `/login` + session cookies; `/api/links` and the admin endpoints.
-- Our own relay (needs a host with a public port).
 - Hosts signing MCPL `send` with the agent key (they hold only tokens today, so their mail is token-attested).
 - Compaction, pruning, metrics; envelopes over 1 MiB wait for anti-entropy instead of gossip.
