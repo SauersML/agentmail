@@ -233,16 +233,33 @@ impl Ctx {
         let mut added = 0;
         for days in differ.chunks(100) {
             let ids = call(&conn, &Req::Ids { days: days.to_vec() }).await?.ids;
-            let mut missing = Vec::new();
-            for id in ids.into_values().flatten() {
-                if mailcore::envelope::is_id(&id) && !node.store.has(&id)? {
-                    missing.push(id);
+            // Day by day, oldest first, each day's envelopes in time order (imports by old number), so local numbers
+            // follow time and imported history keeps its old numbers on a node catching up from empty.
+            for day_ids in ids.into_values() {
+                let mut missing = Vec::new();
+                for id in day_ids {
+                    if mailcore::envelope::is_id(&id) && !node.store.has(&id)? {
+                        missing.push(id);
+                    }
                 }
-            }
-            for chunk in missing.chunks(IDS_PER_GET) {
-                let envs = call(&conn, &Req::Get { ids: chunk.to_vec() }).await?.envelopes;
-                for raw in envs {
-                    match serde_json::from_str::<Envelope>(&raw).map_err(anyhow::Error::from).and_then(|e| node.ingest(e)) {
+                let mut envs = Vec::new();
+                for chunk in missing.chunks(IDS_PER_GET) {
+                    for raw in call(&conn, &Req::Get { ids: chunk.to_vec() }).await?.envelopes {
+                        match serde_json::from_str::<Envelope>(&raw) {
+                            Ok(e) => envs.push(e),
+                            Err(e) => tracing::warn!("sync from {}: unreadable envelope: {e}", peer.fmt_short()),
+                        }
+                    }
+                }
+                envs.sort_by(|a, b| {
+                    let old = |e: &Envelope| match &e.attest {
+                        mailcore::Attest::Import { old_id, .. } => *old_id,
+                        _ => u64::MAX,
+                    };
+                    (old(a), &a.ts, &a.id).cmp(&(old(b), &b.ts, &b.id))
+                });
+                for e in envs {
+                    match node.ingest(e) {
                         Ok(Some(_)) => added += 1,
                         Ok(None) => {}
                         Err(e) => tracing::warn!("sync from {}: refused an envelope: {e:#}", peer.fmt_short()),

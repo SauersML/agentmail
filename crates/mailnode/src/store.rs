@@ -199,13 +199,12 @@ impl Store {
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
         let max: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?;
-        // Imported history keeps its old number when that number is free here (bridge).
+        // Imported history keeps its old number when that number is still above every local number (the import runs
+        // in old-id order before the node takes new mail). Numbers only grow in arrival order, because clients' `after`
+        // cursors, SSE and MCPL push depend on it: old mail the bridge copies in after new mail exists gets a new number
+        // (its old one stays in `imported`).
         let explicit = match v.imported {
-            Some(old) if old > 0 => db
-                .query_row("SELECT 1 FROM messages WHERE id = ?", [old as i64], |_| Ok(()))
-                .optional()?
-                .is_none()
-                .then_some(old as i64),
+            Some(old) if old > 0 && old as i64 > max => Some(old as i64),
             _ => None,
         };
         let explicit = match explicit {

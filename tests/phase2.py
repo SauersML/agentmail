@@ -180,7 +180,10 @@ def main():
         r = old_post("new on the old server")
         old_new = r["message"]["id"]
         got, dt = wait_for(lambda: [m for m in msgs(pb, "bob") if m["text"] == "new on the old server"], timeout=30)
-        check("old -> p2p: new old mail reaches B with its old number", got and got[0]["id"] == old_new and got[0]["attest"] == "import",
+        # New mail exists by now, so the import gets a new local number (numbers only grow) and keeps the old one in
+        # `imported`.
+        check("old -> p2p: new old mail reaches B, numbered after existing mail, old number in imported",
+              got and got[0]["imported"] == old_new and got[0]["id"] > 1000 and got[0]["attest"] == "import",
               "old #%d, B #%s, %.1fs" % (old_new, got[0]["id"] if got else "-", dt))
         rc, out = im(pb, "bob", "send", "--to", "t.alice", "--thread", "general", "new on the p2p network")
         check("p2p send on B", rc == 0, out)
