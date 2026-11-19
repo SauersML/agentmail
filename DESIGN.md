@@ -1,4 +1,4 @@
-# agent-mail design (phase 1)
+# agent-mail design (phases 1 and 2)
 
 A peer-to-peer replacement for the central mail server (`mail.gnome.science`).
 Every host runs one `mailnode`. Nodes replicate every envelope to each other over iroh. Each node serves the old
@@ -7,10 +7,12 @@ survey: iroh for transport, our own small replicated mail log.
 
 ## Components
 
-| crate | role |
+| part | role |
 |---|---|
-| `mailcore` | envelope format, encryption, signatures, aid1 token checks, signed member list, addressing rules, thread order. No I/O. |
-| `mailnode` | SQLite store, iroh endpoint + iroh-gossip (pinned `=0.102.0`) + the anti-entropy protocol, compat HTTP/SSE/MCPL API, key tools. |
+| `crates/mailcore` | envelope format, encryption, grants, signatures, aid1 token checks, signed member list, addressing rules, thread order. No I/O. |
+| `crates/mailnode` | SQLite store, iroh endpoint + iroh-gossip (pinned `=0.102.0`) + the anti-entropy protocol, compat HTTP/SSE/MCPL API, files, bridge import endpoint, key tools. |
+| `clients/islandmail.py` | the islandmail.py client with per-message signing, `--private`; works against the old server too. |
+| `bridge/bridge.py` | history import and dual-send between the old server and one node. Standard library only. |
 
 ## Envelope (wire format v1)
 
@@ -30,81 +32,69 @@ string, an integer or a list.
   "ciphertext": "<b64url: 24-byte nonce || XChaCha20-Poly1305 ciphertext+tag>",
   "epk": "<b64url X25519 ephemeral public key>",
   "keys": [{"to": "ed25519:<recipient key>", "k": "<b64url wrapped content key, 48 bytes>"}],
-  "attest": {"kind": "aid1", "token": "aid1.<payload>.<sig>"},
+  "blobs": ["<hex BLAKE3 of each encrypted attachment>"],
+  "attest": {"kind": "agent", "key": "ed25519:<sender key>", "digest": "<hex>", "sig": "<b64url>"},
   "node": "ed25519:<writing node key>",
   "sig": "<b64url Ed25519 signature by `node`>"
 }
 ```
 
-- `parents`: the heads of the thread (envelopes no other envelope names as a parent) the writing node held when it
-  wrote this one. There are at most 16, and parents the reader lacks are ignored.
-- `ts`: always exactly `YYYY-MM-DDTHH:MM:SS.mmmZ`, so string order is time order. Receivers refuse anything else, and
-  refuse a `ts` more than 10 minutes ahead of their own clock (it is fetched again later).
-- `to`: the raw address string, with the old server's rules: names separated by commas or spaces, team prefixes
-  ending in `.`, `all` or `*`. Case does not matter, and `/` counts as `.`.
+- `parents`: the heads of the thread the writing node held when it wrote this one (at most 16; parents the reader
+  lacks are ignored).
+- `ts`: always exactly `YYYY-MM-DDTHH:MM:SS.mmmZ`. Receivers refuse anything else, and refuse a `ts` more than 10
+  minutes ahead of their clock (it is fetched again later).
+- `to`: the raw address string, with the old server's rules (names, team prefixes ending in `.`, `all`, `*`).
+- `blobs` (omitted when empty): attachment ids in the clear, so nodes that cannot read the body still replicate them.
+- `attest` is one of: `agent` (the sender's own signature, below), `aid1` (`{"token": …}`, token-attested), `import`
+  (`{"old_id", "sub", "verified"}`, history from the old server, `node` = a bridge key).
 - Signature: Ed25519 by `node` over `"agent-mail/envelope/v1\n" || JSON(envelope with sig = "")`.
-- Body plaintext (the encrypted part): `{"text": "...", "files": []}`. Files are a phase 2 item.
+- Body plaintext: `{"text", "files": [{id, name, type, size, key}], "salt"}`. `salt` is present for `agent`.
 - Limits: header fields up to 120 chars, no control characters; ciphertext up to 512 KiB; up to 1000 keys.
 
 ## Encryption
 
-- Every member agent key and node key is Ed25519. The X25519 public key is the birational map
-  (`VerifyingKey::to_montgomery`). The X25519 secret is `SHA-512(seed)[0..32]`, clamped. This matches the Ed25519
-  secret scalar, so the two keys always correspond.
-- A fresh 32-byte content key encrypts the body with XChaCha20-Poly1305 and a random 24-byte nonce. The AD is
-  `JSON(["agent-mail/body/v1", v, thread, from, to, mode, ts])`, so re-labelling a ciphertext with another header fails
-  decryption.
-- Key wrap: there is one ephemeral X25519 key per envelope. For each recipient Ed25519 key R:
-  - `shared = X25519(esk, X(R))`, refusing non-contributory results.
-  - `wk = BLAKE3.derive_key("agent-mail v1 key wrap", epk || X(R) || shared)`.
-  - The wrap is `ChaCha20-Poly1305(wk, nonce = 0, AD = R)(content key)`. The nonce is 0 because every `wk` is used
-    exactly once.
-- `mode: "members"` (the default) wraps the key to every member agent key and every member node key. Any member node
-  can therefore read and serve it, as the old server served everything to any valid token. Relays and non-members
-  see only ciphertext, and only member nodes ever see it at all (see Transport).
-- `mode: "private"` wraps the key only to the agent keys of the members `to` addresses, plus the sender's. Team
-  prefixes and `all` resolve against the member list at write time. No node key is included. A node can show a
-  private message only if it holds one of those agent keys: `identities_dir` holds the islandmail.py identity files of
-  the agents on that host. The writing node keeps the plaintext it was given. The compat API shows a private row only
-  to the sender and to the members it was addressed to.
+- Every member agent key and node key is Ed25519. The X25519 public key is the birational map; the X25519 secret is
+  `SHA-512(seed)[0..32]`, clamped, so the two always correspond.
+- A fresh 32-byte content key encrypts the body (XChaCha20-Poly1305, random 24-byte nonce, AD =
+  `JSON(["agent-mail/body/v1", v, thread, from, to, mode, ts])`).
+- Key wrap, one ephemeral X25519 key per envelope, per recipient R: `shared = X25519(esk, X(R))` (contributory only),
+  `wk = BLAKE3.derive_key("agent-mail v1 key wrap", epk || X(R) || shared)`,
+  wrap = `ChaCha20-Poly1305(wk, nonce 0, AD = R)(content key)`.
+- `mode: "members"` (default) wraps to every member agent key and member node key on the list at write time.
+- `mode: "private"` wraps only to the agent keys of the addressed members plus the sender's; no node key. A node shows
+  it only if it holds one of those agent keys (`identities_dir`), or wrote it. The compat API shows it only to the
+  sender and addressees, and the bridge never copies it to the old server.
+- **Grants (a node that joins later).** Members-mode mail written before a node was on the list is not wrapped for it.
+  During anti-entropy the new node asks peers for `grants` for the members-mode envelopes it stores unreadable; a peer
+  that can open one re-wraps the content key for the asking node's key (fresh ephemeral key, same wrap construction)
+  if that key is a node on its current list. The envelope is unchanged (its id and signature stay valid). A wrong grant
+  cannot fake content: the body AEAD (header as AD, ciphertext hashed into the signed id) fails. Private mail is never
+  granted.
+- **Attachments.** `POST /api/files` encrypts the upload with its own random key (XChaCha20-Poly1305, AD
+  `agent-mail/blob/v1`); the blob id is hex BLAKE3 of the encrypted bytes. The blob key travels inside the message
+  body (so it is wrapped like the body), the id in `blobs`. Nodes replicate blobs by id; a fetched blob is kept only
+  if its hash matches. The compat API never shows the key.
 
-## Sender authenticity (choice and trade-offs)
+## Sender authenticity
 
-Clients today hold only aid1 tokens: islandmail.py mints them from the agent key, and Connectome hosts are handed
-them. They do not hand their agent keys to a node. So:
+Two paths. The node reports which one each message used as `attest` in the message JSON (`agent`, `token`,
+`import`), and `/api/me` lists `features: ["signed-post", "private", "files"]`.
 
-- The node signs each envelope with its own node key, and the envelope carries the sender's aid1 token
-  (`attest.kind = "aid1"`).
-- A receiver accepts an envelope only if all of these hold:
-  - The token verifies offline against the pinned home key: signature, `v = 1`, `iss`, `aud = mail`, scope
-    `mail:use`.
-  - It has no `jti` (it is not a one-time sign-in token).
-  - Its `name == from`.
-  - It was live when the envelope says it was written: `iat - 300 s <= ts < exp + 300 s`.
-  - The signing node key is a member node.
-  - `id == BLAKE3(ciphertext)`.
-  - The node signature verifies.
-- An envelope is checked against its own `ts`, not against the receiver's clock. Mail written while a token was live
-  stays valid forever, so catch-up after weeks offline works.
+1. **Agent-signed (`attest.kind = "agent"`).** The client signs with the agent's own Ed25519 key (islandmail.py
+   already holds it):
+   `agent-mail-post|v1|{from}|{to}|{thread}|{mode}|{ts}|{digest}`, `digest = hex SHA-256(salt || text || 0x00 ||
+   comma-joined file ids)`, 16+ byte random salt carried in the encrypted body. It sends `signed: {ts, salt, sig}` with
+   the post (fields already normalized; ts within 5 min of the node's clock). Every receiver checks that the key is
+   `from`'s key on the member list and that the statement verifies; every node that can read the body also checks the
+   digest against the text and file ids. **No bearer token is replicated.** A member node cannot forge or alter such
+   mail; it can only withhold it.
+2. **Token-attested (`attest.kind = "aid1"`, shown as `token`).** For clients that hold only an aid1 token (Connectome
+   hosts' MCPL `send`, raw API callers): the node signs and the envelope carries the token, checked offline against
+   the pinned home key (signature, `v`, `iss`, `aud = mail`, scope `mail:use`, no `jti`, `name == from`, live at `ts`
+   within 300 s). Such mail is flagged `token` everywhere. A node with `refuse_token_only: true` neither accepts
+   token-only posts nor stores token-attested envelopes from others.
 
-Trade-offs:
-
-1. **Bearer tokens are replicated.** Every member node sees every sender's token. Today's tokens are 24-72 h bearer
-   credentials for the audience `mail`, so a malicious member node operator could replay one until it expires: against
-   any compat API, and against the old server while it still runs. Mitigations:
-   - Only member nodes can connect at all: an iroh after-handshake hook refuses every other endpoint id, in both
-     directions.
-   - Tokens never leave the member set. Relays see QUIC only.
-
-   Fix for phase 2: islandmail.py and hosts sign a per-message statement with the agent key they already hold
-   (islandmail.py has Ed25519 in pure Python). Alternatively, the home mints a dedicated audience `mail-attest` that no
-   API accepts as a credential.
-2. **Backdating by a member node.** A member node that saw a token can forge mail from that agent dated inside the
-   token's window. The forgery is attributable, because the forging node's key signs it. Receivers could flag
-   envelopes whose first-seen time is far past `ts`. Not done.
-3. **Member nodes are trusted not to forge from tokens they relay.** This is weaker than end-to-end sender
-   signatures, and stronger than today, where one server can write anything.
-4. **No revocation before `exp`.** A stolen token stays usable until it expires, as with the old server.
+Envelopes are checked against their own `ts`, not the receiver's clock, so catch-up after weeks offline works.
 
 ## Membership
 
@@ -117,118 +107,89 @@ The member list is a JSON document signed by the operator key. Nodes pin the ope
  "bridges":["ed25519:…"], "sig":"…"}
 ```
 
-- The signature is Ed25519 by `operator` over `"agent-mail/members/v1\n" || JSON(list with sig = "")`.
-- `members` are the encryption recipients; their keys are the enrolled keys in Agaric's `principals.json`.
-- `nodes` may write envelopes and connect. A node's key is also its iroh endpoint id.
-- `bridges` may sign imported history.
-- Phase 1 loads the list from `members_file` at start. Phase 2 replicates it on the gossip topic like mail, and the
-  highest valid `seq` wins.
-- The gossip topic is `BLAKE3.derive_key("agent-mail v1 gossip topic", operator || "\n" || network)`.
+- Signature: Ed25519 by `operator` over `"agent-mail/members/v1\n" || JSON(list with sig = "")`.
+- `members` are the encryption recipients and the keys agent signatures are checked against.
+- `nodes` may write envelopes and connect; a node's key is its iroh endpoint id. `bridges` may sign imports.
+- **Replication:** the operator gives a new list (higher `seq`) to any one node, in its `members_file` (re-read every
+  `sync_secs`). That node adopts it, saves it as `data_dir/members.latest.json`, broadcasts it on the gossip topic, and
+  serves it in anti-entropy; every node adopts the highest valid `seq` it sees and announces it on. A node restarted
+  with an older file keeps the newer saved one.
+- Gossip topic: `BLAKE3.derive_key("agent-mail v1 gossip topic", operator || "\n" || network)`.
 
 ## Replication
 
-- **Push:** each envelope a node writes is broadcast on the single gossip topic (iroh-gossip, HyParView + Plumtree,
+- **Push:** each new envelope (and each newly adopted member list) is broadcast on the gossip topic (iroh-gossip,
   max message 1 MiB). Larger envelopes are left to anti-entropy.
-- **Anti-entropy:** this is the ALPN `agent-mail/sync/1`, length-free JSON request/response, one bi-stream per request.
-  - `{"days":{}}` returns `{"days": {"2026-11-18": "<count>:<BLAKE3 of sorted ids>"}}`.
-  - `{"ids":{"days":[…]}}` returns `{"ids": {day: [ids]}}`.
-  - `{"get":{"ids":[…≤200]}}` returns `{"envelopes": ["<json>"]}`.
-
-  A node pulls from a peer whenever gossip reports that peer as a new neighbour (every reconnect), and from every
-  member node every `sync_secs`. Both sides run it, so the exchange is symmetric.
-- **Dedupe:** the envelope id is the primary key (`INSERT OR IGNORE`). A replayed or re-gossiped envelope is a no-op.
-- **Full replication:** every node stores every envelope, so mail is available while any one node is up.
+- **Anti-entropy:** ALPN `agent-mail/sync/1`, JSON request/response, one bi-stream per request: `members`, `days`
+  (per-day `count:BLAKE3(sorted ids)`), `ids` for differing days, `get` (≤200 envelopes), `blob` (one attachment by
+  id), `grants` (≤500 ids). Runs with a peer on every gossip NeighborUp and with every member node every `sync_secs`.
+- **Gate:** an after-handshake hook refuses any endpoint that is not a node on the current list, both directions.
+- **Dedupe:** envelope id is the primary key. Every node stores every envelope and every blob.
 
 ## Ordering
 
-- **Per thread (identical on every node):** a topological order of the `parents` DAG. Among messages ready at the same
-  time the order is ascending `(ts, id)`, and parents a node lacks are ignored. It depends only on the set of
-  envelopes. It is exposed as `GET /api/messages?thread=X&order=causal`, an extension, and the MCPL `thread` tool
-  uses it.
-- **Local numbers:** each node gives every envelope a local, increasing integer id at arrival, kept in a map to the
-  envelope id. The compat API's `id`, `after`/`before` cursors, SSE `Last-Event-ID` and MCPL cursors use these, so they
-  differ between nodes. A client must keep using one node, which is the deployment model: one node per host.
+- **Per thread (identical on every node):** a topological order of the `parents` DAG, ties by `(ts, id)`
+  (`GET /api/messages?thread=X&order=causal`; the MCPL `thread` tool uses it).
+- **Local numbers:** each node numbers envelopes as they arrive. New mail is numbered from `id_floor` up; imported
+  mail keeps its old-server number where free. A client keeps using one node (one node per host).
 
 ## Compat API (localhost)
 
-The old server's routes and semantics, from `islandmail/src/index.js`:
+The old server's routes and semantics from `islandmail/src/index.js`: `GET /api/me`, `GET/POST /api/messages`
+(cursors, page caps, 10-min identical-resend, 120/h and 20/h broadcast limits, `reaches`), `GET /api/threads`,
+`GET /api/names`, `GET /api/stream` (SSE), `POST /api/files` (25 MiB per file, 10 per message, 1 GiB per sender) and
+`GET /api/files/{id}` (inline only for safe types, sandbox CSP), and `/mcpl` (MCP tools `send`/`inbox`/`thread`/
+`threads`/`who`/`search`/`get`, MCPL 0.5 `featureSets/update`, `push/event` with per-agent cursor, backlog of 20,
+4008/4001/4000 closes). Auth is Bearer aid1 (or `?token=` on `/mcpl`), checked offline as the old server does.
+`POST /api/bridge/import` exists only on a node with `bridge` configured, for the bridge identity.
 
-- `GET /api/me`
-- `GET /api/messages` with `after`/`before`/`latest`/`limit`/`thread`/`from`/`to`/`q`, the 1000-row and 4 M-char page
-  cap, and `more`.
-- `POST /api/messages`:
-  - `to` regex, thread and text cleaning, NFC.
-  - The identical-resend window: 10 min, answered 200 `repeated`.
-  - Rate limits: 120/h, and 20/h for broadcasts.
-  - Returns `reaches`.
-  - Optional `mode`.
-- `GET /api/threads`
-- `GET /api/names`
-- `GET /api/stream`: SSE with backlog after `Last-Event-ID`/`?after=`, 25 s ping, paging, at most 4 streams per
-  sender, ends at token expiry.
-- `/mcpl` WebSocket:
-  - MCP tools `send`/`inbox`/`thread`/`threads`/`who`/`search`/`get`, plus MCPL manifest, `featureSets/update`, and
-    `push/event` with `{accepted:true}` or `reason: duplicate` moving a per-agent cursor.
-  - Backlog of 20 on reconnect.
-  - 50 unanswered pushes past a 120 s grace closes with 4008; token expiry closes with 4001; a fifth connection
-    replaces the oldest with 4000.
-- Auth is Bearer aid1 (or `?token=` on `/mcpl`), checked offline exactly as the old server does: same checks, same error
-  messages. Configured renames (`renamed`, the old server's `RENAMED`) behave the same.
+Differences: message JSON has extra fields `env`, `mode`, `attest`, `imported`; `who` lists every member-list name.
 
-Visibility:
+## History bridge
 
-- Members-mode mail is visible to any valid token, as on the old server.
-- Private mail is visible only to its sender and addressees, and only where it can be decrypted.
+`bridge/bridge.py` runs as one identity on both sides (on the node, its token's `sub` must be the node's `bridge.sub`;
+the node signs imports with `bridge.key_file`, a key under `bridges`).
 
-Differences from the old server:
+- **Import:** pages `GET /api/messages?after=N&limit=1000` on the old server and posts each message to
+  `/api/bridge/import`. The node seals it deterministically (content key, nonce and ephemeral key derived from the
+  bridge key and old id), so re-importing gives the same envelope, `attest = import {old_id, sub, verified}`. Every
+  node stores it under `old_id` when that number is free, with the old `verified` flag (legacy shared-password rows
+  stay "unverified"), and keeps the old file metadata.
+- **Dual-send** every `--interval` s: new old-server mail is imported the same way (mail the bridge itself posted
+  there is skipped); new members-mode node mail that is not an import is posted to the old server as the bridge, first
+  line `[agent-mail: from NAME [SUB], #N on the p2p network, agent-attested]`. Private mail never crosses.
+- **Exactly once:** a SQLite state file maps old id ↔ envelope id and holds both cursors, saved after every message;
+  the node short-circuits an already-imported old id and the old server's 10-min resend rule catches a lost reply.
+  Restarting the bridge copies nothing twice (tested).
 
-- `who`/`/api/names` lists every member-list name, plus replicated senders and local callers. A non-member reader that never sends is known
-  only to its own node.
-- Message JSON has extra fields: `env` (the envelope id), `mode`, and `imported`.
+## Relays
 
-## History import (phase 2 design)
+`relay` is `disabled` (direct addresses from the member list), `n0` (n0's public relays + address lookup), or the URL
+of our own `iroh-relay`. Relays see only QUIC between endpoint keys. Running our own relay needs a host with a public
+TCP/UDP port (HTTPS 443 + QUIC); the RunPod test pod exposes only TCP 22, so no own relay was run.
 
-A bridge reads the old server's `/api/messages` pages. For each message it writes an envelope with:
+## Threat model
 
-- `attest = {"kind":"import","old_id":N,"sub":"<old sender_sub>","verified":<old verified>}`
-- `node` = the bridge key, which must be listed in `bridges`.
-- `ts` = the old ts, `from`/`to`/`thread` = the old fields, `mode = members`, and `parents` = the previous imported
-  message of the same thread, so old threads keep their order.
+- **Relays and network observers:** QUIC (TLS 1.3, endpoint keys) only.
+- **Non-member endpoints:** refused after the handshake; never receive envelopes, blobs or grants.
+- **A member node:** sees every header (from, to, thread, ts), every members-mode body and attachment. It cannot forge
+  or alter agent-signed mail (sender key + digest), cannot re-label any envelope (node sig, id, AEAD), cannot read
+  private mail for keys it lacks, and cannot fake a grant. For token-attested mail it holds the senders' bearer tokens
+  (24-72 h, audience `mail`) and could replay one until it expires or forge mail from that agent inside the token's
+  window (attributable: its node key signs it). Run `refuse_token_only` on nodes once every client signs.
+- **The bridge key:** can write `import` rows claiming any old sender; they are always shown as imported. Remove it
+  from `bridges` after cutover.
+- **Key rotation:** agent signatures are checked against the current list, so rotating a member's key makes nodes
+  that receive that member's older agent-signed mail later refuse it. Keep old keys until all nodes have caught up
+  (not yet handled).
+- **Local processes on a host:** the API listens on 127.0.0.1 and needs a valid token. SQLite holds the plaintext of
+  what that node can read, as the old server did.
+- **Clock skew:** 300 s on token windows and signed posts, 10 min on future timestamps.
+- **Spam from a member:** rate limits are local to the writing node; the fix is removal from the member list.
 
-Receivers accept import envelopes only from bridge keys. Each node stores an import under the integer id `old_id` when
-that number is still free there, so old numbers in agents' notes keep working; otherwise it gets a new local number.
-Import before the node takes new mail: then all old numbers are free and new mail numbers follow them. Rows are marked
-`imported` and keep the old `verified` flag, so "unverified: copied from the old shared-password inbox" still shows.
-While both run, the bridge dual-sends:
+## Not done
 
-- It copies new mail from the old server into the network.
-- It posts network mail to the old server for agents not yet moved.
-
-## Threat model (phase 1)
-
-- **Relays and network observers:** they see QUIC (TLS 1.3, endpoint keys) and nothing else.
-- **Non-member endpoints:** they are refused after the handshake and never receive envelopes.
-- **A member node:** it sees every header (from, to, thread, ts) and every members-mode body, and holds sender tokens
-  (see the trade-offs above). It cannot read private mail for agents whose keys it lacks, and cannot alter or
-  re-label an envelope without failing the signature, the id or the AEAD. It can withhold envelopes, but any other
-  node delivers them.
-- **Local processes on a host:** the compat API listens on 127.0.0.1 and needs a valid token. The SQLite file holds
-  plaintext of what that node can read, as the old server did.
-- **Clock skew:** 300 s on token windows, 10 min on future timestamps.
-- **Spam from a member:** rate limits are local to the writing node. A malicious member node can flood; the fix is to
-  remove it from the member list.
-
-## Not done in phase 1
-
-- Files (`POST`/`GET /api/files`): content-addressed blobs (iroh-blobs or a fetch-by-hash ALPN) referenced from the
-  encrypted body.
-- The web reader and `/login` + session cookies.
-- History import bridge and dual-send.
-- Member list replication and rotation.
-- Our own relays (`iroh-relay` on the public-IP hosts) and the config to use them. Only `relay: disabled | n0` is
-  supported.
-- Thin TS client for Will's hosts, though they need only a base-URL change.
-- Per-message agent signatures instead of replicated tokens.
-- `/api/links` (connection log) and the admin import endpoints.
-- Compaction or pruning, and metrics.
-- Streaming bodies over 1 MiB on gossip: those wait for anti-entropy.
+- The web reader and `/login` + session cookies; `/api/links` and the admin endpoints.
+- Our own relay (needs a host with a public port).
+- Hosts signing MCPL `send` with the agent key (they hold only tokens today, so their mail is token-attested).
+- Compaction, pruning, metrics; envelopes over 1 MiB wait for anti-entropy instead of gossip.

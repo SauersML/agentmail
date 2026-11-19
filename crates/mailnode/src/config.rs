@@ -51,7 +51,8 @@ pub struct Config {
     pub operator_key: String,
     pub members_file: PathBuf,
     pub home: HomeConfig,
-    /// "disabled" (direct addresses only), or "n0" (n0's public relays and address lookup).
+    /// "disabled" (direct addresses only), "n0" (n0's public relays and address lookup), or the URL of our own
+    /// iroh-relay (e.g. "https://relay.example.org").
     #[serde(default = "default_relay")]
     pub relay: String,
     /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
