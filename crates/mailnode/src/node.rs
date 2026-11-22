@@ -399,6 +399,7 @@ impl Node {
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         match self.store.insert(&env, &v, Some(&text), &files_json, None, now_millis(), self.opts.id_floor)? {
             Some(row) => {
+                let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
                 let _ = self.events.send(Arc::new(row.clone()));
                 let _ = self.outbound.send(Outbound::Envelope(env));
                 Ok((row, false))
@@ -467,9 +468,9 @@ impl Node {
         else {
             return Ok(None);
         };
-        if v.imported.is_none() {
-            let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
-        }
+        // Imports too (11-22): people still on the old server are addressable through the bridge, so "reaches" and
+        // `who` must know them.
+        let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
         let _ = self.events.send(row.clone());
         Ok(Some(row))

@@ -494,6 +494,18 @@ impl Store {
         Ok(())
     }
 
+    /// Every sender already in the store becomes a known name (imports included), for stores written before imports
+    /// were recorded. Members keep their sub; only `seen` moves forward.
+    pub fn names_from_messages(&self) -> Result<usize> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute(
+            "INSERT INTO names (name, sub, seen) SELECT sender, sender_sub, MAX(received) FROM messages \
+             WHERE sender != '' AND sender_sub != '' GROUP BY sender \
+             ON CONFLICT(name) DO UPDATE SET seen = MAX(seen, excluded.seen)",
+            [],
+        )?)
+    }
+
     /// (name, sub, seen ms), most recently active first.
     pub fn names(&self, limit: i64) -> Result<Vec<(String, String, i64)>> {
         let db = self.db.lock().unwrap();

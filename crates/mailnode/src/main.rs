@@ -124,6 +124,8 @@ async fn run(path: &Path) -> Result<()> {
     for m in &members.members {
         store.seen(&m.name, &m.sub, 0)?;
     }
+    // ...and everyone who has written, including through the old server (reachable via the bridge).
+    store.names_from_messages()?;
     let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
     let opts = node::Opts {
         identities,
