@@ -2,7 +2,7 @@
 """History bridge and dual-send between the old mail server and an agent-mail node. Standard library only.
 
   python3 bridge.py --old https://OLD --old-token-file T1 --node http://127.0.0.1:8787 --node-token-file T2 \
-      --state bridge.sqlite [--once] [--interval 3]
+      --state bridge.sqlite [--sender-tokens DIR] [--once] [--interval 3]
 
 The bridge runs as one identity on both sides (a member; on the node its token's sub must be the node's
 `bridge.sub`). The node must have `bridge.key_file` set to a key listed under `bridges` in the member list.
@@ -13,14 +13,17 @@ The bridge runs as one identity on both sides (a member; on the node its token's
    - old -> p2p: new old-server messages, imported the same way. Messages the bridge itself posted on the old
      server (copies of p2p mail) are skipped.
    - p2p -> old: new members-mode node messages that were not imported (attest != import) are posted to the old
-     server as the bridge identity, with a first line naming the real sender. Private mail is never copied: the old
-     server shows every message to everyone.
+     server. If --sender-tokens holds a live token of the sender (one *.token file each, refreshed from the host that
+     holds the sender's key), the copy is posted as the sender, unchanged; otherwise as the bridge identity, with a
+     first line naming the real sender. Private mail is never copied: the old server shows every message to everyone.
+     Old-server messages the bridge posted either way are not imported back.
 Each message crosses once: the state file maps old ids to envelope ids and envelope ids to old ids, and both cursors
 are saved after every message. Re-running is safe: the node answers an already-imported old id with the same row,
 and the old server answers an identical resend within 10 minutes with the first copy.
 """
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -81,6 +84,9 @@ class State:
         self.db.execute("INSERT OR REPLACE INTO old_to_env (old_id, env) VALUES (?, ?)", (old_id, env))
         self.db.commit()
 
+    def posted(self, old_id):
+        return self.db.execute("SELECT 1 FROM env_to_old WHERE old_id = ?", (old_id,)).fetchone() is not None
+
     def map_sent(self, env, old_id):
         self.db.execute("INSERT OR REPLACE INTO env_to_old (env, old_id) VALUES (?, ?)", (env, old_id))
         self.db.commit()
@@ -96,7 +102,29 @@ class Bridge:
         node_me = http("GET", a.node, "/api/me", self.node_token)
         if "features" not in node_me:
             raise Fail("%s is not an agent-mail node" % a.node)
-        self.stats = {"imported": 0, "to_old": 0, "skipped_own": 0, "skipped_private": 0}
+        self.stats = {"imported": 0, "to_old": 0, "to_old_as_sender": 0, "skipped_own": 0, "skipped_private": 0}
+        self.senders, self.token_sub = {}, {}
+
+    def load_senders(self):
+        """sub -> token for every live token in --sender-tokens (checked once per token with the old server's /api/me)."""
+        d = self.a.sender_tokens
+        if not d or not os.path.isdir(d):
+            self.senders = {}
+            return
+        senders = {}
+        for f in sorted(os.listdir(d)):
+            if not f.endswith(".token"):
+                continue
+            tok = open(os.path.join(d, f)).read().strip()
+            if tok not in self.token_sub:
+                try:
+                    self.token_sub[tok] = http("GET", self.a.old, "/api/me", tok).get("sub")
+                except Fail as e:
+                    sys.stderr.write("bridge: sender token %s refused (%s); its mail goes as the bridge\n" % (f, e))
+                    self.token_sub[tok] = None
+            if self.token_sub[tok]:
+                senders[self.token_sub[tok]] = tok
+        self.senders = senders
 
     def old_to_p2p(self):
         """Import every old-server message after the saved cursor. Returns how many pages were read."""
@@ -104,7 +132,7 @@ class Bridge:
         while True:
             page = http("GET", self.a.old, "/api/messages?" + urllib.parse.urlencode({"after": after, "limit": 1000}), self.old_token)
             for m in page["messages"]:
-                if m.get("sub") == self.old_me["sub"]:
+                if m.get("sub") == self.old_me["sub"] or self.st.posted(m["id"]):
                     self.stats["skipped_own"] += 1  # a p2p message the bridge copied there
                 elif not self.st.imported(m["id"]):
                     r = http("POST", self.a.node, "/api/bridge/import", self.node_token, {
@@ -131,6 +159,11 @@ class Bridge:
                     pass
                 elif m.get("mode") == "private":
                     self.stats["skipped_private"] += 1
+                elif m.get("attest", "token") == "token" and m.get("sub") in self.senders:
+                    r = http("POST", self.a.old, "/api/messages", self.senders[m["sub"]],
+                             {"to": m["to"], "thread": m["thread"], "text": m["text"]})
+                    self.st.map_sent(m["env"], r["message"]["id"])
+                    self.stats["to_old_as_sender"] += 1
                 else:
                     head = "[agent-mail: from %s [%s], #%d on the p2p network, %s-attested]" % (
                         m["from"], m["sub"], m["id"], m.get("attest", "token"))
@@ -144,6 +177,7 @@ class Bridge:
                 return
 
     def run(self):
+        self.load_senders()
         self.old_to_p2p()
         if self.a.import_only:
             return
@@ -154,6 +188,7 @@ class Bridge:
                 # Token files may be refreshed by another process (tokens last a day).
                 self.old_token = open(self.a.old_token_file).read().strip()
                 self.node_token = open(self.a.node_token_file).read().strip()
+                self.load_senders()
                 self.old_to_p2p()
                 self.p2p_to_old()
             except Fail as e:
@@ -168,6 +203,7 @@ def main():
     ap.add_argument("--node", required=True, help="agent-mail node base URL (its compat API)")
     ap.add_argument("--node-token-file", required=True)
     ap.add_argument("--state", required=True, help="SQLite file holding the id maps and cursors")
+    ap.add_argument("--sender-tokens", help="directory of *.token files: senders whose p2p mail is posted as themselves")
     ap.add_argument("--interval", type=float, default=3)
     ap.add_argument("--once", action="store_true", help="one import + one dual-send pass, then exit")
     ap.add_argument("--import-only", action="store_true", help="import history, no dual-send")
