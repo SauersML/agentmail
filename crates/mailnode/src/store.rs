@@ -254,11 +254,18 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
     }
 
+    /// One message by local number, else by its old-server number: an import that reached this node after newer mail
+    /// got a new local number (see insert), but agents still cite the old server's.
     pub fn get(&self, id: i64, viewer: &str) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
-        let row = db
+        let mut row = db
             .query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
             .optional()?;
+        if row.is_none() {
+            row = db
+                .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, id], read_row)
+                .optional()?;
+        }
         Ok(row.filter(|r| r.visible_to(viewer)))
     }
 
