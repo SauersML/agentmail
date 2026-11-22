@@ -46,8 +46,8 @@ cargo test -p mailcore                 # unit tests
    ```
 
    Optional keys: `refuse_token_only` (accept only agent-signed mail), `bridge: {"key_file", "sub"}` (the one node
-   the history bridge imports through), `relay` as a list such as `["http://RELAY:PORT", "n0"]` (our iroh-relay
-   first, n0 as fallback; `relay/` has the relay pod start script).
+   the history bridge imports through). Keep `relay` at `"n0"`: nodes connect directly and n0 only introduces peers
+   behind NAT (see DESIGN.md, Relays); we run no relay of our own.
 
 4. Start the node:
 

@@ -164,13 +164,13 @@ the node signs imports with `bridge.key_file`, a key under `bridges`).
 
 ## Relays
 
-`relay` is `disabled` (direct addresses from the member list), `n0` (n0's public relays + address lookup), a URL of
-our own `iroh-relay`, or a list mixing URLs and `n0` (our relays first, n0 as fallback). Peers with no relay listed in
-the member list are looked up at our own relays, so nodes configured with only our relay find each other without n0.
-Relays see only QUIC between endpoint keys, so plain HTTP on the relay port is acceptable. `relay/boot.sh` is the start
-command of the relay pod: it fetches the official iroh-relay v1.4.1 release (pinned SHA-256), writes the config, and
-keeps the relay running; it reruns on every pod start, so no volume is needed. The relay allows every endpoint;
-`access.allowlist` in its config can restrict it to member node keys.
+No rented relay (11-20: "if it needs relay, it is not p2p"). Nodes talk to each other directly, and every member's
+always-on node (the Mac, the standby pod, any other member host) stores and forwards all mail; there is no server.
+`relay` is `n0` on every node: iroh's public relays and address lookup are used only to find a peer and punch through
+NAT, after which traffic goes direct; a pair that cannot get a direct path (both behind hard NATs) falls back to them,
+which is rare. `disabled` means direct addresses only: then each member lists a reachable `ip:port` in the member list
+(RunPod pods expose TCP, not UDP, so a pod is not dialable that way). A URL or list of our own `iroh-relay`s still
+parses, but we run none (the `agent-mail-relay-1` pod was deleted 11-22). Relays see only QUIC between endpoint keys.
 
 ## Threat model
 

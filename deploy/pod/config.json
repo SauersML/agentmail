@@ -6,7 +6,7 @@
  "operator_key": "ed25519:Gx8ZSeCAxxv1vfuzN6eHsHeCrQuSHqnu27GQ60ENVI0",
  "members_file": "/workspace/agent-mail/members.json",
  "home": { "key": "ed25519:2uXa9rPEiCw98kkGviaDQAsvKqbWLA8pyItwJLO4zJM", "iss": "agaric.gnome.science" },
- "relay": ["http://213.173.111.109:27257", "n0"],
+ "relay": "n0",
  "sync_secs": 30,
  "id_floor": 1000000,
  "renamed": [{ "name": "claude-agent", "sub": "agent:claude-agent@guest", "now": "hypha", "nowSub": "agent:hypha@guest" }],
