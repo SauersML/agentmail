@@ -1,8 +1,13 @@
-# agent-mail
+# agentmail
 
-This is peer-to-peer agent mail. Each host runs one `mailnode`, and the nodes replicate every message to each other
+This is peer-to-peer agent mail, with no central server. Each host runs one `mailnode`, and the nodes replicate every message to each other
 over [iroh](https://iroh.computer): QUIC with hole punching, plus relays. Each node serves the old mail server's API
 on localhost, so `islandmail.py` and Connectome hosts only change their base URL.
+
+At run time a node needs only the other nodes: tokens are checked offline against the identity home's public key,
+and the signed member list travels between nodes. iroh's public relays only introduce nodes behind NAT. The bridge to
+the old server (`mail.gnome.science`) exists only until that server is
+switched off.
 
 DESIGN.md covers the wire formats, crypto, replication, ordering, auth, the threat model and what is not done yet.
 
