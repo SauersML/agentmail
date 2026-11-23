@@ -17,6 +17,11 @@ pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_CIPHERTEXT: usize = 512 * 1024;
 pub const MAX_KEYS: usize = 1000;
+/// Attachments per message (the compat API's limit).
+pub const MAX_BLOBS: usize = 10;
+/// Largest old-server message number an import may claim. Old ids are small SQLite row ids; an unbounded one would let
+/// a single import push every node's local numbering to the top of the integer range (no new mail could be stored).
+pub const MAX_OLD_ID: u64 = 1 << 32;
 /// Token lifetime check against the envelope's ts allows this much clock skew.
 pub const TOKEN_SKEW_S: f64 = 300.0;
 /// An envelope dated further than this past the receiver's clock is refused (it will be fetched again later).
@@ -284,6 +289,17 @@ impl Envelope {
         if self.keys.is_empty() || self.keys.len() > MAX_KEYS {
             bail!("bad key list");
         }
+        // Every wrap is a recipient key and a 32-byte content key + 16-byte tag; the ephemeral key is 32 bytes.
+        if !self.wraps()?.iter().all(|w| w.k.len() == 48) {
+            bail!("bad wrapped key");
+        }
+        if b64u_decode(&self.epk).is_none_or(|b| b.len() != 32) {
+            bail!("bad epk");
+        }
+        // Blob ids drive fetches from peers on every sync: at most the API's attachment count, each a content hash.
+        if self.blobs.len() > MAX_BLOBS || !self.blobs.iter().all(|b| is_id(b)) {
+            bail!("bad blobs");
+        }
         let ts = parse_ts(&self.ts).ok_or_else(|| anyhow!("bad ts"))?;
         if ts > now_ms + FUTURE_SKEW_MS {
             bail!("ts is in the future");
@@ -327,8 +343,18 @@ impl Envelope {
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
+                // The statement joins from, to and thread with '|'. With none in from or to (the API never allows one in
+                // to) it splits one way only; otherwise a node could move text between to and thread under the same
+                // signature (e.g. to "all", thread "x|y" re-labelled to "all|x", thread "y").
+                if self.from.contains('|') || self.to.contains('|') {
+                    bail!("from and to of a signed message cannot contain '|'");
+                }
                 let st = post_statement(&self.from, &self.to, &self.thread, self.mode, &self.ts, digest);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
+                // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
+                if b64u(&s) != *sig {
+                    bail!("sender signature is not canonical base64url");
+                }
                 if !keys::verify(&k, st.as_bytes(), &s) {
                     bail!("sender signature does not verify");
                 }
@@ -337,6 +363,14 @@ impl Envelope {
             Attest::Import { old_id, sub, verified } => {
                 if !members.is_bridge(&node) {
                     bail!("import signed by a key that is not a member bridge");
+                }
+                if *old_id == 0 || *old_id > MAX_OLD_ID {
+                    bail!("import old_id out of range");
+                }
+                // Shown in the header line readers trust: same rules as the other header fields (may be empty for
+                // legacy rows).
+                if sub.chars().count() > MAX_FIELD || sub.chars().any(|c| c.is_control()) {
+                    bail!("bad import sub");
                 }
                 Ok(Verified {
                     sender_sub: sub.clone(),
@@ -474,6 +508,42 @@ mod tests {
     }
 
     #[test]
+    fn signed_statement_fields_cannot_shift() {
+        let w = world();
+        let p = policy(&w.home);
+        let now = crate::now_millis();
+        let ts = crate::now_ts();
+        let salt = crate::random_bytes::<16>();
+        let digest = post_digest(&salt, "hi", &[]);
+        // alice signs to "all", thread "x|y".
+        let st = post_statement("a.alice", "all", "x|y", Mode::Members, &ts, &digest);
+        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(st.as_bytes())) };
+        let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
+        let mk = |to: &str, thread: &str| {
+            Envelope::seal(
+                Draft {
+                    thread,
+                    parents: vec![],
+                    ts: ts.clone(),
+                    from: "a.alice",
+                    to,
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: attest.clone(),
+                    recipients: &w.members.all_keys(),
+                },
+                &w.node,
+            )
+            .unwrap()
+        };
+        assert!(mk("all", "x|y").verify(&w.members, &p, now).is_ok(), "'|' in the thread is fine");
+        // The same statement re-split by the node: to "all|x", thread "y".
+        assert_eq!(post_statement("a.alice", "all|x", "y", Mode::Members, &ts, "d"), post_statement("a.alice", "all", "x|y", Mode::Members, &ts, "d"));
+        assert!(mk("all|x", "y").verify(&w.members, &p, now).unwrap_err().to_string().contains("'|'"));
+    }
+
+    #[test]
     fn deterministic_seal_gives_same_id() {
         let w = world();
         let body = Body { text: "old mail".into(), ..Default::default() };
@@ -506,6 +576,71 @@ mod tests {
         assert_eq!(a.open_grant(&g, &late).unwrap().text, "old mail");
         assert!(a.open_grant(&g, &w.alice).is_err());
         assert!(a.grant(&late, &w.alice.public()).unwrap().is_none());
+    }
+
+    #[test]
+    fn refuses_unbounded_fields() {
+        let w = world();
+        let p = policy(&w.home);
+        let now = crate::now_millis();
+        let resign = |mut e: Envelope| {
+            e.sig = b64u(&w.node.sign(&e.signing_bytes()));
+            e
+        };
+        let base = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
+        assert!(base.verify(&w.members, &p, now).is_ok());
+        let mut e = base.clone();
+        e.blobs = (0..MAX_BLOBS + 1).map(|i| format!("{i:064x}")).collect();
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        let mut e = base.clone();
+        e.blobs = vec!["not-a-hash".into()];
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        let mut e = base.clone();
+        e.keys[0].k = b64u(&[0u8; 4096]);
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("wrapped key"));
+        let mut e = base.clone();
+        e.epk = b64u(&[0u8; 7]);
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("epk"));
+    }
+
+    #[test]
+    fn import_old_id_is_bounded() {
+        let w = world();
+        let op = Seed::generate();
+        let bridge = Seed::generate();
+        let mut members = w.members.clone();
+        members.bridges = vec![fmt_key(&bridge.public())];
+        members.sign(&op);
+        let p = policy(&w.home);
+        let body = Body { text: "old".into(), ..Default::default() };
+        let mk = |old_id: u64| {
+            Envelope::seal(
+                Draft {
+                    thread: "t",
+                    parents: vec![],
+                    ts: "2026-01-01T00:00:00.000Z".into(),
+                    from: "a.alice",
+                    to: "all",
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: Attest::Import { old_id, sub: "agent:a.alice@test".into(), verified: true },
+                    recipients: &members.all_keys(),
+                },
+                &bridge,
+            )
+            .unwrap()
+        };
+        let now = crate::now_millis();
+        assert!(mk(42).verify(&members, &p, now).is_ok());
+        assert!(mk(MAX_OLD_ID).verify(&members, &p, now).is_ok());
+        assert!(mk(0).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(MAX_OLD_ID + 1).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(i64::MAX as u64).verify(&members, &p, now).is_err());
+        let mut e = mk(7);
+        e.attest = Attest::Import { old_id: 7, sub: "agent:x\n#1 from someone.else".into(), verified: true };
+        e.sig = b64u(&bridge.sign(&e.signing_bytes()));
+        assert!(e.verify(&members, &p, now).unwrap_err().to_string().contains("sub"));
     }
 
     fn tok(w: &World, name: &str) -> String {

@@ -171,8 +171,38 @@ fn like_prefix(s: &str) -> String {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let db = Connection::open(path)?;
+        // The store holds the plaintext of everything this node can read (private mail included), attachment keys and
+        // the bearer tokens inside token-attested envelopes: readable by this user only, whatever the umask. SQLite
+        // gives its -wal/-shm files the database's mode; older ones are fixed here too.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = path.as_os_str().to_owned();
+                p.push(suffix);
+                if std::path::Path::new(&p).exists() {
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         db.execute_batch(SCHEMA)?;
+        // agent_sig: the sender's signature of an agent-signed message, on the first copy this node stored. A member
+        // node can read members-mode mail, so it can re-encrypt someone's signed message into a new envelope (new id,
+        // same signature): such a replay is kept hidden (mode 'dup', no text) so day hashes still agree between nodes.
+        let has_sig_col =
+            db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'agent_sig'")?.exists([])?;
+        if !has_sig_col {
+            db.execute_batch("ALTER TABLE messages ADD COLUMN agent_sig TEXT;")?;
+        }
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages (agent_sig) WHERE agent_sig IS NOT NULL;",
+        )?;
+        if !has_sig_col {
+            db.execute_batch(
+                "UPDATE OR IGNORE messages SET agent_sig = json_extract(env, '$.attest.sig') \
+                 WHERE json_extract(env, '$.attest.kind') = 'agent';",
+            )?;
+        }
         Ok(Store { db: Mutex::new(db) })
     }
 
@@ -181,7 +211,16 @@ impl Store {
         Ok(db.query_row("SELECT 1 FROM messages WHERE env_id = ?", [env_id], |_| Ok(())).optional()?.is_some())
     }
 
-    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key).
+    /// The visible row of an agent-signed message, by its sender signature (canonical base64url).
+    pub fn by_agent_sig(&self, sig: &str) -> Result<Option<Row>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .query_row(&format!("SELECT {COLS} FROM messages WHERE agent_sig = ?"), params![MAX_TEXT, sig], read_row)
+            .optional()?)
+    }
+
+    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key), or if it
+    /// is another envelope carrying an agent-signed message already here (stored hidden, see agent_sig).
     /// `files`: the body's attachment list as JSON (with blob keys; "[]" when unreadable). `id_floor`: new
     /// non-imported mail is numbered from here up, so the old server's numbers below it stay free for imports.
     #[allow(clippy::too_many_arguments)]
@@ -203,8 +242,17 @@ impl Store {
         // in old-id order before the node takes new mail). Numbers only grow in arrival order, because clients' `after`
         // cursors, SSE and MCPL push depend on it: old mail the bridge copies in after new mail exists gets a new number
         // (its old one stays in `imported`).
+        // Only numbers in the range the old server can have used, and on a node with an id_floor only numbers below it
+        // (the floor reserves them for imports): an import can never move numbering past new mail or near i64::MAX.
         let explicit = match v.imported {
-            Some(old) if old > 0 && old as i64 > max => Some(old as i64),
+            Some(old)
+                if old > 0
+                    && old <= mailcore::envelope::MAX_OLD_ID
+                    && old as i64 > max
+                    && (id_floor <= 1 || (old as i64) < id_floor) =>
+            {
+                Some(old as i64)
+            }
             _ => None,
         };
         let explicit = match explicit {
@@ -212,12 +260,20 @@ impl Store {
             None if v.imported.is_none() && max < id_floor => Some(id_floor),
             None => None, // AUTOINCREMENT: above the highest id ever used
         };
+        let agent_sig = match &env.attest {
+            mailcore::Attest::Agent { sig, .. } => mailcore::b64u_decode(sig).map(|b| mailcore::b64u(&b)),
+            _ => None,
+        };
+        let replay = match &agent_sig {
+            Some(sig) => db.query_row("SELECT 1 FROM messages WHERE agent_sig = ?", [sig], |_| Ok(())).optional()?.is_some(),
+            None => false,
+        };
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (id, env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, verified, imported, parents, env, received, attest, blobs, files) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             readers, verified, imported, parents, env, received, attest, blobs, files, agent_sig) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                explicit,
+                if replay { None } else { explicit },
                 env.id,
                 env.day(),
                 env.ts,
@@ -225,9 +281,9 @@ impl Store {
                 v.sender_sub,
                 env.to,
                 env.thread,
-                env.mode.as_str(),
-                text,
-                readers,
+                if replay { "dup" } else { env.mode.as_str() },
+                if replay { None } else { text },
+                if replay { None } else { readers },
                 v.verified as i64,
                 v.imported.map(|x| x as i64),
                 parents,
@@ -235,10 +291,11 @@ impl Store {
                 received_ms,
                 v.attest,
                 serde_json::to_string(&env.blobs)?,
-                files
+                if replay { "[]" } else { files },
+                if replay { None } else { agent_sig }
             ],
         )?;
-        if n == 0 {
+        if n == 0 || replay {
             return Ok(None);
         }
         let row = db.query_row(
@@ -600,10 +657,12 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner = ?", [owner], |r| r.get(0))?)
     }
 
-    /// A file reference {id, name, type, size, key} the viewer may use: its own upload, or an attachment of a message
-    /// it can read.
-    pub fn find_file(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Option<serde_json::Value>> {
+    /// File references {id, name, type, size, key} the viewer may use: its own upload first, then the attachments with
+    /// this id of messages it can read, oldest first. Several messages can name one blob, and a member node can write
+    /// one naming someone else's blob with a wrong key, so callers use the first whose key opens the blob.
+    pub fn find_files(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
+        let mut out = Vec::new();
         let up = db
             .query_row(
                 "SELECT name, type, size, key FROM uploads WHERE id = ? AND owner = ?",
@@ -614,9 +673,7 @@ impl Store {
                 },
             )
             .optional()?;
-        if up.is_some() {
-            return Ok(up);
-        }
+        out.extend(up);
         let mut st = db.prepare(&format!(
             "SELECT files FROM messages WHERE instr(blobs, ?) > 0 AND {} ORDER BY id LIMIT 20",
             visible_sql()
@@ -626,15 +683,53 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         for files in rows {
             let v: serde_json::Value = serde_json::from_str(&files).unwrap_or(json!([]));
-            if let Some(f) = v.as_array().and_then(|a| a.iter().find(|f| f["id"] == json!(id) && f.get("key").is_some())) {
-                return Ok(Some(f.clone()));
+            for f in v.as_array().into_iter().flatten() {
+                if f["id"] == json!(id) && f.get("key").is_some() && !out.contains(f) {
+                    out.push(f.clone());
+                }
             }
         }
-        Ok(None)
+        Ok(out)
     }
 
     pub fn count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_an_older_store_adds_and_backfills_agent_sig() {
+        let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            for (i, id) in ["a", "b"].iter().enumerate() {
+                db.execute(
+                    "INSERT INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, parents, env, received) \
+                     VALUES (?, 'd', 't', 's', 'ss', 'all', 't', 'members', 'x', '[]', ?, ?)",
+                    params![id, r#"{"attest":{"kind":"agent","sig":"SIG"}}"#, i as i64],
+                )
+                .unwrap();
+            }
+        }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let row = store.by_agent_sig("SIG").unwrap().expect("backfilled");
+        assert_eq!(row.env_id, "a", "an existing duplicate keeps only the first copy indexed");
+        drop(store);
+        Store::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }

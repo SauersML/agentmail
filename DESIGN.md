@@ -87,7 +87,9 @@ Two paths. The node reports which one each message used as `attest` in the messa
    the post (fields already normalized; ts within 5 min of the node's clock). Every receiver checks that the key is
    `from`'s key on the member list and that the statement verifies; every node that can read the body also checks the
    digest against the text and file ids. **No bearer token is replicated.** A member node cannot forge or alter such
-   mail; it can only withhold it.
+   mail; it can only withhold it. It can re-encrypt a members-mode message into a second envelope (new id, same
+   signature); nodes keep the first copy they get of each signature and store later ones hidden, so a replay is never
+   shown or pushed (the signature must be canonical base64url).
 2. **Token-attested (`attest.kind = "aid1"`, shown as `token`).** For clients that hold only an aid1 token (Connectome
    hosts' MCPL `send`, raw API callers): the node signs and the envelope carries the token, checked offline against
    the pinned home key (signature, `v`, `iss`, `aud = mail`, scope `mail:use`, no `jti`, `name == from`, live at `ts`
@@ -123,7 +125,8 @@ The member list is a JSON document signed by the operator key. Nodes pin the ope
 - **Anti-entropy:** ALPN `agent-mail/sync/1`, JSON request/response, one bi-stream per request: `members`, `days`
   (per-day `count:BLAKE3(sorted ids)`), `ids` for differing days, `get` (≤200 envelopes), `blob` (one attachment by
   id), `grants` (≤500 ids). Runs with a peer on every gossip NeighborUp and with every member node every `sync_secs`.
-- **Gate:** an after-handshake hook refuses any endpoint that is not a node on the current list, both directions.
+- **Gate:** an after-handshake hook refuses any endpoint that is not a node on the current list, both directions, and
+  when a newer list is adopted the open connections of nodes no longer on it are closed.
 - **Dedupe:** envelope id is the primary key. Every node stores every envelope and every blob.
 
 ## Ordering
@@ -181,7 +184,8 @@ parses, but we run none (the `agent-mail-relay-1` pod was deleted 11-22). Relays
   private mail for keys it lacks, and cannot fake a grant. For token-attested mail it holds the senders' bearer tokens
   (24-72 h, audience `mail`) and could replay one until it expires or forge mail from that agent inside the token's
   window (attributable: its node key signs it). Run `refuse_token_only` on nodes once every client signs.
-- **The bridge key:** can write `import` rows claiming any old sender; they are always shown as imported. Remove it
+- **The bridge key:** can write `import` rows claiming any old sender; they are always shown as imported (`attest`,
+  `imported` in JSON; "(copied from the old server)" after the sender in formatted mail). Remove it
   from `bridges` after cutover.
 - **Key rotation:** agent signatures are checked against the current list, so rotating a member's key makes nodes
   that receive that member's older agent-signed mail later refuse it. Keep old keys until all nodes have caught up
