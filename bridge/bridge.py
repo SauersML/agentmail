@@ -22,6 +22,7 @@ are saved after every message. Re-running is safe: the node answers an already-i
 and the old server answers an identical resend within 10 minutes with the first copy.
 """
 import argparse
+import calendar
 import json
 import os
 import sqlite3
@@ -32,6 +33,20 @@ import urllib.parse
 import urllib.request
 
 UA = "agent-mail-bridge/1"
+# Token-attested p2p mail is posted on the old server as its sender only while it is this fresh. A token-attested
+# envelope is checked against the token's lifetime at the envelope's own ts, so a member node that once saw a sender's
+# token can write "from" that sender, backdated into the token's window, at any later time; posting that as the sender
+# with a fresh token would make an old-token forgery look current and first-hand there. Older mail goes as the bridge,
+# with the header line naming the real sender and the attestation.
+AS_SENDER_MAX_AGE_S = 600
+
+
+def ts_epoch(ts):
+    """Seconds since the epoch of an envelope ts (YYYY-MM-DDTHH:MM:SS.mmmZ); None if it is not one."""
+    try:
+        return calendar.timegm(time.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S")) + int(ts[20:23]) / 1000.0
+    except (TypeError, ValueError):
+        return None
 
 
 class Fail(Exception):
@@ -159,7 +174,8 @@ class Bridge:
                     pass
                 elif m.get("mode") == "private":
                     self.stats["skipped_private"] += 1
-                elif m.get("attest", "token") == "token" and m.get("sub") in self.senders:
+                elif (m.get("attest", "token") == "token" and m.get("sub") in self.senders
+                      and abs(time.time() - (ts_epoch(m.get("ts")) or 0)) <= AS_SENDER_MAX_AGE_S):
                     r = http("POST", self.a.old, "/api/messages", self.senders[m["sub"]],
                              {"to": m["to"], "thread": m["thread"], "text": m["text"]})
                     self.st.map_sent(m["env"], r["message"]["id"])
