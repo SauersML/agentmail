@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks};
+use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks, WeakConnectionHandle};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
@@ -34,6 +34,9 @@ const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 const MAX_RESP: usize = 64 << 20;
 const IDS_PER_GET: usize = 200;
+/// A `get` answer stops adding envelopes past this many bytes (it always carries at least one), so it stays under
+/// MAX_RESP even when every envelope is near the size limit (200 of those are ~110 MiB); the asker requests the rest.
+const GET_BUDGET: usize = 32 << 20;
 const GRANTS_PER_CALL: usize = 500;
 /// Our own relay URLs from the config (set once at start).
 static OWN_RELAYS: std::sync::OnceLock<Vec<RelayUrl>> = std::sync::OnceLock::new();
@@ -64,18 +67,46 @@ struct Resp {
     blob: Option<String>,
     #[serde(default)]
     grants: BTreeMap<String, mailcore::envelope::Grant>,
+    /// For `get`: how many of the requested ids this answer covers (the rest did not fit; ask again for them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken: Option<usize>,
 }
 
-/// Rejects every connection (both directions) from or to a key that is not a node on the current member list.
+/// Rejects every connection (both directions) from or to a key that is not a node on the current member list, and
+/// keeps weak handles of the ones it accepts so a node removed from the list later loses them too (the check alone
+/// runs only at the handshake: a removed node's open gossip connection would keep receiving every envelope).
 #[derive(Debug, Clone)]
 struct MemberGate {
     node: Arc<Node>,
+    open: Arc<std::sync::Mutex<Vec<WeakConnectionHandle>>>,
+}
+
+impl MemberGate {
+    /// Closes every open connection whose peer is no longer a node on the current list. Returns how many.
+    fn close_removed(&self) -> usize {
+        let members = self.node.members.read().unwrap().clone();
+        let mut closed = 0;
+        self.open.lock().unwrap().retain(|w| match w.upgrade() {
+            None => false,
+            Some(c) if members.is_node(c.remote_id().as_bytes()) => true,
+            Some(c) => {
+                tracing::warn!("closing connection to {}: no longer on the member list", c.remote_id().fmt_short());
+                c.close(403u32.into(), b"removed from the member list");
+                closed += 1;
+                false
+            }
+        });
+        closed
+    }
 }
 
 impl EndpointHooks for MemberGate {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
         if self.node.members.read().unwrap().is_node(id.as_bytes()) {
+            let mut open = self.open.lock().unwrap();
+            open.retain(|w| w.upgrade().is_some());
+            open.push(conn.weak_handle());
             AfterHandshakeOutcome::accept()
         } else {
             tracing::warn!("refused connection from non-member {}", id.fmt_short());
@@ -136,7 +167,9 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
         }
         Req::Get { ids } => {
             let ids: Vec<String> = ids.into_iter().take(IDS_PER_GET).collect();
-            r.envelopes = node.store.envelopes(&ids)?;
+            let (envelopes, taken) = get_within(node, &ids, GET_BUDGET)?;
+            r.envelopes = envelopes;
+            r.taken = Some(taken);
         }
         Req::Members => r.members = Some(node.members.read().unwrap().clone()),
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
@@ -146,6 +179,22 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(serde_json::to_vec(&r)?)
+}
+
+/// The stored envelopes among `ids`, in order, until `budget` bytes (at least one), and how many ids that covered.
+fn get_within(node: &Node, ids: &[String], budget: usize) -> Result<(Vec<String>, usize)> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for (i, id) in ids.iter().enumerate() {
+        if let Some(e) = node.store.envelopes(std::slice::from_ref(id))?.pop() {
+            if !out.is_empty() && bytes + e.len() > budget {
+                return Ok((out, i));
+            }
+            bytes += e.len();
+            out.push(e);
+        }
+    }
+    Ok((out, ids.len()))
 }
 
 async fn call(conn: &Connection, req: &Req) -> Result<Resp> {
@@ -169,6 +218,7 @@ struct Ctx {
     node: Arc<Node>,
     lookup: MemoryLookup,
     sender: GossipSender,
+    gate: MemberGate,
 }
 
 impl Ctx {
@@ -215,6 +265,7 @@ fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
 
 impl Ctx {
     async fn announce_members(&self) {
+        self.gate.close_removed();
         let list = self.node.members.read().unwrap().clone();
         if let Ok(b) = serde_json::to_vec(&list) {
             let _ = self.sender.broadcast(Bytes::from(b)).await;
@@ -251,10 +302,19 @@ impl Ctx {
                 }
                 let mut envs = Vec::new();
                 for chunk in missing.chunks(IDS_PER_GET) {
-                    for raw in call(&conn, &Req::Get { ids: chunk.to_vec() }).await?.envelopes {
-                        match serde_json::from_str::<Envelope>(&raw) {
-                            Ok(e) => envs.push(e),
-                            Err(e) => tracing::warn!("sync from {}: unreadable envelope: {e}", peer.fmt_short()),
+                    // A peer answers as many as fit in its byte budget and says how many ids it covered; ask for the rest.
+                    let mut rest: &[String] = chunk;
+                    while !rest.is_empty() {
+                        let resp = call(&conn, &Req::Get { ids: rest.to_vec() }).await?;
+                        for raw in resp.envelopes {
+                            match serde_json::from_str::<Envelope>(&raw) {
+                                Ok(e) => envs.push(e),
+                                Err(e) => tracing::warn!("sync from {}: unreadable envelope: {e}", peer.fmt_short()),
+                            }
+                        }
+                        match resp.taken {
+                            Some(n) if n > 0 && n < rest.len() => rest = &rest[n..],
+                            _ => break,
                         }
                     }
                 }
@@ -308,7 +368,7 @@ impl Ctx {
 }
 
 pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedReceiver<Outbound>) -> Result<Net> {
-    let gate = MemberGate { node: node.clone() };
+    let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
     let entries = cfg.relay.entries();
     let mut own = Vec::new();
@@ -341,7 +401,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     let endpoint = builder
         .secret_key(SecretKey::from_bytes(node.seed.bytes()))
         .address_lookup(lookup.clone())
-        .hooks(gate)
+        .hooks(gate.clone())
         .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.iroh_port))?
         .bind()
         .await?;
@@ -356,7 +416,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     let topic = TopicId::from_bytes(node.members.read().unwrap().topic());
     let first = peers(&node, &lookup);
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
-    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender };
+    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender, gate };
 
     // Gossip in: envelopes and member lists; NeighborUp starts anti-entropy with that neighbor.
     let c = ctx.clone();
@@ -374,6 +434,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
                     if v.get("operator").is_some() && v.get("nodes").is_some() {
                         match serde_json::from_value::<MemberList>(v).map_err(anyhow::Error::from).and_then(|l| c.node.adopt_members(&l)) {
                             Ok(true) => {
+                                c.gate.close_removed();
                                 let _ = c.sender.join_peers(c.peers()).await;
                             }
                             Ok(false) => {}
@@ -464,4 +525,75 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     });
 
     Ok(Net { endpoint, router })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::{Node, Opts};
+    use crate::store::Store;
+    use mailcore::envelope::Draft;
+    use mailcore::keys::{fmt_key, Seed};
+    use mailcore::{Attest, Body, Mode, NodeEntry, TokenPolicy, Verified};
+
+    #[test]
+    fn get_answers_stay_within_the_byte_budget() {
+        let (op, home, me) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let mut list = MemberList {
+            v: 1,
+            network: "t".into(),
+            seq: 1,
+            issued: mailcore::now_ts(),
+            operator: String::new(),
+            members: vec![],
+            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![] }],
+            bridges: vec![],
+            sig: String::new(),
+        };
+        list.sign(&op);
+        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
+        let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let recipients = list.all_keys();
+        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), policy, me, Opts::default(), tx);
+        let v = Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let body = Body { text: format!("{i}").repeat(10_000), ..Default::default() };
+            let e = Envelope::seal(
+                Draft {
+                    thread: "t",
+                    parents: vec![],
+                    ts: mailcore::now_ts(),
+                    from: "a.x",
+                    to: "all",
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: Attest::Aid1 { token: "aid1.x.y".into() },
+                    recipients: &recipients,
+                },
+                &node.seed,
+            )
+            .unwrap();
+            node.store.insert(&e, &v, Some("x"), "[]", None, 0, 1).unwrap().unwrap();
+            ids.push(e.id);
+        }
+        ids.insert(2, "0".repeat(64)); // one id the peer does not have
+        let one = node.store.envelopes(&ids[..1]).unwrap()[0].len();
+        // Room for two envelopes: the answer covers the first three ids (the missing one is skipped and counted), and
+        // the asker continues from the fourth.
+        let (got, taken) = get_within(&node, &ids, one * 2 + 10).unwrap();
+        assert_eq!((got.len(), taken), (2, 3));
+        let (got, taken) = get_within(&node, &ids[3..], one * 2 + 10).unwrap();
+        assert_eq!((got.len(), taken), (2, 2));
+        let (got, taken) = get_within(&node, &ids[5..], one * 2 + 10).unwrap();
+        assert_eq!((got.len(), taken), (1, 1));
+        // Budget smaller than one envelope: still one per answer, so the asker always progresses.
+        let (got, taken) = get_within(&node, &ids, 1).unwrap();
+        assert_eq!((got.len(), taken), (1, 1));
+        let (got, taken) = get_within(&node, &ids, usize::MAX).unwrap();
+        assert_eq!((got.len(), taken), (5, 6));
+        let _ = std::fs::remove_file(path);
+    }
 }
