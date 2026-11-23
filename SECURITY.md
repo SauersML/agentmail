@@ -16,7 +16,8 @@ None of these are in this repository.
 
 - Every route needs `Authorization: Bearer <aid1 token>`. The token must be signed by the home key, for
   audience `mail`, with scope `mail:use`, live now, and not a one-time sign-in token.
-- The caller is the token's `name`. It can send only as that name. It reads all members-mode mail, and private mail
+- The token's `name` and `sub` must be a member on the current member list (403 otherwise), so a token the home
+  minted for anyone else reads nothing. The caller is the token's `name`. It can send only as that name. It reads all members-mode mail, and private mail
   only when its name is among the recipients or is the sender.
 - Any process on the host that holds a valid token can do this, so the API listens on loopback only. The node refuses
   to start with a non-loopback `api_listen`.
