@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks};
+use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks, WeakConnectionHandle};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
@@ -72,16 +72,41 @@ struct Resp {
     taken: Option<usize>,
 }
 
-/// Rejects every connection (both directions) from or to a key that is not a node on the current member list.
+/// Rejects every connection (both directions) from or to a key that is not a node on the current member list, and
+/// keeps weak handles of the ones it accepts so a node removed from the list later loses them too (the check alone
+/// runs only at the handshake: a removed node's open gossip connection would keep receiving every envelope).
 #[derive(Debug, Clone)]
 struct MemberGate {
     node: Arc<Node>,
+    open: Arc<std::sync::Mutex<Vec<WeakConnectionHandle>>>,
+}
+
+impl MemberGate {
+    /// Closes every open connection whose peer is no longer a node on the current list. Returns how many.
+    fn close_removed(&self) -> usize {
+        let members = self.node.members.read().unwrap().clone();
+        let mut closed = 0;
+        self.open.lock().unwrap().retain(|w| match w.upgrade() {
+            None => false,
+            Some(c) if members.is_node(c.remote_id().as_bytes()) => true,
+            Some(c) => {
+                tracing::warn!("closing connection to {}: no longer on the member list", c.remote_id().fmt_short());
+                c.close(403u32.into(), b"removed from the member list");
+                closed += 1;
+                false
+            }
+        });
+        closed
+    }
 }
 
 impl EndpointHooks for MemberGate {
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
         if self.node.members.read().unwrap().is_node(id.as_bytes()) {
+            let mut open = self.open.lock().unwrap();
+            open.retain(|w| w.upgrade().is_some());
+            open.push(conn.weak_handle());
             AfterHandshakeOutcome::accept()
         } else {
             tracing::warn!("refused connection from non-member {}", id.fmt_short());
@@ -186,6 +211,7 @@ struct Ctx {
     node: Arc<Node>,
     lookup: MemoryLookup,
     sender: GossipSender,
+    gate: MemberGate,
 }
 
 impl Ctx {
@@ -232,6 +258,7 @@ fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
 
 impl Ctx {
     async fn announce_members(&self) {
+        self.gate.close_removed();
         let list = self.node.members.read().unwrap().clone();
         if let Ok(b) = serde_json::to_vec(&list) {
             let _ = self.sender.broadcast(Bytes::from(b)).await;
@@ -334,7 +361,7 @@ impl Ctx {
 }
 
 pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedReceiver<Outbound>) -> Result<Net> {
-    let gate = MemberGate { node: node.clone() };
+    let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
     let entries = cfg.relay.entries();
     let mut own = Vec::new();
@@ -367,7 +394,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     let endpoint = builder
         .secret_key(SecretKey::from_bytes(node.seed.bytes()))
         .address_lookup(lookup.clone())
-        .hooks(gate)
+        .hooks(gate.clone())
         .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.iroh_port))?
         .bind()
         .await?;
@@ -382,7 +409,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     let topic = TopicId::from_bytes(node.members.read().unwrap().topic());
     let first = peers(&node, &lookup);
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
-    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender };
+    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender, gate };
 
     // Gossip in: envelopes and member lists; NeighborUp starts anti-entropy with that neighbor.
     let c = ctx.clone();
@@ -400,6 +427,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
                     if v.get("operator").is_some() && v.get("nodes").is_some() {
                         match serde_json::from_value::<MemberList>(v).map_err(anyhow::Error::from).and_then(|l| c.node.adopt_members(&l)) {
                             Ok(true) => {
+                                c.gate.close_removed();
                                 let _ = c.sender.join_peers(c.peers()).await;
                             }
                             Ok(false) => {}

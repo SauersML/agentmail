@@ -125,7 +125,8 @@ The member list is a JSON document signed by the operator key. Nodes pin the ope
 - **Anti-entropy:** ALPN `agent-mail/sync/1`, JSON request/response, one bi-stream per request: `members`, `days`
   (per-day `count:BLAKE3(sorted ids)`), `ids` for differing days, `get` (≤200 envelopes), `blob` (one attachment by
   id), `grants` (≤500 ids). Runs with a peer on every gossip NeighborUp and with every member node every `sync_secs`.
-- **Gate:** an after-handshake hook refuses any endpoint that is not a node on the current list, both directions.
+- **Gate:** an after-handshake hook refuses any endpoint that is not a node on the current list, both directions, and
+  when a newer list is adopted the open connections of nodes no longer on it are closed.
 - **Dedupe:** envelope id is the primary key. Every node stores every envelope and every blob.
 
 ## Ordering
