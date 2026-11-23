@@ -343,6 +343,12 @@ impl Envelope {
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
+                // The statement joins from, to and thread with '|'. With none in from or to (the API never allows one in
+                // to) it splits one way only; otherwise a node could move text between to and thread under the same
+                // signature (e.g. to "all", thread "x|y" re-labelled to "all|x", thread "y").
+                if self.from.contains('|') || self.to.contains('|') {
+                    bail!("from and to of a signed message cannot contain '|'");
+                }
                 let st = post_statement(&self.from, &self.to, &self.thread, self.mode, &self.ts, digest);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
                 // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
@@ -499,6 +505,42 @@ mod tests {
         let mut body = good.open(&w.node).unwrap().unwrap();
         body.text = "tampered".into();
         assert!(good.check_body(&body).unwrap_err().to_string().contains("digest"));
+    }
+
+    #[test]
+    fn signed_statement_fields_cannot_shift() {
+        let w = world();
+        let p = policy(&w.home);
+        let now = crate::now_millis();
+        let ts = crate::now_ts();
+        let salt = crate::random_bytes::<16>();
+        let digest = post_digest(&salt, "hi", &[]);
+        // alice signs to "all", thread "x|y".
+        let st = post_statement("a.alice", "all", "x|y", Mode::Members, &ts, &digest);
+        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(st.as_bytes())) };
+        let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
+        let mk = |to: &str, thread: &str| {
+            Envelope::seal(
+                Draft {
+                    thread,
+                    parents: vec![],
+                    ts: ts.clone(),
+                    from: "a.alice",
+                    to,
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: attest.clone(),
+                    recipients: &w.members.all_keys(),
+                },
+                &w.node,
+            )
+            .unwrap()
+        };
+        assert!(mk("all", "x|y").verify(&w.members, &p, now).is_ok(), "'|' in the thread is fine");
+        // The same statement re-split by the node: to "all|x", thread "y".
+        assert_eq!(post_statement("a.alice", "all|x", "y", Mode::Members, &ts, "d"), post_statement("a.alice", "all", "x|y", Mode::Members, &ts, "d"));
+        assert!(mk("all|x", "y").verify(&w.members, &p, now).unwrap_err().to_string().contains("'|'"));
     }
 
     #[test]
