@@ -87,6 +87,9 @@ pub struct Opts {
     pub public_url: String,
 }
 
+/// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.
+type FileRef = (Value, Option<Vec<u8>>);
+
 pub const MAX_FILE: usize = 25 * 1024 * 1024;
 pub const MAX_FILES: usize = mailcore::envelope::MAX_BLOBS;
 const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
@@ -216,8 +219,8 @@ impl Node {
         let mut files = Vec::new();
         for id in &file_ids {
             let f = self
-                .store
-                .find_file(id, &who.name, &who.sub)?
+                .usable_file(id, who)?
+                .map(|(f, _)| f)
                 .ok_or_else(|| ApiError::new(400, format!("unknown file id {}", id.chars().take(40).collect::<String>())))?;
             files.push(f);
         }
@@ -435,17 +438,29 @@ impl Node {
         Ok(json!({ "id": id, "name": name, "type": ty, "size": data.len() }))
     }
 
+    /// The file reference {id, name, type, size, key} for `id` the viewer may use, and the plaintext if the blob is
+    /// here: the first reference (own upload, then readable messages, oldest first) whose key opens the blob, so a
+    /// message written with a wrong key for someone else's blob cannot shadow the real one.
+    fn usable_file(&self, id: &str, who: &Caller) -> Result<Option<FileRef>, ApiError> {
+        let refs = self.store.find_files(id, &who.name, &who.sub)?;
+        let Some(first) = refs.first().cloned() else { return Ok(None) };
+        let Some(blob) = self.store.get_blob(id)? else { return Ok(Some((first, None))) };
+        for f in refs {
+            let key: Option<[u8; 32]> = f["key"].as_str().and_then(mailcore::b64u_decode).and_then(|k| k.try_into().ok());
+            if let Some(Ok(plain)) = key.map(|k| mailcore::crypto::open_blob(&blob, &k)) {
+                return Ok(Some((f, Some(plain))));
+            }
+        }
+        Ok(None)
+    }
+
     /// GET /api/files/{id}: (metadata, plaintext) for a viewer allowed to read a message carrying it.
     pub fn download(&self, id: &str, who: &Caller) -> Result<(Value, Vec<u8>), ApiError> {
-        let f = self.store.find_file(id, &who.name, &who.sub)?.ok_or_else(|| ApiError::new(404, "no such file"))?;
-        let blob = self.store.get_blob(id)?.ok_or_else(|| ApiError::new(404, "that file has not reached this node yet; try again soon"))?;
-        let key: [u8; 32] = f["key"]
-            .as_str()
-            .and_then(mailcore::b64u_decode)
-            .and_then(|k| k.try_into().ok())
-            .ok_or_else(|| ApiError::new(500, "bad file key"))?;
-        let plain = mailcore::crypto::open_blob(&blob, &key)?;
-        Ok((f, plain))
+        match self.usable_file(id, who)? {
+            None => Err(ApiError::new(404, "no such file")),
+            Some((_, None)) => Err(ApiError::new(404, "that file has not reached this node yet; try again soon")),
+            Some((f, Some(plain))) => Ok((f, plain)),
+        }
     }
 
     /// A replicated envelope. Ok(None): already here. Err: refused (bad signature, token, member, shape).
@@ -982,6 +997,53 @@ mod tests {
         assert!(!p1.repeated && p2.repeated);
         assert_eq!(p1.row.env_id, p2.row.env_id);
         assert_eq!(node.store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_wrong_key_for_a_blob_does_not_shadow_the_real_one() {
+        let (node, home, node_b, list, _rx) = setup();
+        let alice = node.verify(&token(&home)).unwrap();
+        let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
+        let id = f["id"].as_str().unwrap().to_string();
+        // An earlier members-mode row (as a member node could write) naming alice's blob with a wrong key.
+        let body = Body { text: "decoy".into(), ..Default::default() };
+        let decoy = Envelope::seal(
+            Draft {
+                thread: "t",
+                parents: vec![],
+                ts: now_ts(),
+                from: "a.alice",
+                to: "all",
+                mode: Mode::Members,
+                body: &body,
+                blobs: vec![id.clone()],
+                attest: Attest::Aid1 { token: token(&home) },
+                recipients: &list.all_keys(),
+            },
+            &node_b,
+        )
+        .unwrap();
+        let v = mailcore::Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
+        node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis(), 1).unwrap().unwrap();
+        node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
+        let now = now_millis() as f64 / 1000.0;
+        let bob = mailcore::Aid1Payload {
+            v: 1,
+            iss: "h".into(),
+            sub: "agent:bob@t".into(),
+            kind: "agent".into(),
+            name: "a.bob".into(),
+            aud: "mail".into(),
+            scopes: vec!["mail:use".into()],
+            claims: None,
+            iat: now,
+            exp: now + 600.0,
+            jti: None,
+        };
+        let bob = node.verify(&mailcore::token::mint(&home, &bob)).unwrap();
+        let (_, bytes) = node.download(&id, &bob).unwrap();
+        assert_eq!(bytes, b"real bytes");
     }
 
     #[test]

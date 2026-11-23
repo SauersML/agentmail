@@ -657,10 +657,12 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner = ?", [owner], |r| r.get(0))?)
     }
 
-    /// A file reference {id, name, type, size, key} the viewer may use: its own upload, or an attachment of a message
-    /// it can read.
-    pub fn find_file(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Option<serde_json::Value>> {
+    /// File references {id, name, type, size, key} the viewer may use: its own upload first, then the attachments with
+    /// this id of messages it can read, oldest first. Several messages can name one blob, and a member node can write
+    /// one naming someone else's blob with a wrong key, so callers use the first whose key opens the blob.
+    pub fn find_files(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
+        let mut out = Vec::new();
         let up = db
             .query_row(
                 "SELECT name, type, size, key FROM uploads WHERE id = ? AND owner = ?",
@@ -671,9 +673,7 @@ impl Store {
                 },
             )
             .optional()?;
-        if up.is_some() {
-            return Ok(up);
-        }
+        out.extend(up);
         let mut st = db.prepare(&format!(
             "SELECT files FROM messages WHERE instr(blobs, ?) > 0 AND {} ORDER BY id LIMIT 20",
             visible_sql()
@@ -683,11 +683,13 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         for files in rows {
             let v: serde_json::Value = serde_json::from_str(&files).unwrap_or(json!([]));
-            if let Some(f) = v.as_array().and_then(|a| a.iter().find(|f| f["id"] == json!(id) && f.get("key").is_some())) {
-                return Ok(Some(f.clone()));
+            for f in v.as_array().into_iter().flatten() {
+                if f["id"] == json!(id) && f.get("key").is_some() && !out.contains(f) {
+                    out.push(f.clone());
+                }
             }
         }
-        Ok(None)
+        Ok(out)
     }
 
     pub fn count(&self) -> Result<i64> {
