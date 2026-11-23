@@ -94,6 +94,7 @@ async fn run(path: &Path) -> Result<()> {
         .init();
     let cfg = config::Config::load(path)?;
     std::fs::create_dir_all(&cfg.data_dir)?;
+    private_data(&cfg.data_dir)?;
     let seed = cfg.node_seed()?;
     let members = cfg.best_members()?;
     if !members.is_node(&seed.public()) {
@@ -120,6 +121,7 @@ async fn run(path: &Path) -> Result<()> {
         identities.len()
     );
     let store = store::Store::open(&cfg.data_dir.join("mail.sqlite"))?;
+    private_data(&cfg.data_dir)?; // again, for a database the open just created
     // Every member is a known name from the start (who / reaches), even before it has written anything here.
     for m in &members.members {
         store.seen(&m.name, &m.sub, 0)?;
@@ -145,6 +147,14 @@ async fn run(path: &Path) -> Result<()> {
         streams: Arc::new(Mutex::new(Default::default())),
         sockets: Arc::new(Default::default()),
     };
+    // The API trusts any home token and serves decrypted mail: it is for this host's own processes only.
+    let loopback = match cfg.api_listen.parse::<std::net::SocketAddr>() {
+        Ok(a) => a.ip().is_loopback(),
+        Err(_) => cfg.api_listen.starts_with("localhost:"),
+    };
+    if !loopback {
+        bail!("api_listen {} is not a loopback address; the compat API must not be reachable from other hosts", cfg.api_listen);
+    }
     let listener = tokio::net::TcpListener::bind(&cfg.api_listen).await.with_context(|| format!("binding {}", cfg.api_listen))?;
     tracing::info!("compat API on http://{} ({} envelopes stored)", cfg.api_listen, node.store.count()?);
     axum::serve(listener, api::router(state))
@@ -152,5 +162,20 @@ async fn run(path: &Path) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    Ok(())
+}
+
+/// The store holds decrypted mail (members mode, and private mail for the identities this node holds): only this
+/// user may read it. SQLite gives its -wal and -shm files the database file's mode.
+fn private_data(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("making {} private", dir.display()))?;
+    for f in ["mail.sqlite", "mail.sqlite-wal", "mail.sqlite-shm"] {
+        let p = dir.join(f);
+        if p.exists() {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
     Ok(())
 }

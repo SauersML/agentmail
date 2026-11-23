@@ -95,6 +95,10 @@ class State:
 class Bridge:
     def __init__(self, a):
         self.a = a
+        for url in (a.old, a.node):  # tokens go in a header: never in the clear off this host
+            u = urllib.parse.urlparse(url)
+            if u.scheme != "https" and u.hostname not in ("127.0.0.1", "localhost", "::1"):
+                raise Fail("%s: use https (only a loopback node may be plain http)" % url)
         self.old_token = open(a.old_token_file).read().strip()
         self.node_token = open(a.node_token_file).read().strip()
         self.st = State(a.state)
@@ -111,11 +115,12 @@ class Bridge:
         if not d or not os.path.isdir(d):
             self.senders = {}
             return
-        senders = {}
+        senders, present = {}, set()
         for f in sorted(os.listdir(d)):
             if not f.endswith(".token"):
                 continue
             tok = open(os.path.join(d, f)).read().strip()
+            present.add(tok)
             if tok not in self.token_sub:
                 try:
                     self.token_sub[tok] = http("GET", self.a.old, "/api/me", tok).get("sub")
@@ -124,7 +129,23 @@ class Bridge:
                     self.token_sub[tok] = None
             if self.token_sub[tok]:
                 senders[self.token_sub[tok]] = tok
+        self.token_sub = {t: s for t, s in self.token_sub.items() if t in present}  # forget replaced tokens
         self.senders = senders
+
+    def as_sender(self, m):
+        """Post m on the old server with its sender's own token. False (and that token dropped) if the old server
+        refuses the token, so the message goes as the bridge instead of stalling the pass."""
+        try:
+            r = http("POST", self.a.old, "/api/messages", self.senders[m["sub"]],
+                     {"to": m["to"], "thread": m["thread"], "text": m["text"]})
+        except Fail as e:
+            if not str(e).startswith(("401 ", "403 ")):
+                raise
+            sys.stderr.write("bridge: %s's token refused (%s); posting as the bridge\n" % (m["from"], e))
+            del self.senders[m["sub"]]
+            return False
+        self.st.map_sent(m["env"], r["message"]["id"])
+        return True
 
     def old_to_p2p(self):
         """Import every old-server message after the saved cursor. Returns how many pages were read."""
@@ -159,10 +180,7 @@ class Bridge:
                     pass
                 elif m.get("mode") == "private":
                     self.stats["skipped_private"] += 1
-                elif m.get("attest", "token") == "token" and m.get("sub") in self.senders:
-                    r = http("POST", self.a.old, "/api/messages", self.senders[m["sub"]],
-                             {"to": m["to"], "thread": m["thread"], "text": m["text"]})
-                    self.st.map_sent(m["env"], r["message"]["id"])
+                elif m.get("attest", "token") == "token" and m.get("sub") in self.senders and self.as_sender(m):
                     self.stats["to_old_as_sender"] += 1
                 else:
                     head = "[agent-mail: from %s [%s], #%d on the p2p network, %s-attested]" % (
