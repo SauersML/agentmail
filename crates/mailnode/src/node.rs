@@ -346,7 +346,10 @@ impl Node {
         if &who.sub != bsub {
             return Err(ApiError::new(403, "only the bridge identity may import"));
         }
-        let old_id = m["id"].as_i64().filter(|&x| x > 0).ok_or_else(|| ApiError::new(400, "id must be a positive integer"))?;
+        let old_id = m["id"]
+            .as_i64()
+            .filter(|&x| x > 0 && x as u64 <= mailcore::envelope::MAX_OLD_ID)
+            .ok_or_else(|| ApiError::new(400, "id must be a positive integer of at most 2^32"))?;
         if let Some(row) = self.store.by_imported(old_id)? {
             return Ok((row, true));
         }
@@ -842,6 +845,27 @@ mod tests {
         let again: Envelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert!(node.ingest(again).unwrap().is_none());
         assert_eq!(node.store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn imports_cannot_push_local_numbering_up() {
+        let (node, home, node_b, list, _rx) = setup();
+        let v = |old: u64| mailcore::Verified {
+            sender_sub: "agent:x@t".into(),
+            sender_kind: String::new(),
+            imported: Some(old),
+            verified: true,
+            attest: "import",
+        };
+        let ins = |text: &str, old: u64, floor: i64| {
+            let e = envelope(&node_b, &list, &home, text);
+            node.store.insert(&e, &v(old), Some(text), "[]", None, 0, floor).unwrap().unwrap().id
+        };
+        assert_eq!(ins("a", 5, 1), 5, "an old id in range keeps its number");
+        assert_eq!(ins("b", 1 << 40, 1), 6, "an old id past the old server's range is renumbered");
+        assert_eq!(ins("c", i64::MAX as u64, 1), 7);
+        assert_eq!(ins("d", 2_000, 1_000), 8, "at or above id_floor: renumbered");
+        assert_eq!(ins("e", 900, 1_000), 900, "below id_floor: kept");
     }
 
     #[test]

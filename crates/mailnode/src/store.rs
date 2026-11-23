@@ -203,8 +203,17 @@ impl Store {
         // in old-id order before the node takes new mail). Numbers only grow in arrival order, because clients' `after`
         // cursors, SSE and MCPL push depend on it: old mail the bridge copies in after new mail exists gets a new number
         // (its old one stays in `imported`).
+        // Only numbers in the range the old server can have used, and on a node with an id_floor only numbers below it
+        // (the floor reserves them for imports): an import can never move numbering past new mail or near i64::MAX.
         let explicit = match v.imported {
-            Some(old) if old > 0 && old as i64 > max => Some(old as i64),
+            Some(old)
+                if old > 0
+                    && old <= mailcore::envelope::MAX_OLD_ID
+                    && old as i64 > max
+                    && (id_floor <= 1 || (old as i64) < id_floor) =>
+            {
+                Some(old as i64)
+            }
             _ => None,
         };
         let explicit = match explicit {

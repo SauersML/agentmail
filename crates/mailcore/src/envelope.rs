@@ -17,6 +17,9 @@ pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_CIPHERTEXT: usize = 512 * 1024;
 pub const MAX_KEYS: usize = 1000;
+/// Largest old-server message number an import may claim. Old ids are small SQLite row ids; an unbounded one would let
+/// a single import push every node's local numbering to the top of the integer range (no new mail could be stored).
+pub const MAX_OLD_ID: u64 = 1 << 32;
 /// Token lifetime check against the envelope's ts allows this much clock skew.
 pub const TOKEN_SKEW_S: f64 = 300.0;
 /// An envelope dated further than this past the receiver's clock is refused (it will be fetched again later).
@@ -338,6 +341,9 @@ impl Envelope {
                 if !members.is_bridge(&node) {
                     bail!("import signed by a key that is not a member bridge");
                 }
+                if *old_id == 0 || *old_id > MAX_OLD_ID {
+                    bail!("import old_id out of range");
+                }
                 Ok(Verified {
                     sender_sub: sub.clone(),
                     sender_kind: String::new(),
@@ -506,6 +512,42 @@ mod tests {
         assert_eq!(a.open_grant(&g, &late).unwrap().text, "old mail");
         assert!(a.open_grant(&g, &w.alice).is_err());
         assert!(a.grant(&late, &w.alice.public()).unwrap().is_none());
+    }
+
+    #[test]
+    fn import_old_id_is_bounded() {
+        let w = world();
+        let op = Seed::generate();
+        let bridge = Seed::generate();
+        let mut members = w.members.clone();
+        members.bridges = vec![fmt_key(&bridge.public())];
+        members.sign(&op);
+        let p = policy(&w.home);
+        let body = Body { text: "old".into(), ..Default::default() };
+        let mk = |old_id: u64| {
+            Envelope::seal(
+                Draft {
+                    thread: "t",
+                    parents: vec![],
+                    ts: "2026-01-01T00:00:00.000Z".into(),
+                    from: "a.alice",
+                    to: "all",
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: Attest::Import { old_id, sub: "agent:a.alice@test".into(), verified: true },
+                    recipients: &members.all_keys(),
+                },
+                &bridge,
+            )
+            .unwrap()
+        };
+        let now = crate::now_millis();
+        assert!(mk(42).verify(&members, &p, now).is_ok());
+        assert!(mk(MAX_OLD_ID).verify(&members, &p, now).is_ok());
+        assert!(mk(0).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(MAX_OLD_ID + 1).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(i64::MAX as u64).verify(&members, &p, now).is_err());
     }
 
     fn tok(w: &World, name: &str) -> String {
