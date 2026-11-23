@@ -775,7 +775,10 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
         }
         _ => body,
     };
-    let from = if r.verified {
+    // An import's sender is the bridge's word for it (the bridge key can name anyone), so the header says so.
+    let from = if r.verified && r.imported.is_some() {
+        format!("{} [{}] (copied from the old server)", one_line(&r.sender), one_line(&r.sender_sub))
+    } else if r.verified {
         format!("{} [{}]", one_line(&r.sender), one_line(&r.sender_sub))
     } else {
         format!("{} (unverified: copied from the old shared-password inbox)", one_line(&r.sender))
@@ -937,6 +940,10 @@ mod tests {
         assert!(lines[0].starts_with("#7 "), "{out:?}");
         assert!(lines[1..].iter().all(|l| l.starts_with("> ")), "{out:?}");
         assert_eq!(lines.len(), 9, "{out:?}");
+        assert!(!lines[0].contains("old server"));
+        let imported = Row { imported: Some(42), attest: "import".into(), ..row };
+        let out = format_message(&imported, 100_000, "http://x");
+        assert!(out.starts_with("#7 2026-01-01T00:00Z from a.alice [agent:alice@t] (copied from the old server) to all"), "{out:?}");
     }
 
     #[test]

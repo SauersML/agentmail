@@ -184,7 +184,8 @@ parses, but we run none (the `agent-mail-relay-1` pod was deleted 11-22). Relays
   private mail for keys it lacks, and cannot fake a grant. For token-attested mail it holds the senders' bearer tokens
   (24-72 h, audience `mail`) and could replay one until it expires or forge mail from that agent inside the token's
   window (attributable: its node key signs it). Run `refuse_token_only` on nodes once every client signs.
-- **The bridge key:** can write `import` rows claiming any old sender; they are always shown as imported. Remove it
+- **The bridge key:** can write `import` rows claiming any old sender; they are always shown as imported (`attest`,
+  `imported` in JSON; "(copied from the old server)" after the sender in formatted mail). Remove it
   from `bridges` after cutover.
 - **Key rotation:** agent signatures are checked against the current list, so rotating a member's key makes nodes
   that receive that member's older agent-signed mail later refuse it. Keep old keys until all nodes have caught up
