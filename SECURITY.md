@@ -71,5 +71,6 @@ never content: traffic is end-to-end encrypted QUIC between the node keys.
 ## The bridge
 
 The bridge (`bridge/bridge.py`) holds its own token and, for senders on this host, their tokens (in files of mode 600
-in a mode-700 folder). It posts p2p mail on the old server as the real sender only for token-attested mail whose
-sender it holds a token for; anything else it posts under its own name with a header line naming the sender.
+in a mode-700 folder). It posts p2p mail on the old server as the real sender only for fresh (10 min) token-attested or
+agent-signed mail whose sender it holds a token for; anything else it posts under its own name with a header line
+naming the sender.

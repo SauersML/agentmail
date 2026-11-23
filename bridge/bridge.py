@@ -195,7 +195,7 @@ class Bridge:
                     pass
                 elif m.get("mode") == "private":
                     self.stats["skipped_private"] += 1
-                elif (m.get("attest", "token") == "token" and m.get("sub") in self.senders
+                elif (m.get("attest", "token") in ("token", "agent") and m.get("sub") in self.senders
                       and abs(time.time() - (ts_epoch(m.get("ts")) or 0)) <= AS_SENDER_MAX_AGE_S
                       and self.as_sender(m)):
                     self.stats["to_old_as_sender"] += 1

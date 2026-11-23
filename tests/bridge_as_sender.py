@@ -24,6 +24,8 @@ msgs = [
      "text": "backdated", "mode": "members", "attest": "token"},
     {"id": 3, "env": "e3", "ts": "garbage", "from": "a.x", "sub": "agent:x@t", "to": "all", "thread": "t",
      "text": "bad ts", "mode": "members", "attest": "token"},
+    {"id": 4, "env": "e4", "ts": ts(now - 5), "from": "a.x", "sub": "agent:x@t", "to": "all", "thread": "t",
+     "text": "signed", "mode": "members", "attest": "agent"},
 ]
 posts = []
 
@@ -47,4 +49,5 @@ b.p2p_to_old()
 assert posts[0] == ("SENDER", "fresh"), posts
 assert posts[1][0] == "BRIDGE" and posts[1][1].startswith("[agent-mail: from a.x [agent:x@t]") and posts[1][1].endswith("backdated"), posts
 assert posts[2][0] == "BRIDGE", posts
-print("ok: fresh as sender, old and unparseable as the bridge")
+assert posts[3] == ("SENDER", "signed"), posts  # agent-signed mail goes as its sender too
+print("ok: fresh (token or agent-signed) as sender, old and unparseable as the bridge")
