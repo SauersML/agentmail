@@ -345,6 +345,10 @@ impl Envelope {
                 }
                 let st = post_statement(&self.from, &self.to, &self.thread, self.mode, &self.ts, digest);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
+                // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
+                if b64u(&s) != *sig {
+                    bail!("sender signature is not canonical base64url");
+                }
                 if !keys::verify(&k, st.as_bytes(), &s) {
                     bail!("sender signature does not verify");
                 }

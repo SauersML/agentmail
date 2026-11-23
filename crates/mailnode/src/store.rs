@@ -173,6 +173,23 @@ impl Store {
         let db = Connection::open(path)?;
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         db.execute_batch(SCHEMA)?;
+        // agent_sig: the sender's signature of an agent-signed message, on the first copy this node stored. A member
+        // node can read members-mode mail, so it can re-encrypt someone's signed message into a new envelope (new id,
+        // same signature): such a replay is kept hidden (mode 'dup', no text) so day hashes still agree between nodes.
+        let has_sig_col =
+            db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'agent_sig'")?.exists([])?;
+        if !has_sig_col {
+            db.execute_batch("ALTER TABLE messages ADD COLUMN agent_sig TEXT;")?;
+        }
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages (agent_sig) WHERE agent_sig IS NOT NULL;",
+        )?;
+        if !has_sig_col {
+            db.execute_batch(
+                "UPDATE OR IGNORE messages SET agent_sig = json_extract(env, '$.attest.sig') \
+                 WHERE json_extract(env, '$.attest.kind') = 'agent';",
+            )?;
+        }
         Ok(Store { db: Mutex::new(db) })
     }
 
@@ -181,7 +198,16 @@ impl Store {
         Ok(db.query_row("SELECT 1 FROM messages WHERE env_id = ?", [env_id], |_| Ok(())).optional()?.is_some())
     }
 
-    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key).
+    /// The visible row of an agent-signed message, by its sender signature (canonical base64url).
+    pub fn by_agent_sig(&self, sig: &str) -> Result<Option<Row>> {
+        let db = self.db.lock().unwrap();
+        Ok(db
+            .query_row(&format!("SELECT {COLS} FROM messages WHERE agent_sig = ?"), params![MAX_TEXT, sig], read_row)
+            .optional()?)
+    }
+
+    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key), or if it
+    /// is another envelope carrying an agent-signed message already here (stored hidden, see agent_sig).
     /// `files`: the body's attachment list as JSON (with blob keys; "[]" when unreadable). `id_floor`: new
     /// non-imported mail is numbered from here up, so the old server's numbers below it stay free for imports.
     #[allow(clippy::too_many_arguments)]
@@ -221,12 +247,20 @@ impl Store {
             None if v.imported.is_none() && max < id_floor => Some(id_floor),
             None => None, // AUTOINCREMENT: above the highest id ever used
         };
+        let agent_sig = match &env.attest {
+            mailcore::Attest::Agent { sig, .. } => mailcore::b64u_decode(sig).map(|b| mailcore::b64u(&b)),
+            _ => None,
+        };
+        let replay = match &agent_sig {
+            Some(sig) => db.query_row("SELECT 1 FROM messages WHERE agent_sig = ?", [sig], |_| Ok(())).optional()?.is_some(),
+            None => false,
+        };
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (id, env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, verified, imported, parents, env, received, attest, blobs, files) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             readers, verified, imported, parents, env, received, attest, blobs, files, agent_sig) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                explicit,
+                if replay { None } else { explicit },
                 env.id,
                 env.day(),
                 env.ts,
@@ -234,9 +268,9 @@ impl Store {
                 v.sender_sub,
                 env.to,
                 env.thread,
-                env.mode.as_str(),
-                text,
-                readers,
+                if replay { "dup" } else { env.mode.as_str() },
+                if replay { None } else { text },
+                if replay { None } else { readers },
                 v.verified as i64,
                 v.imported.map(|x| x as i64),
                 parents,
@@ -244,10 +278,11 @@ impl Store {
                 received_ms,
                 v.attest,
                 serde_json::to_string(&env.blobs)?,
-                files
+                if replay { "[]" } else { files },
+                if replay { None } else { agent_sig }
             ],
         )?;
-        if n == 0 {
+        if n == 0 || replay {
             return Ok(None);
         }
         let row = db.query_row(
@@ -645,5 +680,33 @@ impl Store {
     pub fn count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opening_an_older_store_adds_and_backfills_agent_sig() {
+        let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            for (i, id) in ["a", "b"].iter().enumerate() {
+                db.execute(
+                    "INSERT INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, parents, env, received) \
+                     VALUES (?, 'd', 't', 's', 'ss', 'all', 't', 'members', 'x', '[]', ?, ?)",
+                    params![id, r#"{"attest":{"kind":"agent","sig":"SIG"}}"#, i as i64],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let row = store.by_agent_sig("SIG").unwrap().expect("backfilled");
+        assert_eq!(row.env_id, "a", "an existing duplicate keeps only the first copy indexed");
+        drop(store);
+        Store::open(&path).unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }

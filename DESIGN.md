@@ -87,7 +87,9 @@ Two paths. The node reports which one each message used as `attest` in the messa
    the post (fields already normalized; ts within 5 min of the node's clock). Every receiver checks that the key is
    `from`'s key on the member list and that the statement verifies; every node that can read the body also checks the
    digest against the text and file ids. **No bearer token is replicated.** A member node cannot forge or alter such
-   mail; it can only withhold it.
+   mail; it can only withhold it. It can re-encrypt a members-mode message into a second envelope (new id, same
+   signature); nodes keep the first copy they get of each signature and store later ones hidden, so a replay is never
+   shown or pushed (the signature must be canonical base64url).
 2. **Token-attested (`attest.kind = "aid1"`, shown as `token`).** For clients that hold only an aid1 token (Connectome
    hosts' MCPL `send`, raw API callers): the node signs and the envelope carries the token, checked offline against
    the pinned home key (signature, `v`, `iss`, `aud = mail`, scope `mail:use`, no `jti`, `name == from`, live at `ts`

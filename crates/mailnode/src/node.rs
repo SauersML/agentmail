@@ -296,6 +296,13 @@ impl Node {
                 if !ok {
                     return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key on the member list", who.name)));
                 }
+                // Canonical encoding (the one every node dedupes by); a client resending the same signed post gets
+                // the first copy back instead of a second envelope.
+                let sig = mailcore::b64u_decode(&sig).map(|b| mailcore::b64u(&b)).unwrap_or(sig);
+                if let Some(row) = self.store.by_agent_sig(&sig)? {
+                    let reaches = self.reaches(&row.recipient, &who.sub)?;
+                    return Ok(Posted { row, reaches, repeated: true });
+                }
                 (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
             }
             None => {
@@ -915,6 +922,66 @@ mod tests {
         assert!(lines[0].starts_with("#7 "), "{out:?}");
         assert!(lines[1..].iter().all(|l| l.starts_with("> ")), "{out:?}");
         assert_eq!(lines.len(), 9, "{out:?}");
+    }
+
+    #[test]
+    fn a_replayed_agent_signed_message_stays_hidden() {
+        let (node, home, node_b, list, _rx, alice) = setup_full();
+        let ts = now_ts();
+        let salt = mailcore::random_bytes::<16>();
+        let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]);
+        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
+        let sig = mailcore::b64u(&alice.sign(st.as_bytes()));
+        let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
+        let seal = |parents: Vec<String>, sig: String| {
+            Envelope::seal(
+                Draft {
+                    thread: "t",
+                    parents,
+                    ts: ts.clone(),
+                    from: "a.alice",
+                    to: "all",
+                    mode: Mode::Members,
+                    body: &body,
+                    blobs: vec![],
+                    attest: Attest::Agent { key: fmt_key(&alice.public()), digest: digest.clone(), sig },
+                    recipients: &list.all_keys(),
+                },
+                &node_b,
+            )
+            .unwrap()
+        };
+        let first = seal(vec![], sig.clone());
+        assert!(node.ingest(first.clone()).unwrap().is_some());
+        // node_b re-encrypts alice's signed message into a new envelope (new id, same signature).
+        let replay = seal(vec![first.id.clone()], sig.clone());
+        assert_ne!(replay.id, first.id);
+        assert!(node.ingest(replay.clone()).unwrap().is_none(), "the replay is not shown");
+        assert_eq!(node.store.count().unwrap(), 2, "but kept, so day hashes agree with peers that have it");
+        assert!(node.ingest(replay).unwrap().is_none());
+        let who = node.verify(&token(&home)).unwrap();
+        let (rows, _) = node.store.query(&crate::store::Query::default(), &who.name, MAX_TEXT).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(node.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
+        // The same signature in another base64 spelling is refused outright.
+        let padded = seal(vec![], format!("{sig}=="));
+        assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
+    }
+
+    #[test]
+    fn resending_a_signed_post_returns_the_first_copy() {
+        let (node, home, _b, _l, _rx, alice) = setup_full();
+        let who = node.verify(&token(&home)).unwrap();
+        let f = node.upload(&who, "a.txt", "text/plain", b"bytes").unwrap();
+        let id = f["id"].as_str().unwrap().to_string();
+        let ts = now_ts();
+        let post = json!({ "to": "all", "thread": "t", "text": "with file", "files": [id],
+                           "signed": signed(&alice, "all", "t", "with file", std::slice::from_ref(&id), &ts) });
+        let p1 = node.post(&who, &post).unwrap();
+        let p2 = node.post(&who, &post).unwrap();
+        assert!(!p1.repeated && p2.repeated);
+        assert_eq!(p1.row.env_id, p2.row.env_id);
+        assert_eq!(node.store.count().unwrap(), 1);
     }
 
     #[test]
