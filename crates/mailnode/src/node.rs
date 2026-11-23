@@ -169,6 +169,12 @@ impl Node {
         if p.jti.is_some() {
             return Err(ApiError::new(401, "token refused: a one-time sign-in token works only to sign in"));
         }
+        // Only names on the member list (with the same sub) may use this node: a token the home minted for anyone
+        // else reads nothing here (SECURITY.md). Members are added by re-signing the list.
+        let listed = self.members.read().unwrap().member_by_name(&p.name).is_some_and(|m| m.sub == p.sub);
+        if !listed {
+            return Err(ApiError::new(403, format!("{} is not on this network's member list; ask its operator to add you", p.name)));
+        }
         self.touch(&p.name, &p.sub);
         Ok(Caller { name: p.name, sub: p.sub, kind: p.kind, token: token.to_string(), exp_ms: (p.exp * 1000.0) as i64 })
     }
@@ -1057,21 +1063,8 @@ mod tests {
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
         node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis(), 1).unwrap().unwrap();
         node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
-        let now = now_millis() as f64 / 1000.0;
-        let bob = mailcore::Aid1Payload {
-            v: 1,
-            iss: "h".into(),
-            sub: "agent:bob@t".into(),
-            kind: "agent".into(),
-            name: "a.bob".into(),
-            aud: "mail".into(),
-            scopes: vec!["mail:use".into()],
-            claims: None,
-            iat: now,
-            exp: now + 600.0,
-            jti: None,
-        };
-        let bob = node.verify(&mailcore::token::mint(&home, &bob)).unwrap();
+        // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
+        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), kind: "agent".into(), token: String::new(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }
@@ -1130,6 +1123,33 @@ mod tests {
         let old = ts_from_millis(now_millis() - 3_600_000);
         let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&alice, "all", "t", "y", &[], &old) }));
         assert_eq!(bad.err().unwrap().status, 400);
+    }
+
+    #[test]
+    fn only_member_list_names_may_use_the_api() {
+        let (node, home, _b, _l, _rx, _alice) = setup_full();
+        assert!(node.verify(&token(&home)).is_ok());
+        let now = now_millis() as f64 / 1000.0;
+        let mint = |name: &str, sub: &str| {
+            mailcore::token::mint(
+                &home,
+                &mailcore::Aid1Payload {
+                    v: 1,
+                    iss: "h".into(),
+                    sub: sub.into(),
+                    kind: "agent".into(),
+                    name: name.into(),
+                    aud: "mail".into(),
+                    scopes: vec!["mail:use".into()],
+                    claims: None,
+                    iat: now,
+                    exp: now + 3600.0,
+                    jti: None,
+                },
+            )
+        };
+        assert_eq!(node.verify(&mint("a.mallory", "agent:mallory@t")).err().unwrap().status, 403, "not on the list");
+        assert_eq!(node.verify(&mint("a.alice", "agent:mallory@t")).err().unwrap().status, 403, "listed name, other sub");
     }
 
     #[test]
