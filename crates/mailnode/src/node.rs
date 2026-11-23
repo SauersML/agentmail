@@ -1063,21 +1063,8 @@ mod tests {
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
         node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis(), 1).unwrap().unwrap();
         node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
-        let now = now_millis() as f64 / 1000.0;
-        let bob = mailcore::Aid1Payload {
-            v: 1,
-            iss: "h".into(),
-            sub: "agent:bob@t".into(),
-            kind: "agent".into(),
-            name: "a.bob".into(),
-            aud: "mail".into(),
-            scopes: vec!["mail:use".into()],
-            claims: None,
-            iat: now,
-            exp: now + 600.0,
-            jti: None,
-        };
-        let bob = node.verify(&mailcore::token::mint(&home, &bob)).unwrap();
+        // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
+        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), kind: "agent".into(), token: String::new(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }
