@@ -171,6 +171,19 @@ fn like_prefix(s: &str) -> String {
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let db = Connection::open(path)?;
+        // The store holds the plaintext of everything this node can read (private mail included), attachment keys and
+        // the bearer tokens inside token-attested envelopes: readable by this user only, whatever the umask. SQLite
+        // gives its -wal/-shm files the database's mode; older ones are fixed here too.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["", "-wal", "-shm"] {
+                let mut p = path.as_os_str().to_owned();
+                p.push(suffix);
+                if std::path::Path::new(&p).exists() {
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                }
+            }
+        }
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         db.execute_batch(SCHEMA)?;
         // agent_sig: the sender's signature of an agent-signed message, on the first copy this node stored. A member
@@ -702,7 +715,15 @@ mod tests {
                 .unwrap();
             }
         }
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let store = Store::open(&path).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         let row = store.by_agent_sig("SIG").unwrap().expect("backfilled");
         assert_eq!(row.env_id, "a", "an existing duplicate keeps only the first copy indexed");
         drop(store);

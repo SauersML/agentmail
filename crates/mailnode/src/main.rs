@@ -94,6 +94,12 @@ async fn run(path: &Path) -> Result<()> {
         .init();
     let cfg = config::Config::load(path)?;
     std::fs::create_dir_all(&cfg.data_dir)?;
+    // mail.sqlite (plaintext mail, attachment keys, replicated bearer tokens) lives here: this user only.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("making {} private", cfg.data_dir.display()))?;
+    }
     let seed = cfg.node_seed()?;
     let members = cfg.best_members()?;
     if !members.is_node(&seed.public()) {
