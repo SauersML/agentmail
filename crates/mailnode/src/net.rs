@@ -98,6 +98,13 @@ impl ProtocolHandler for SyncProto {
             };
             let node = self.node.clone();
             let peer = *conn.remote_id().as_bytes();
+            // Membership is checked at the handshake; a node taken off a newer member list must also lose a
+            // connection it already had, so check again on every request.
+            if !node.members.read().unwrap().is_node(&peer) {
+                tracing::warn!("closing sync connection of {}: no longer a member node", conn.remote_id().fmt_short());
+                conn.close(403u32.into(), b"not a member node");
+                return Ok(());
+            }
             let req = recv.read_to_end(MAX_REQ).await.map_err(AcceptError::from_err)?;
             let resp = tokio::task::spawn_blocking(move || answer(&node, &peer, &req))
                 .await
