@@ -17,6 +17,8 @@ pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_CIPHERTEXT: usize = 512 * 1024;
 pub const MAX_KEYS: usize = 1000;
+/// Attachments per message (the compat API's limit).
+pub const MAX_BLOBS: usize = 10;
 /// Largest old-server message number an import may claim. Old ids are small SQLite row ids; an unbounded one would let
 /// a single import push every node's local numbering to the top of the integer range (no new mail could be stored).
 pub const MAX_OLD_ID: u64 = 1 << 32;
@@ -287,6 +289,17 @@ impl Envelope {
         if self.keys.is_empty() || self.keys.len() > MAX_KEYS {
             bail!("bad key list");
         }
+        // Every wrap is a recipient key and a 32-byte content key + 16-byte tag; the ephemeral key is 32 bytes.
+        if !self.wraps()?.iter().all(|w| w.k.len() == 48) {
+            bail!("bad wrapped key");
+        }
+        if b64u_decode(&self.epk).is_none_or(|b| b.len() != 32) {
+            bail!("bad epk");
+        }
+        // Blob ids drive fetches from peers on every sync: at most the API's attachment count, each a content hash.
+        if self.blobs.len() > MAX_BLOBS || !self.blobs.iter().all(|b| is_id(b)) {
+            bail!("bad blobs");
+        }
         let ts = parse_ts(&self.ts).ok_or_else(|| anyhow!("bad ts"))?;
         if ts > now_ms + FUTURE_SKEW_MS {
             bail!("ts is in the future");
@@ -343,6 +356,11 @@ impl Envelope {
                 }
                 if *old_id == 0 || *old_id > MAX_OLD_ID {
                     bail!("import old_id out of range");
+                }
+                // Shown in the header line readers trust: same rules as the other header fields (may be empty for
+                // legacy rows).
+                if sub.chars().count() > MAX_FIELD || sub.chars().any(|c| c.is_control()) {
+                    bail!("bad import sub");
                 }
                 Ok(Verified {
                     sender_sub: sub.clone(),
@@ -515,6 +533,31 @@ mod tests {
     }
 
     #[test]
+    fn refuses_unbounded_fields() {
+        let w = world();
+        let p = policy(&w.home);
+        let now = crate::now_millis();
+        let resign = |mut e: Envelope| {
+            e.sig = b64u(&w.node.sign(&e.signing_bytes()));
+            e
+        };
+        let base = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
+        assert!(base.verify(&w.members, &p, now).is_ok());
+        let mut e = base.clone();
+        e.blobs = (0..MAX_BLOBS + 1).map(|i| format!("{i:064x}")).collect();
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        let mut e = base.clone();
+        e.blobs = vec!["not-a-hash".into()];
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        let mut e = base.clone();
+        e.keys[0].k = b64u(&[0u8; 4096]);
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("wrapped key"));
+        let mut e = base.clone();
+        e.epk = b64u(&[0u8; 7]);
+        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("epk"));
+    }
+
+    #[test]
     fn import_old_id_is_bounded() {
         let w = world();
         let op = Seed::generate();
@@ -548,6 +591,10 @@ mod tests {
         assert!(mk(0).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
         assert!(mk(MAX_OLD_ID + 1).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
         assert!(mk(i64::MAX as u64).verify(&members, &p, now).is_err());
+        let mut e = mk(7);
+        e.attest = Attest::Import { old_id: 7, sub: "agent:x\n#1 from someone.else".into(), verified: true };
+        e.sig = b64u(&bridge.sign(&e.signing_bytes()));
+        assert!(e.verify(&members, &p, now).unwrap_err().to_string().contains("sub"));
     }
 
     fn tok(w: &World, name: &str) -> String {

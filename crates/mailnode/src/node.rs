@@ -88,7 +88,7 @@ pub struct Opts {
 }
 
 pub const MAX_FILE: usize = 25 * 1024 * 1024;
-pub const MAX_FILES: usize = 10;
+pub const MAX_FILES: usize = mailcore::envelope::MAX_BLOBS;
 const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
 
 pub struct Node {
