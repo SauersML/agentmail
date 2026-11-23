@@ -308,6 +308,17 @@ impl Node {
                 }
                 (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
             }
+            // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
+            // sign for it, so the envelope carries a signature instead of the caller's bearer token (SECURITY.md).
+            None if self.local_key(&members, who).is_some() => {
+                let (key, seed) = self.local_key(&members, who).expect("checked");
+                let salt = mailcore::random_bytes::<16>();
+                let ts = now_ts();
+                let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
+                let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
+                let sig = mailcore::b64u(&seed.sign(st.as_bytes()));
+                (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
+            }
             None => {
                 if self.opts.refuse_token_only {
                     return Err(ApiError::new(400, "this node accepts only mail signed with the sender's own key (islandmail.py signs it)"));
@@ -347,6 +358,18 @@ impl Node {
         let _ = self.outbound.send(Outbound::Envelope(env));
         let reaches = self.reaches(&to, &who.sub)?;
         Ok(Posted { row, reaches, repeated: false })
+    }
+
+    /// The caller's agent key, if this node holds it: an identity named like the caller whose public key is the one
+    /// the member list gives that name, with the same sub as the caller's token. (member-list key string, seed)
+    fn local_key(&self, members: &MemberList, who: &Caller) -> Option<(String, Seed)> {
+        let m = members.member_by_name(&who.name).filter(|m| m.sub == who.sub)?;
+        let k = mailcore::keys::parse_key(&m.key).ok()?;
+        self.opts
+            .identities
+            .iter()
+            .find(|(n, s)| mailcore::addr::same(n, &who.name) && s.public() == k)
+            .map(|(_, s)| (m.key.clone(), s.clone()))
     }
 
     /// Bridge: one message from the old server, kept under its old number where free, signed by the bridge key, sealed
@@ -1107,6 +1130,36 @@ mod tests {
         let old = ts_from_millis(now_millis() - 3_600_000);
         let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&alice, "all", "t", "y", &[], &old) }));
         assert_eq!(bad.err().unwrap().status, 400);
+    }
+
+    #[test]
+    fn node_signs_for_a_caller_whose_key_it_holds() {
+        let (_n, home, node_b, list, _rx, alice) = setup_full();
+        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
+        let op = mailcore::keys::parse_key(&list.operator).unwrap();
+        let mk = |ids: Vec<(String, Seed)>| {
+            let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let opts = Opts { id_floor: 1, public_url: "http://x".into(), identities: ids, ..Default::default() };
+            let node_seed = Seed::from_bytes(*node_b.bytes());
+            (Node::new(Store::open(&path).unwrap(), list.clone(), op, policy.clone(), node_seed, opts, tx), rx)
+        };
+        // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
+        let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
+        let who = node.verify(&token(&home)).unwrap();
+        let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
+        assert_eq!(p.row.attest, "agent");
+        let e = env_of(rx.try_recv().unwrap());
+        assert!(matches!(e.attest, Attest::Agent { .. }));
+        assert!(!serde_json::to_string(&e).unwrap().contains(&who.token), "the token never enters the envelope");
+        let v = e.verify(&list, &policy, now_millis()).unwrap();
+        assert_eq!(v.attest, "agent");
+        e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
+        // Holding a different key under alice's name: not hers on the member list, so the post stays token-attested.
+        let (node, mut rx) = mk(vec![("a.alice".into(), Seed::generate())]);
+        let who = node.verify(&token(&home)).unwrap();
+        assert_eq!(node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x" })).unwrap().row.attest, "token");
+        assert!(matches!(env_of(rx.try_recv().unwrap()).attest, Attest::Aid1 { .. }));
     }
 
     #[test]
