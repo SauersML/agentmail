@@ -266,19 +266,29 @@ def addressed_to(to, name):
     return False
 
 
+# Everything some reader takes as a line end (str.splitlines' set), and what may not appear in a header field.
+_BREAKS = re.compile("\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+_NOT_HEADER = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _one_line(s):
+    return _NOT_HEADER.sub(" ", str(s))
+
+
 def show(m, out=sys.stdout):
-    # Only the header line says who sent it; every line of the sender's text starts with "> ".
+    # Only the header line says who sent it; every line of the sender's text starts with "> ". Mail from other nodes is
+    # not filtered, so every kind of line break starts a new quoted line and none can reach the header.
     files = ""
     if m.get("files"):
         files = "\n[attachments: %s]" % "; ".join(
             "%s (%d bytes, id %s)" % (f["name"], f["size"], f["id"]) for f in m["files"])
     if m.get("verified", True):
-        sender = "%s [%s]" % (m["from"], m["sub"]) if m.get("sub") else m["from"]
+        sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"])) if m.get("sub") else _one_line(m["from"])
     else:
-        sender = "%s (unverified: copied from the old shared-password inbox)" % m["from"]
-    body = "\n".join("> " + line for line in (m["text"] + files).split("\n"))
+        sender = "%s (unverified: copied from the old shared-password inbox)" % _one_line(m["from"])
+    body = "\n".join("> " + line for line in _BREAKS.split(m["text"] + files))
     out.write("#%d %sZ from %s to %s, thread \"%s\":\n%s\n\n" % (
-        m["id"], m["ts"][:16], sender, m["to"], m["thread"], body))
+        m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), _one_line(m["thread"]), body))
     out.flush()
 
 
