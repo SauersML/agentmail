@@ -1,6 +1,8 @@
 //! Operator-signed membership for agent identities and direct peers.
 
-use anyhow::{anyhow, bail, Result};
+use std::collections::HashSet;
+
+use anyhow::{anyhow, bail, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::addr;
@@ -15,7 +17,7 @@ pub struct Member {
     pub name: String,
     /// Durable principal id (the token's `sub`)
     pub sub: String,
-    /// The agent's enrolled Ed25519 key (principals.json `key`)
+    /// The agent's public signing key.
     pub key: String,
 }
 
@@ -24,7 +26,7 @@ pub struct NodeEntry {
     pub name: String,
     /// The node's Ed25519 key; also its iroh endpoint id.
     pub key: String,
-    /// Direct addresses (ip:port) other nodes may dial; optional when relays or address lookup find it.
+    /// Direct socket addresses that other peers can dial.
     #[serde(default)]
     pub addrs: Vec<String>,
 }
@@ -69,11 +71,32 @@ impl MemberList {
         if !keys::verify(pinned_operator, &self.signing_bytes(), &sig) {
             bail!("member list signature does not verify");
         }
+        ensure!(!self.nodes.is_empty() && self.members.len() + self.nodes.len() <= crate::envelope::MAX_KEYS,
+                "list needs at least one node and at most {} recipient keys", crate::envelope::MAX_KEYS);
+        ensure!(!self.network.trim().is_empty() && self.network.len() <= 120 && !self.network.chars().any(char::is_control),
+                "invalid network name");
+        let mut keys = HashSet::new();
+        let mut add_key = |raw: &str| -> Result<()> {
+            let key = parse_key(raw)?;
+            ensure!(fmt_key(&key) == raw, "public key must use canonical base64url");
+            ensure!(keys.insert(keys::x25519_public(&key)?), "keys must be distinct across members, nodes and operator");
+            Ok(())
+        };
+        add_key(&self.operator)?;
+        let mut names = HashSet::new();
+        let mut subjects = HashSet::new();
         for m in &self.members {
-            parse_key(&m.key)?;
+            let name = m.name.as_bytes();
+            ensure!(name.first().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') && name.len() <= 48
+                    && name.iter().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c))
+                    && !m.name.ends_with('.') && !m.name.eq_ignore_ascii_case("all"), "invalid agent name");
+            ensure!(!m.sub.is_empty() && m.sub.len() <= 120 && m.sub.bytes().all(|b| b.is_ascii_graphic()),
+                    "invalid agent subject");
+            ensure!(names.insert(addr::norm(&m.name)) && subjects.insert(&m.sub), "duplicate agent name or subject");
+            add_key(&m.key)?;
         }
         for n in &self.nodes {
-            parse_key(&n.key)?;
+            add_key(&n.key)?;
             for addr in &n.addrs {
                 addr.parse::<std::net::SocketAddr>().map_err(|_| anyhow!("invalid peer socket address {addr:?}"))?;
             }
@@ -82,7 +105,8 @@ impl MemberList {
     }
 
     pub fn is_node(&self, key: &PublicKey) -> bool {
-        self.nodes.iter().any(|n| parse_key(&n.key).ok().as_ref() == Some(key))
+        let key = fmt_key(key);
+        self.nodes.iter().any(|n| n.key == key)
     }
 
     pub fn node_keys(&self) -> Vec<PublicKey> {
@@ -150,6 +174,19 @@ pub(crate) mod tests {
         l.sign(&op);
         l.verify(&op.public()).unwrap();
         l
+    }
+
+    #[test]
+    fn membership_rejects_shared_roles_and_ambiguous_names() {
+        let op = Seed::generate();
+        let mut l = list(&[("a.bob", &Seed::generate()), ("a.sue", &Seed::generate())], &[&Seed::generate()]);
+        l.members[1].name = "A.Bob".into();
+        l.sign(&op);
+        assert!(l.verify(&op.public()).is_err());
+        l.members[1].name = "a.sue".into();
+        l.nodes[0].key = l.members[0].key.clone();
+        l.sign(&op);
+        assert!(l.verify(&op.public()).is_err());
     }
 
     #[test]

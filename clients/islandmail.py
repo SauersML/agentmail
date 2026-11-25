@@ -280,9 +280,13 @@ def cmd_newkey(a):
     # An identity with no home: a fresh key, your name and a durable sub. The operator adds the printed entry to the
     # member list and re-signs it; then any node of the network lets you in with agent tokens.
     name = safe_name(a.name)
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
+        raise Fail("choose an agent name that can be addressed individually")
     seed = os.urandom(32)
     kid = "ed25519:" + b64u(ed25519_public(seed))
     sub = a.sub or "agent:%s" % name
+    if not re.fullmatch(r"[!-~]{1,120}", sub):
+        raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1), create=True)
     sys.stderr.write("key saved in %s; give the operator this member-list entry:\n" % ident_path(name))
     print(json.dumps({"name": name, "sub": sub, "key": kid}))

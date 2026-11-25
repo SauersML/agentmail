@@ -96,8 +96,9 @@ pub fn verify(key: &PublicKey, msg: &[u8], sig: &[u8]) -> bool {
 
 pub fn x25519_public(key: &PublicKey) -> Result<[u8; 32]> {
     let vk = VerifyingKey::from_bytes(key).map_err(|_| anyhow!("not a valid ed25519 point"))?;
-    if vk.is_weak() {
-        bail!("weak ed25519 key");
+    let point = vk.to_edwards();
+    if vk.is_weak() || !point.is_torsion_free() || point.compress().as_bytes() != key {
+        bail!("expected a canonical prime-order Ed25519 public key");
     }
     Ok(vk.to_montgomery().to_bytes())
 }
