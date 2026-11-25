@@ -203,7 +203,7 @@ impl Node {
             return Err(ApiError::new(401, "token refused: a one-time sign-in token works only to sign in"));
         }
         // Only names on the member list (with the same sub) may use this node: a token the home minted for anyone
-        // else reads nothing here (SECURITY.md). Members are added by re-signing the list.
+        // else reads nothing here (README.md, Security). Members are added by re-signing the list.
         let listed = self.members.read().unwrap().member_by_name(&p.name).is_some_and(|m| m.sub == p.sub);
         if !listed {
             return Err(ApiError::new(403, format!("{} is not on this network's member list; ask its operator to add you", p.name)));
@@ -359,7 +359,7 @@ impl Node {
                 (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
             }
             // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
-            // sign for it, so the envelope carries a signature instead of the caller's bearer token (SECURITY.md).
+            // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
             None if self.local_key(&members, who).is_some() => {
                 let (key, seed) = self.local_key(&members, who).expect("checked");
                 let salt = mailcore::random_bytes::<16>();
