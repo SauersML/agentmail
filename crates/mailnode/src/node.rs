@@ -84,6 +84,8 @@ pub struct Node {
     /// Who this host accepts now: pinned agents and live certificates (`MemberList::agents`). Kept current by
     /// `refresh` whenever the trust file, a certificate or a revocation changes.
     roster: RwLock<Vec<Agent>>,
+    /// Serialize local issuance decisions with other claims, owner revocations and namespace edits.
+    issuance: Mutex<()>,
     /// Bumped on every trust change, so open sessions re-check their caller at once.
     pub trust: watch::Sender<u64>,
     /// Certificates and revocations to gossip (JSON, tagged {"cert": …} or {"revocation": …}).
@@ -110,6 +112,7 @@ impl Node {
         let node = Node {
             store,
             roster: RwLock::new(Vec::new()),
+            issuance: Mutex::new(()),
             trust: watch::channel(0).0,
             trust_out,
             members: RwLock::new(members),
@@ -153,6 +156,7 @@ impl Node {
 
     /// Reload only from the local configuration file. Remote input never changes peer trust.
     pub fn reload_members(&self, list: &MemberList) -> Result<bool> {
+        let _guard = self.issuance.lock().unwrap();
         let mut cur = self.members.write().unwrap();
         if *list == *cur { return Ok(false); }
         anyhow::ensure!(list.network == cur.network && list.seq > cur.seq, "trust changes require the same network and a higher revision");
@@ -221,6 +225,7 @@ impl Node {
         let me = self.me();
         let k = mailcore::cert::check_issuance(name, key, f("ts"), f("sig"), &me, now_millis())
             .map_err(|e| ApiError::new(400, format!("certificate request refused: {e}")))?;
+        let _guard = self.issuance.lock().unwrap();
         let list = self.members.read().unwrap().clone();
         let mine = list.node_by_key(&me).ok_or_else(|| ApiError::new(503, "this node is not in its own trust file"))?;
         if !mine.covers(name) {
@@ -269,6 +274,7 @@ impl Node {
             || !mailcore::keys::verify(&me, revoke_statement(name, &fmt_key(&me), ts).as_bytes(), &sig) {
             return Err(ApiError::new(401, "revocation requests are signed by this node's key (mailnode revoke CONFIG NAME)"));
         }
+        let _guard = self.issuance.lock().unwrap();
         let out = self.store.revoke_local(&self.seed, name, t)?
             .ok_or_else(|| ApiError::new(409, "revocation request already used or superseded"))?;
         for r in &out {
@@ -1198,6 +1204,23 @@ mod tests {
 
     fn status<T>(r: Result<T, ApiError>) -> u16 {
         r.err().map_or(0, |e| e.status)
+    }
+
+    #[test]
+    fn concurrent_local_claims_issue_one_key_per_name() {
+        let (node, _, _, _) = homes();
+        let requests = [proof(&Seed::generate(), "hypha", &node), proof(&Seed::generate(), "hypha", &node)];
+        let barrier = std::sync::Barrier::new(requests.len());
+        let mut codes = std::thread::scope(|scope| {
+            let calls: Vec<_> = requests.iter().map(|req| scope.spawn(|| {
+                barrier.wait();
+                node.certify(req).map_or_else(|e| e.status, |(status, _)| status)
+            })).collect();
+            calls.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
+        });
+        codes.sort();
+        assert_eq!(codes, [201, 409]);
+        assert_eq!(node.store.certs_named("hypha").unwrap().len(), 1);
     }
 
     #[test]
