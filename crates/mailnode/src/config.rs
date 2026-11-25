@@ -127,21 +127,60 @@ pub fn read_seed(path: &Path) -> Result<Seed> {
 pub fn write_seed(path: &Path, seed: &Seed) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(seed.to_hex().as_bytes())?;
-    f.sync_all()?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".mailnode-{}.tmp", mailcore::b64u(&mailcore::random_bytes::<16>())));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    // Publish the complete file without replacing a key another process just created.
+    let result = (|| -> std::io::Result<()> {
+        f.write_all(seed.to_hex().as_bytes())?;
+        f.sync_all()?;
+        std::fs::hard_link(&tmp, path)
+    })();
+    let cleanup = std::fs::remove_file(&tmp);
+    result.with_context(|| format!("creating {}", path.display()))?;
+    cleanup?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
 pub fn read_or_create_seed(path: &Path) -> Result<Seed> {
-    if path.exists() {
-        return read_seed(path);
+    use std::io::{Error, ErrorKind};
+    match read_seed(path) {
+        Err(e) if e.downcast_ref::<Error>().is_some_and(|e| e.kind() == ErrorKind::NotFound) => {}
+        result => return result,
     }
-    let s = Seed::generate();
-    write_seed(path, &s)?;
-    Ok(s)
+    let seed = Seed::generate();
+    match write_seed(path, &seed) {
+        Ok(()) => Ok(seed),
+        Err(e) if e.downcast_ref::<Error>().is_some_and(|e| e.kind() == ErrorKind::AlreadyExists) => read_seed(path),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn concurrent_first_starts_share_one_complete_private_seed() {
+        let dir = std::env::temp_dir().join(format!("mailnode-key-{}", mailcore::b64u(&mailcore::random_bytes::<12>())));
+        let path = dir.join("node.seed");
+        let start = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let writers: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                start.wait();
+                read_or_create_seed(&path).unwrap().public()
+            })).collect();
+            let keys: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            assert!(keys.iter().all(|k| *k == keys[0]));
+        });
+        let original = read_seed(&path).unwrap().public();
+        assert!(write_seed(&path, &Seed::generate()).is_err());
+        assert_eq!(read_seed(&path).unwrap().public(), original);
+        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

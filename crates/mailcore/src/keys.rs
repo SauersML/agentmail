@@ -51,8 +51,7 @@ impl Seed {
     /// Hex, as islandmail.py stores seeds (`"seed": "<64 hex>"`).
     pub fn from_hex(s: &str) -> Result<Self> {
         let s = s.trim();
-        // ASCII first: slicing two bytes at a time below would panic inside a multi-byte character.
-        if s.len() != 64 || !s.is_ascii() {
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             bail!("seed must be 64 hex characters");
         }
         let mut b = [0u8; 32];
@@ -120,5 +119,6 @@ mod tests {
         // 64 bytes but not ASCII (an identity file in identities_dir is read at start): an error, not a panic.
         assert!(Seed::from_hex(&format!("0{}0", "é".repeat(31))).is_err());
         assert!(Seed::from_hex(&"é".repeat(32)).is_err());
+        assert!(Seed::from_hex(&"+1".repeat(32)).is_err());
     }
 }
