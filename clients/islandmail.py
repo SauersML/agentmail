@@ -498,7 +498,7 @@ def cmd_ask(a):
 
 
 def query(a):
-    q = {}
+    q = {"to_me": 1} if a.to_me else {}
     for k in ("thread", "from", "to", "after", "before", "latest", "limit", "q"):
         v = getattr(a, k.replace("from", "from_"), None)
         if v is not None:

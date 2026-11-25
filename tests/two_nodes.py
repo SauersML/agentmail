@@ -280,6 +280,12 @@ def main():
         rc, out = im(pb, "bob", "read", "--to-me", "--thread", "t1")
         check("islandmail.py read --to-me (B)", rc == 0 and "hello from A" in out)
 
+        # A newer visible message to another agent must not displace Bob's latest inbox item.
+        rc, _ = im(pb, "bob", "send", "--to", "t.alice", "--thread", "t2", "reply to Alice")
+        check("Bob sends his reply", rc == 0)
+        rc, out = im(pb, "bob", "read", "--to-me", "--thread", "t2", "--latest", "1", "--json")
+        check("latest counts addressed messages", rc == 0 and [m["text"] for m in json.loads(out)] == ["sent with islandmail.py"])
+
         # MCPL on node B: tools, push/event of mail posted on A, cursor moves on {accepted:true}.
         try:
             from websockets.sync.client import connect

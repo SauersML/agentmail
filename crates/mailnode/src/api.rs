@@ -106,7 +106,13 @@ fn int_param(p: &HashMap<String, String>, name: &str) -> Result<Option<i64>, Api
 }
 
 pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
+    let to_me = match p.get("to_me").map(String::as_str) {
+        None | Some("0") => false,
+        Some("1") => true,
+        _ => return Err(ApiError::new(400, "to_me must be 0 or 1")),
+    };
     Ok(Query {
+        to_me,
         after: int_param(p, "after")?,
         before: int_param(p, "before")?,
         latest: int_param(p, "latest")?,
@@ -218,7 +224,7 @@ async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQ
     // Extension: order=causal gives one thread in the order every node agrees on (parents first, then (ts, id)).
     if p.get("order").map(|s| s.as_str()) == Some("causal") {
         let thread = q.thread.clone().ok_or_else(|| ApiError::new(400, "order=causal needs thread"))?;
-        if q.q.is_some() || q.from.is_some() || q.to.is_some() {
+        if q.to_me || q.q.is_some() || q.from.is_some() || q.to.is_some() {
             return Err(ApiError::new(400, "causal order supports thread, after, before, limit and latest"));
         }
         let (rows, more) = s.node.store.thread_causal(&thread, &who, &q, MAX_TEXT)?;

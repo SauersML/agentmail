@@ -115,6 +115,7 @@ impl Row {
 
 #[derive(Default, Debug, Clone)]
 pub struct Query {
+    pub to_me: bool,
     pub after: Option<i64>,
     pub before: Option<i64>,
     pub latest: Option<i64>,
@@ -314,6 +315,11 @@ impl Store {
     pub fn query(&self, q: &Query, viewer: &Caller, text_cap: i64) -> Result<(Vec<Row>, bool)> {
         let mut wh = vec![visible_sql().to_string()];
         let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))), Value::Text(viewer.key.clone())];
+        if q.to_me {
+            wh.push("sender_sub != ? AND addressed_to(recipient, ?)".into());
+            args.push(Value::Text(viewer.sub.clone()));
+            args.push(Value::Text(viewer.name.clone()));
+        }
         if let Some(a) = q.after {
             wh.push("id > ?".into());
             args.push(Value::Integer(a));
@@ -363,21 +369,6 @@ impl Store {
             rows.reverse();
         }
         Ok((rows, more))
-    }
-
-    pub fn addressed_rows(
-        &self, viewer: &Caller, after: i64, before: i64, limit: usize, text_cap: i64, ascending: bool,
-    ) -> Result<Vec<Row>> {
-        let db = self.db.lock().unwrap();
-        let order = if ascending { "ASC" } else { "DESC" };
-        let mut st = db.prepare(&format!(
-            "SELECT {COLS} FROM messages WHERE {} AND id > ? AND id < ? AND sender_sub != ?
-             AND addressed_to(recipient, ?) ORDER BY id {order} LIMIT ?", visible_sql()
-        ))?;
-        let args = params![text_cap, format!(",{},", norm(&viewer.name)), viewer.key, after, before,
-                           viewer.sub, viewer.name, limit as i64];
-        let rows = st.query_map(args, read_row)?.collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
     }
 
     pub fn thread_rows(&self, viewer: &Caller, limit: i64) -> Result<Vec<serde_json::Value>> {

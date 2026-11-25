@@ -367,16 +367,11 @@ impl Conn {
                 Ok(format!("Sent #{} to {} in thread \"{}\"; {reach}.", m.id, m.recipient, m.thread))
             }
             "inbox" => {
-                let limit = cap(&args["limit"], 20) as usize;
-                let before = int(&args["before"]).unwrap_or(i64::MAX);
-                let rows = match int(&args["after"]) {
-                    Some(after) => n.store.addressed_rows(me, after, before, limit, 2000, true)?,
-                    None => {
-                        let mut r = n.store.addressed_rows(me, 0, before, limit, 2000, false)?;
-                        r.reverse();
-                        r
-                    }
-                };
+                let limit = cap(&args["limit"], 20);
+                let after = int(&args["after"]);
+                let query = Query { to_me: true, after, before: int(&args["before"]), limit: Some(limit),
+                    latest: after.is_none().then_some(limit), ..Default::default() };
+                let (rows, _) = n.store.query(&query, me, 2000)?;
                 if rows.is_empty() {
                     return Ok("No mail for you there.".into());
                 }
@@ -462,10 +457,12 @@ impl Conn {
 
     fn flush_backlog(&mut self) {
         if !self.ready || !self.push_allowed() || self.pending.is_some() { return; }
-        let rows = self.node.store.cursor(&self.who.key).and_then(|cursor|
-            self.node.store.addressed_rows(&self.who, cursor, i64::MAX, 1, PUSH_TEXT as i64, true));
+        let rows = self.node.store.cursor(&self.who.key).and_then(|cursor| {
+            let q = Query { to_me: true, after: Some(cursor), limit: Some(1), ..Default::default() };
+            self.node.store.query(&q, &self.who, PUSH_TEXT as i64)
+        });
         match rows {
-            Ok(rows) => if let Some(row) = rows.first() { self.push(row); },
+            Ok((rows, _)) => if let Some(row) = rows.first() { self.push(row); },
             Err(_) => self.close(1011, "cannot read delivery cursor"),
         }
     }
