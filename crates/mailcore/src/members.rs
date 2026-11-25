@@ -154,39 +154,29 @@ impl MemberList {
     /// for that name and key add homes, certificates for another key are ignored.
     pub fn agents(&self, certs: &[Cert], revoked_at: &dyn Fn(&Cert) -> Option<i64>, at_ms: i64) -> Vec<Agent> {
         let mut seen = HashSet::new();
-        let live: Vec<&Cert> = certs
-            .iter()
-            .filter(|c| self.accepts(c) && revoked_at(c).is_none_or(|t| at_ms < t))
-            .filter(|c| seen.insert((c.node.clone(), c.key.clone())))
-            .collect();
-        let homes_of = |name: &str, key: &PublicKey| -> (Vec<PublicKey>, Vec<Cert>) {
-            let mut hc: Vec<(PublicKey, Cert)> = live.iter()
-                .filter(|c| addr::same(&c.name, name) && c.agent_key().is_ok_and(|k| k == *key))
-                .filter_map(|c| Some((c.node_key().ok()?, (*c).clone())))
-                .collect();
-            hc.sort_by_key(|a| a.0);
-            hc.into_iter().unzip()
+        let mut groups: BTreeMap<_, Vec<(PublicKey, Cert)>> = BTreeMap::new();
+        for c in certs {
+            if !self.accepts(c) || revoked_at(c).is_some_and(|t| at_ms >= t) { continue; }
+            let (Ok(node), Ok(key)) = (c.node_key(), c.agent_key()) else { continue };
+            if seen.insert((node, key)) {
+                groups.entry((addr::norm(&c.name), key)).or_default().push((node, c.clone()));
+            }
+        }
+        let agent = |name, sub, key, pinned, mut group: Vec<(PublicKey, Cert)>| {
+            group.sort_unstable_by_key(|(node, _)| *node);
+            let (homes, certs) = group.into_iter().unzip();
+            Agent { name, sub, key, homes, certs, pinned }
         };
         let mut out = Vec::new();
         for m in &self.members {
             let Ok(key) = parse_key(&m.key) else { continue };
-            let (homes, certs) = homes_of(&m.name, &key);
-            out.push(Agent { name: m.name.clone(), sub: m.sub.clone(), key, homes, certs, pinned: true });
+            let group = groups.remove(&(addr::norm(&m.name), key)).unwrap_or_default();
+            out.push(agent(m.name.clone(), m.sub.clone(), key, true, group));
         }
-        let mut certified: BTreeMap<(String, PublicKey), String> = BTreeMap::new();
-        for c in &live {
-            if self.member_by_name(&c.name).is_some() {
-                continue;
-            }
-            let Ok(key) = c.agent_key() else { continue };
-            let slot = certified.entry((addr::norm(&c.name), key)).or_insert_with(|| c.name.clone());
-            if c.name < *slot {
-                slot.clone_from(&c.name);
-            }
-        }
-        for ((_, key), name) in certified {
-            let (homes, certs) = homes_of(&name, &key);
-            out.push(Agent { sub: cert::agent_sub(&name), name, key, homes, certs, pinned: false });
+        for ((_, key), group) in groups {
+            let name = group.iter().map(|(_, c)| &c.name).min().expect("nonempty certificate group").clone();
+            let sub = cert::agent_sub(&name);
+            out.push(agent(name, sub, key, false, group));
         }
         out
     }
