@@ -101,6 +101,11 @@ impl Row {
                     && self.readers.as_deref().is_some_and(|r| r.contains(&format!(",{},", norm(&viewer.name))))))
     }
 
+    pub fn sealed_to(&self, recipients: &[mailcore::keys::PublicKey]) -> bool {
+        let keys: HashSet<_> = self.wrapped_to.split(',').collect();
+        keys.len() == recipients.len() && recipients.iter().all(|k| keys.contains(mailcore::keys::fmt_key(k).as_str()))
+    }
+
     pub fn to_message(&self) -> serde_json::Value {
         let text = self.text.clone().unwrap_or_default();
         let shown = text.chars().count() as i64;
@@ -497,15 +502,15 @@ impl Store {
     }
 
     /// The same sender's identical message within the repeat window (a client resending after a dropped answer).
-    pub fn repeat(&self, sub: &str, since_ts: &str, to: &str, thread: &str, text: &str) -> Result<Option<Row>> {
+    pub fn repeat(&self, who: &Caller, since_ts: &str, to: &str, thread: &str, text: &str) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         Ok(db
             .query_row(
                 &format!(
-                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND ts > ? AND recipient = ? AND thread = ? \
+                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND env->>'$.attest.key' = ? AND ts > ? AND recipient = ? AND thread = ? \
                      AND text = ? AND files = '[]' ORDER BY id DESC LIMIT 1"
                 ),
-                params![MAX_TEXT, sub, since_ts, to, thread, text],
+                params![MAX_TEXT, who.sub, who.name, who.key, since_ts, to, thread, text],
                 read_row,
             )
             .optional()?)

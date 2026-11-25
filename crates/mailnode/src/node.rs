@@ -457,8 +457,8 @@ impl Node {
                     "sign the post with your agent key or configure identities_dir on this node"))?;
                 if file_ids.is_empty() {
                     let since = ts_from_millis(now_millis() - REPEAT_MS);
-                    if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)?
-                        .filter(|r| r.mode == mode.as_str() && r.visible_to(who)) {
+                    if let Some(row) = self.store.repeat(who, &since, &to, &thread, &text)?
+                        .filter(|r| r.mode == mode.as_str() && r.visible_to(who) && r.sealed_to(&recipients)) {
                         let reaches = self.reaches(&to, &who.sub);
                         return Ok(Posted { row, reaches, repeated: true });
                     }
@@ -1018,6 +1018,24 @@ mod tests {
         assert!(node.store.get(private.id, &fresh).unwrap().is_none());
         assert!(node.store.query(&Default::default(), &fresh, MAX_TEXT).unwrap().0.is_empty());
         assert!(node.download(file["id"].as_str().unwrap(), &fresh).is_err());
+    }
+
+    #[test]
+    fn resending_after_enrollment_seals_to_the_current_recipients() {
+        let (mut node, alice, _, mut list, _rx) = setup();
+        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        let who = node.verify(&agent_token(&alice, &node.me())).unwrap();
+        let post = json!({"to":"all","text":"meeting notes"});
+        let before = node.post(&who, &post).unwrap();
+        let bob = Seed::generate();
+        list.seq += 1;
+        list.members.push(Member { name: "a.bob".into(), sub: "agent:bob".into(), key: fmt_key(&bob.public()) });
+        node.reload_members(&list).unwrap();
+        let after = node.post(&who, &post).unwrap();
+        assert!(!after.repeated);
+        let bob = node.verify(&mailcore::agent_token::mint(&bob, "a.bob", "agent:bob", &node.me(), now_millis(), 60)).unwrap();
+        assert!(!before.row.visible_to(&bob) && after.row.visible_to(&bob));
+        assert_eq!(node.post(&who, &post).unwrap().row.env_id, after.row.env_id);
     }
 
     #[test]
