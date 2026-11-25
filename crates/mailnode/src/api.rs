@@ -264,7 +264,8 @@ async fn download(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("sandbox; default-src 'none'; img-src 'self'; style-src 'unsafe-inline'"),
     );
-    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(r)
 }
 

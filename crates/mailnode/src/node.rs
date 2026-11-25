@@ -373,14 +373,12 @@ impl Node {
             return Err(ApiError::new(413, format!("body is over {MAX_FILE} bytes")));
         }
         self.rate(&who.sub, "upload", 60)?;
-        if self.store.uploaded_bytes(&who.key)? + data.len() as i64 > MAX_FILES_PER_SUB {
-            return Err(ApiError::new(507, "you have stored the most attachments one sender may"));
-        }
         let (blob, key) = mailcore::crypto::seal_blob(data)?;
         let id = blake3::hash(&blob).to_hex().to_string();
-        let now = now_millis();
-        self.store.put_blob(&id, &blob, now)?;
-        self.store.add_upload(&id, &who.key, name, ty, data.len() as i64, &mailcore::b64u(&key), now)?;
+        if !self.store.save_upload(&id, &blob, &who.key, name, ty, data.len() as i64,
+                                   &mailcore::b64u(&key), now_millis(), MAX_FILES_PER_SUB)? {
+            return Err(ApiError::new(507, "attachment storage quota exceeded"));
+        }
         Ok(json!({ "id": id, "name": name, "type": ty, "size": data.len() }))
     }
 
@@ -388,13 +386,14 @@ impl Node {
     /// here: the first reference (own upload, then readable messages, oldest first) whose key opens the blob, so a
     /// message written with a wrong key for someone else's blob cannot shadow the real one.
     fn usable_file(&self, id: &str, who: &Caller) -> Result<Option<FileRef>, ApiError> {
+        if !mailcore::envelope::is_id(id) { return Ok(None); }
         let refs = self.store.find_files(id, who)?;
         let Some(first) = refs.first().cloned() else { return Ok(None) };
         let Some(blob) = self.store.get_blob(id)? else { return Ok(Some((first, None))) };
         for f in refs {
             let key: Option<[u8; 32]> = f["key"].as_str().and_then(mailcore::b64u_decode).and_then(|k| k.try_into().ok());
             if let Some(Ok(plain)) = key.map(|k| mailcore::crypto::open_blob(&blob, &k)) {
-                return Ok(Some((f, Some(plain))));
+                if f["size"].as_u64() == Some(plain.len() as u64) { return Ok(Some((f, Some(plain)))); }
             }
         }
         Ok(None)
@@ -427,9 +426,10 @@ impl Node {
         }
         if let Some(b) = &body {
             env.check_body(b)?;
+            anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
         }
         let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
-        let text: Option<String> = body.map(|b| b.text.chars().take(MAX_TEXT as usize).collect());
+        let text = body.map(|b| b.text);
         let readers = (env.mode == Mode::Private).then(|| readers_for(&members, &env.to, &env.from));
         let Some(row) =
             self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis())?

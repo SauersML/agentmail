@@ -578,33 +578,24 @@ impl Store {
     /// Blob ids some stored envelope references that this node does not hold yet.
     pub fn missing_blobs(&self) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT blobs FROM messages WHERE blobs != '[]'")?;
-        let lists: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        let mut have = db.prepare("SELECT 1 FROM blobs WHERE id = ?")?;
-        let mut out = Vec::new();
-        for l in lists {
-            for id in serde_json::from_str::<Vec<String>>(&l).unwrap_or_default() {
-                if have.query_row([&id], |_| Ok(())).optional()?.is_none() && !out.contains(&id) {
-                    out.push(id);
-                }
-            }
-        }
-        Ok(out)
+        let mut st = db.prepare("SELECT DISTINCT b.value FROM messages m, json_each(m.blobs) b
+            WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=b.value) ORDER BY b.value")?;
+        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn add_upload(&self, id: &str, owner: &str, name: &str, ty: &str, size: i64, key: &str, now_ms: i64) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT OR REPLACE INTO uploads (id, owner, name, type, size, key, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![id, owner, name, ty, size, key, now_ms],
-        )?;
-        Ok(())
-    }
-
-    pub fn uploaded_bytes(&self, owner: &str) -> Result<i64> {
-        let db = self.db.lock().unwrap();
-        Ok(db.query_row("SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner = ?", [owner], |r| r.get(0))?)
+    pub fn save_upload(&self, id: &str, blob: &[u8], owner: &str, name: &str, ty: &str, size: i64,
+                       key: &str, now: i64, quota: i64) -> Result<bool> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let used: i64 = tx.query_row("SELECT COALESCE(SUM(size), 0) FROM uploads WHERE owner=?", [owner], |r| r.get(0))?;
+        if size > quota - used { return Ok(false); }
+        tx.execute("INSERT INTO blobs (id, data, size, created) VALUES (?, ?, ?, ?)", params![id, blob, blob.len() as i64, now])?;
+        tx.execute("INSERT INTO uploads (id, owner, name, type, size, key, created) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   params![id, owner, name, ty, size, key, now])?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// File references {id, name, type, size, key} the viewer may use: its own upload first, then the attachments with
@@ -625,19 +616,11 @@ impl Store {
             .optional()?;
         out.extend(up);
         let mut st = db.prepare(&format!(
-            "SELECT files FROM messages WHERE instr(blobs, ?) > 0 AND {} ORDER BY id LIMIT 20",
-            visible_sql()
+            "SELECT DISTINCT f.value FROM messages m, json_each(m.files) f WHERE f.value->>'id' = ? AND {}
+             ORDER BY m.id, f.key", visible_sql()
         ))?;
-        let rows: Vec<String> = st
-            .query_map(params![id, format!(",{},", norm(&viewer.name)), viewer.key], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for files in rows {
-            let v: serde_json::Value = serde_json::from_str(&files).unwrap_or(json!([]));
-            for f in v.as_array().into_iter().flatten() {
-                if f["id"] == json!(id) && f.get("key").is_some() && !out.contains(f) {
-                    out.push(f.clone());
-                }
-            }
+        for row in st.query_map(params![id, format!(",{},", norm(&viewer.name)), viewer.key], |r| r.get::<_, String>(0))? {
+            out.push(serde_json::from_str(&row?)?);
         }
         Ok(out)
     }
