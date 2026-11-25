@@ -50,7 +50,7 @@ On each host, save this as `config.json`. Relative paths resolve from the config
 }
 ```
 
-When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain historical rows on disk. The API and replication expose agent-signed mail. Private reads also require a recipient key from the original envelope. Older unattached uploads must be uploaded again to establish key ownership.
+Upgrade peers together for sync protocol version 2. When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain historical rows on disk. The API and replication expose agent-signed mail. Private reads also require a recipient key from the original envelope. Older unattached uploads must be uploaded again to establish key ownership.
 
 Run `mailnode run config.json`. To change membership, increment `seq`, sign again and place the new list on a running peer. It distributes the signed update. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
 

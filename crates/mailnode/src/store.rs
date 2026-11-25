@@ -474,10 +474,10 @@ impl Store {
         Ok(out)
     }
 
-    pub fn ids_for_day(&self, day: &str) -> Result<Vec<String>> {
+    pub fn ids_for_day(&self, day: &str, after: &str, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND attest = 'agent' ORDER BY env_id")?;
-        let ids = st.query_map([day], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND env_id > ? AND attest = 'agent' ORDER BY env_id LIMIT ?")?;
+        let ids = st.query_map(params![day, after, limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
 
