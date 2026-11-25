@@ -28,6 +28,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+from http.client import HTTPException
 import ipaddress
 import json
 import mimetypes
@@ -49,6 +50,7 @@ UA = "islandmail.py/2"
 REQUEST_TTL = 300
 STREAM_TTL = 3600
 MAX_TTL = 86400
+MAX_FILE = 25 * 1024 * 1024
 
 try:
     from cryptography.hazmat.primitives import serialization
@@ -113,19 +115,14 @@ class Fail(Exception):
     pass
 
 
-def ensure_dir(path):
-    os.makedirs(path, mode=0o700, exist_ok=True)
-
-
-def write_private(path, data, *, create=False):
-    # A fresh temporary file per write (two watchers never share one), readable only by you, on disk before the rename.
-    folder = os.path.dirname(path)
-    ensure_dir(folder)
-    fd, tmp = tempfile.mkstemp(dir=folder, prefix="." + os.path.basename(path) + ".")
+def write_private(path, data, *, create=False, create_dirs=True):
+    folder = os.path.dirname(path) or "."
+    if create_dirs:
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".islandmail-")
     try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data.encode("utf-8") if isinstance(data, str) else data)
             f.flush()
             os.fsync(f.fileno())
         if create:
@@ -254,14 +251,24 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
     req = urllib.request.Request(url, data=data, headers=h, method=method)
     try:
         with _opener.open(req, timeout=timeout) as r:
-            out = r.read()
+            limit = MAX_FILE if raw else 32 * 1024 * 1024
+            expected = r.length
+            if expected is not None and expected > limit:
+                raise Fail("response exceeds %d bytes" % limit)
+            out = r.read(limit + 1)
+            if len(out) > limit:
+                raise Fail("response exceeds %d bytes" % limit)
+            if expected is not None and len(out) != expected:
+                raise Fail("incomplete response")
             return out if raw else json.loads(out or b"{}")
     except urllib.error.HTTPError as e:
         try:
-            msg = json.loads(e.read()).get("error") or e.reason
+            msg = json.loads(e.read(8192)).get("error") or e.reason
         except Exception:
             msg = e.reason
         raise Fail("%s %s: %s" % (e.code, urllib.parse.urlsplit(url).path, msg))
+    except HTTPException as e:
+        raise Fail("incomplete HTTP response") from e
     except urllib.error.URLError as e:
         raise Fail("cannot reach %s (%s)" % (urllib.parse.urlsplit(url).netloc, e.reason))
 
@@ -440,8 +447,8 @@ def send(ident, a):
         raise Fail("at most 10 attachments per message")
     for path in a.file or []:
         with open(path, "rb") as f:
-            data = f.read(25 * 1024 * 1024 + 1)
-        if len(data) > 25 * 1024 * 1024:
+            data = f.read(MAX_FILE + 1)
+        if len(data) > MAX_FILE:
             raise Fail("attachment exceeds 25 MiB")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), data,
@@ -545,8 +552,7 @@ def cmd_download(a):
         raise Fail("file_id must be a lowercase 64-digit content hash")
     data = api(ident, "GET", "/api/files/%s?download=1" % a.file_id, raw=True, timeout=300)
     out = a.o or a.file_id
-    with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
-        f.write(data)
+    write_private(out, data, create=True, create_dirs=False)
     print("saved %d bytes to %s" % (len(data), out))
 
 

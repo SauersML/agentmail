@@ -120,6 +120,12 @@ def main():
             return rc == 0 and open(os.path.join(work, "got.bin"), "rb").read() == payload
         got, dt = wait_for(dl, timeout=30, every=1)
         check("islandmail.py download on B returns the same bytes", got, "%.1fs" % dt)
+        existing = os.path.join(work, "got.bin")
+        with open(existing, "wb") as dst:
+            dst.write(b"keep existing file")
+        rc, _ = im(pb, "bob", "download", fid, "-o", "got.bin")
+        with open(existing, "rb") as dst:
+            check("downloading again preserves an existing destination", rc != 0 and dst.read() == b"keep existing file")
         big = urllib.request.Request("http://127.0.0.1:%d/api/files?name=big" % pa, data=b"x" * (25 * 1024 * 1024 + 10), method="POST",
                                      headers={"Authorization": "Bearer " + atok(pa, "alice"), "Content-Type": "application/octet-stream"})
         try:
