@@ -67,6 +67,7 @@ fn canonical_key(key: &str) -> Result<PublicKey> {
 pub fn check_issuance(name: &str, key: &str, ts: &str, sig: &str, node: &PublicKey, now_ms: i64) -> Result<PublicKey> {
     ensure!(valid_name(name), "invalid agent name");
     let k = canonical_key(key)?;
+    keys::x25519_public(&k)?;
     let t = parse_ts(ts).ok_or_else(|| anyhow!("ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
     ensure!((t - now_ms).abs() <= CERTIFY_SKEW_MS, "ts is more than 5 minutes from the node's clock");
     let s = canonical_sig(sig)?;
@@ -134,6 +135,7 @@ impl Cert {
     /// Shape and the issuing node's signature. Whether this host trusts the node for the name is the trust file's
     /// call (`MemberList::accepts`), and revocation is the store's.
     pub fn check(&self) -> Result<()> {
+        keys::x25519_public(&self.agent_key()?)?;
         check_signed(self.v, &self.name, &self.key, &self.node, &self.issued, &self.sig, &self.signing_bytes())
     }
 

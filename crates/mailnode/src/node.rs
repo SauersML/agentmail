@@ -236,8 +236,8 @@ impl Node {
         if self.store.revoked_at(&fmt_key(&me), key)?.is_some() {
             return Err(ApiError::new(403, "this node revoked that key; make a new one"));
         }
-        if let Some(m) = list.member_by_name(name).filter(|m| m.key != key) {
-            return Err(ApiError::new(409, format!("{} is pinned in this host's trust file with another key", m.name)));
+        if !list.permits_agent_key(name, &k) {
+            return Err(ApiError::new(409, "agent name or key conflicts with a pin in this host's trust file"));
         }
         if let Some(c) = self.store.cert(&fmt_key(&me), key)? {
             if !mailcore::addr::same(&c.name, name) {
@@ -1234,6 +1234,7 @@ mod tests {
         let e = mac.certify(&proof(&hypha, "ops.x", &mac)).unwrap_err();
         assert_eq!(e.status, 403);
         assert!(e.message.contains("hypha, h."), "{}", e.message);
+        assert_eq!(status(mac.certify(&proof(&pod.seed, "h.node", &mac))), 409);
         assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
         assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 200, "idempotent");
         assert_eq!(status(mac.certify(&proof(&other, "hypha", &mac))), 409, "name taken by another key");

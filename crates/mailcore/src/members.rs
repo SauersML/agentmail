@@ -130,9 +130,23 @@ impl MemberList {
         self.nodes.iter().find(|n| n.key == key)
     }
 
+    /// Pins reserve their encryption keys, including the other Ed25519 sign encoding with the same X25519 image.
+    /// A pinned agent can still obtain a home certificate for its own name and exact signing key.
+    pub fn permits_agent_key(&self, name: &str, key: &PublicKey) -> bool {
+        let exact = fmt_key(key);
+        let mut opposite = *key;
+        opposite[31] ^= 0x80;
+        let opposite = fmt_key(&opposite);
+        !self.nodes.iter().any(|n| n.key == exact || n.key == opposite)
+            && self.members.iter().all(|m| {
+                if addr::same(&m.name, name) { m.key == exact } else { m.key != exact && m.key != opposite }
+            })
+    }
+
     /// Whether this host trusts `c`: well formed, signed by a node on this list whose namespace covers its name.
     pub fn accepts(&self, c: &Cert) -> bool {
-        c.check().is_ok() && c.node_key().ok().and_then(|k| self.node_by_key(&k)).is_some_and(|n| n.covers(&c.name))
+        self.nodes.iter().any(|n| n.key == c.node && n.covers(&c.name))
+            && c.agent_key().is_ok_and(|k| self.permits_agent_key(&c.name, &k)) && c.check().is_ok()
     }
 
     /// Every agent this host accepts at `at_ms`. `revoked_at(cert)` is when the cert's own node revoked its key, if
@@ -236,6 +250,22 @@ pub(crate) mod tests {
         l.members[1].name = "a.sue".into();
         l.nodes[0].key = l.members[0].key.clone();
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn certificates_respect_pinned_key_roles_and_encryption_requirements() {
+        let (home, agent) = (Seed::generate(), Seed::generate());
+        let mut l = list(&[("a.bob", &agent)], &[&home]);
+        l.nodes[0].names = vec!["a.".into()];
+        let accepts = |name, key| l.accepts(&Cert::issue(&home, name, &key, &crate::now_ts()));
+        assert!(accepts("a.bob", agent.public()));
+        assert!(accepts("a.other", Seed::generate().public()));
+        assert!(!accepts("a.other", agent.public()));
+        assert!(!accepts("a.other", home.public()));
+        assert!(!accepts("a.other", [0; 32]));
+        let mut alias = agent.public();
+        alias[31] ^= 0x80;
+        assert!(!accepts("a.other", alias));
     }
 
     #[test]
