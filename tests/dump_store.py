@@ -6,7 +6,7 @@ import sys
 
 db = sqlite3.connect(os.path.join(sys.argv[1], "mail.sqlite"))
 cols = [r[1] for r in db.execute("PRAGMA table_info(messages)")]
-show = [c for c in ("id", "ts", "thread", "sender", "recipients", "mode", "attest", "imported", "readers") if c in cols]
+show = [c for c in ("id", "ts", "thread", "sender", "recipients", "mode", "attest", "readers") if c in cols]
 print(cols)
 for r in db.execute("SELECT %s, length(text) FROM messages ORDER BY id" % ", ".join(show)):
     print(dict(zip(show + ["textlen"], r)))

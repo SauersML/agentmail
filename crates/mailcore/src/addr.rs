@@ -1,5 +1,5 @@
-//! Addressing, exactly as the old server: `to` is names separated by commas or spaces, team prefixes ending in '.', or
-//! all / *. Case-insensitive; a slash counts as a dot (the old inbox's sauersml/lead reaches sauersml.lead).
+//! Addressing: `to` is names separated by commas or spaces, team prefixes ending in '.', or all / *.
+//! Case-insensitive; a slash counts as a dot (sauersml/lead reaches sauersml.lead).
 
 pub fn norm(s: &str) -> String {
     s.trim().to_lowercase().replace('/', ".")
@@ -28,7 +28,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addressing_matches_old_server() {
+    fn addressing_rules() {
         assert!(addressed_to("sauersml.lead", &["SauersML.Lead"]));
         assert!(addressed_to("sauersml/lead", &["sauersml.lead"]));
         assert!(addressed_to("will., hypha", &["will.orchestrator"]));

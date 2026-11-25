@@ -13,7 +13,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for  # noqa: E402
+from lib import Client, Node, check, finish, free_port, member_list, run, wait_for  # noqa: E402
 
 
 def main():
@@ -28,35 +28,27 @@ def main():
         shutil.move(work, work + ".old-%d" % int(time.time()))
     os.makedirs(os.path.join(work, "keys"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    pub = {n: run(bin_, "keygen", k(n)) for n in ("home", "operator", "nodeA", "nodeB", "alice", "bob")}
-    lst = {"v": 1, "network": "n0test", "seq": 1, "issued": "", "operator": "",
-           "members": [{"name": "t." + n, "sub": "agent:%s@test" % n, "key": pub[n]} for n in ("alice", "bob")],
-           "nodes": [{"name": h, "key": pub["node" + h], "addrs": []} for h in "AB"], "bridges": [], "sig": ""}
-    json.dump(lst, open(os.path.join(work, "members.unsigned.json"), "w"))
-    run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
+    pub = {n: run(bin_, "keygen", k(n)) for n in ("operator", "nodeA", "nodeB")}
+    members = member_list(bin_, work, k("operator"), 1, [(h.lower(), pub["node" + h], None, []) for h in "AB"],
+                          network="n0test")
     nodes = {}
     for h in "AB":
         nodes[h] = Node(bin_, work, h, {
             "data_dir": os.path.join(work, "data" + h), "api_listen": "127.0.0.1:%d" % free_port(),
             "iroh_port": free_port(socket.SOCK_DGRAM), "node_key_file": k("node" + h), "operator_key": pub["operator"],
-            "members_file": os.path.join(work, "members.json"), "home": {"key": pub["home"], "iss": "home.test"},
-            "relay": json.loads(a.relay), "sync_secs": 5})
-    tok = {n: run(bin_, "mint-token", k("home"), "home.test", "t." + n, "agent:%s@test" % n, "3600") for n in ("alice", "bob")}
+            "members_file": members, "relay": json.loads(a.relay), "sync_secs": 5})
+    alice, bob = Client(work, "alice", nodes["A"]), Client(work, "bob", nodes["B"])
     try:
         check("A starts (relay %s)" % a.relay, nodes["A"].start())
         check("B starts", nodes["B"].start())
-        st, _ = req("POST", nodes["A"].port, "/api/messages", tok["alice"], {"to": "t.bob", "text": "over n0"})
-        check("post on A", st == 201)
-        got, dt = wait_for(lambda: [m for m in req("GET", nodes["B"].port, "/api/messages?after=0", tok["bob"])[1]["messages"]
-                                    if m["text"] == "over n0"], timeout=120, every=1)
+        rc, out = alice("send", "--to", "b.bob", "over n0")
+        check("post on A", rc == 0, out)
+        got, dt = wait_for(lambda: "over n0" in bob.stdout("read", "--latest", "5")[1], timeout=120, every=1)
         check("B receives it with no configured addresses (relays only)", got, "%.1fs" % dt)
     finally:
         for n in nodes.values():
             n.stop()
-    failed = [r for r in RESULTS if not r[1]]
-    print("\n%d checks, %d failed; logs in %s" % (len(RESULTS), len(failed), work))
-    sys.exit(1 if failed else 0)
-
+    finish(work)
 
 if __name__ == "__main__":
     main()

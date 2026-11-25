@@ -1,6 +1,7 @@
 //! SQLite: every envelope this node holds (as JSON, keyed by envelope id), the decrypted header + text when this node
-//! can read it, a local integer id per envelope (the compat API's message number), and the compat API's bookkeeping
-//! (names seen, MCPL push cursors).
+//! can read it, a local integer id per envelope (the API's message number, from 1 in arrival order), the agent
+//! certificates and revocations this node knows, and the API's bookkeeping (names seen, MCPL push cursors, used token
+//! ids).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -8,7 +9,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use mailcore::addr::norm;
-use mailcore::{Envelope, Verified};
+use mailcore::{Cert, Envelope, KnownCerts, Revocation, Verified};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde_json::json;
@@ -31,15 +32,14 @@ CREATE TABLE IF NOT EXISTS messages (
   text TEXT,
   files TEXT NOT NULL DEFAULT '[]',
   readers TEXT,
-  verified INTEGER NOT NULL DEFAULT 1,
-  imported INTEGER,
   parents TEXT NOT NULL,
   env TEXT NOT NULL,
   received INTEGER NOT NULL,
-  attest TEXT NOT NULL DEFAULT 'token',
-  blobs TEXT NOT NULL DEFAULT '[]');
+  attest TEXT NOT NULL,
+  blobs TEXT NOT NULL DEFAULT '[]',
+  agent_sig TEXT);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread, id);
-CREATE INDEX IF NOT EXISTS messages_imported ON messages (imported);
+CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages (agent_sig) WHERE agent_sig IS NOT NULL;
 CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
   size INTEGER NOT NULL, key TEXT NOT NULL, created INTEGER NOT NULL);
@@ -50,7 +50,15 @@ CREATE TABLE IF NOT EXISTS cursors (sub TEXT PRIMARY KEY, last_id INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS used_tokens (name TEXT NOT NULL, jti TEXT NOT NULL, exp INTEGER NOT NULL,
   PRIMARY KEY (name, jti));
 CREATE INDEX IF NOT EXISTS used_tokens_exp ON used_tokens (exp);
+CREATE TABLE IF NOT EXISTS certs (node TEXT NOT NULL, key TEXT NOT NULL, name TEXT NOT NULL, lname TEXT NOT NULL,
+  issued TEXT NOT NULL, json TEXT NOT NULL, received INTEGER NOT NULL, PRIMARY KEY (node, key));
+CREATE INDEX IF NOT EXISTS certs_lname ON certs (lname);
+CREATE TABLE IF NOT EXISTS revocations (node TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL,
+  json TEXT NOT NULL, received INTEGER NOT NULL, PRIMARY KEY (node, key));
 ";
+
+/// The most certs (and, separately, revocations) one anti-entropy answer carries.
+pub const SYNC_CAP: i64 = 10_000;
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
 #[derive(Clone, Debug)]
@@ -67,8 +75,6 @@ pub struct Row {
     pub len: i64,
     pub files: String,
     pub readers: Option<String>,
-    pub verified: bool,
-    pub imported: Option<i64>,
     pub parents: Vec<String>,
     pub attest: String,
 }
@@ -87,7 +93,7 @@ pub fn public_files(files: &str) -> serde_json::Value {
 }
 
 impl Row {
-    /// Members mode: any caller with a valid token (as on the old server). Private: the sender and the members it was
+    /// Members mode: any caller with a valid token. Private: the sender and the agents it was
     /// addressed to, and only if this node could decrypt it.
     pub fn visible_to(&self, viewer: &str) -> bool {
         self.text.is_some()
@@ -101,14 +107,11 @@ impl Row {
         let mut m = json!({
             "id": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
             "text": text, "files": public_files(&self.files),
-            "len": self.len, "sub": self.sender_sub, "verified": self.verified,
+            "len": self.len, "sub": self.sender_sub,
             "env": self.env_id, "mode": self.mode, "attest": self.attest,
         });
         if self.len > shown {
             m["truncated"] = json!(self.len);
-        }
-        if let Some(old) = self.imported {
-            m["imported"] = json!(old);
         }
         m
     }
@@ -131,14 +134,14 @@ pub struct Store {
 }
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
-                    length(text) AS len, files, readers, verified, imported, parents, attest";
+                    length(text) AS len, files, readers, parents, attest";
 
 fn visible_sql() -> &'static str {
     "(text IS NOT NULL AND (mode = 'members' OR instr(readers, ?) > 0))"
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
-    let parents: String = r.get(14)?;
+    let parents: String = r.get(12)?;
     Ok(Row {
         id: r.get(0)?,
         env_id: r.get(1)?,
@@ -152,10 +155,8 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         len: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
         files: r.get(10)?,
         readers: r.get(11)?,
-        verified: r.get::<_, i64>(12)? != 0,
-        imported: r.get(13)?,
         parents: serde_json::from_str(&parents).unwrap_or_default(),
-        attest: r.get(15)?,
+        attest: r.get(13)?,
     })
 }
 
@@ -175,7 +176,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let db = Connection::open(path)?;
         // The store holds the plaintext of everything this node can read (private mail included), attachment keys and
-        // the bearer tokens inside token-attested envelopes: readable by this user only, whatever the umask. SQLite
+        // the agents' certificates: readable by this user only, whatever the umask. SQLite
         // gives its -wal/-shm files the database's mode; older ones are fixed here too.
         {
             use std::os::unix::fs::PermissionsExt;
@@ -188,24 +189,20 @@ impl Store {
             }
         }
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-        db.execute_batch(SCHEMA)?;
         // agent_sig: the sender's signature of an agent-signed message, on the first copy this node stored. A member
         // node can read members-mode mail, so it can re-encrypt someone's signed message into a new envelope (new id,
         // same signature): such a replay is kept hidden (mode 'dup', no text) so day hashes still agree between nodes.
-        let has_sig_col =
-            db.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'agent_sig'")?.exists([])?;
-        if !has_sig_col {
-            db.execute_batch("ALTER TABLE messages ADD COLUMN agent_sig TEXT;")?;
+        db.execute_batch(SCHEMA)?;
+        Ok(Store { db: Mutex::new(db) })
+    }
+
+    /// Opens an existing store read-only (for `mailnode revoke` while the node runs).
+    pub fn open_read_only(path: &Path) -> Result<Store> {
+        if !path.exists() {
+            anyhow::bail!("{} does not exist; run the node first", path.display());
         }
-        db.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages (agent_sig) WHERE agent_sig IS NOT NULL;",
-        )?;
-        if !has_sig_col {
-            db.execute_batch(
-                "UPDATE OR IGNORE messages SET agent_sig = json_extract(env, '$.attest.sig') \
-                 WHERE json_extract(env, '$.attest.kind') = 'agent';",
-            )?;
-        }
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Store { db: Mutex::new(db) })
     }
 
@@ -222,11 +219,10 @@ impl Store {
             .optional()?)
     }
 
-    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key), or if it
-    /// is another envelope carrying an agent-signed message already here (stored hidden, see agent_sig).
-    /// `files`: the body's attachment list as JSON (with blob keys; "[]" when unreadable). `id_floor`: new
-    /// non-imported mail is numbered from here up, so the old server's numbers below it stay free for imports.
-    #[allow(clippy::too_many_arguments)]
+    /// Stores a verified envelope, numbered after every earlier one. Returns None if it was already here (the
+    /// envelope id is the dedupe key), or if it is another envelope carrying an agent-signed message already here
+    /// (stored hidden, see agent_sig). `files`: the body's attachment list as JSON (with blob keys; "[]" when
+    /// unreadable).
     pub fn insert(
         &self,
         env: &Envelope,
@@ -235,34 +231,10 @@ impl Store {
         files: &str,
         readers: Option<&str>,
         received_ms: i64,
-        id_floor: i64,
     ) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
-        let max: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?;
-        // Imported history keeps its old number when that number is still above every local number (the import runs
-        // in old-id order before the node takes new mail). Numbers only grow in arrival order, because clients' `after`
-        // cursors, SSE and MCPL push depend on it: old mail the bridge copies in after new mail exists gets a new number
-        // (its old one stays in `imported`).
-        // Only numbers in the range the old server can have used, and on a node with an id_floor only numbers below it
-        // (the floor reserves them for imports): an import can never move numbering past new mail or near i64::MAX.
-        let explicit = match v.imported {
-            Some(old)
-                if old > 0
-                    && old <= mailcore::envelope::MAX_OLD_ID
-                    && old as i64 > max
-                    && (id_floor <= 1 || (old as i64) < id_floor) =>
-            {
-                Some(old as i64)
-            }
-            _ => None,
-        };
-        let explicit = match explicit {
-            Some(x) => Some(x),
-            None if v.imported.is_none() && max < id_floor => Some(id_floor),
-            None => None, // AUTOINCREMENT: above the highest id ever used
-        };
         let agent_sig = match &env.attest {
             mailcore::Attest::Agent { sig, .. } => mailcore::b64u_decode(sig).map(|b| mailcore::b64u(&b)),
             _ => None,
@@ -272,11 +244,10 @@ impl Store {
             None => false,
         };
         let n = db.execute(
-            "INSERT OR IGNORE INTO messages (id, env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, verified, imported, parents, env, received, attest, blobs, files, agent_sig) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
+             readers, parents, env, received, attest, blobs, files, agent_sig) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                if replay { None } else { explicit },
                 env.id,
                 env.day(),
                 env.ts,
@@ -287,8 +258,6 @@ impl Store {
                 if replay { "dup" } else { env.mode.as_str() },
                 if replay { None } else { text },
                 if replay { None } else { readers },
-                v.verified as i64,
-                v.imported.map(|x| x as i64),
                 parents,
                 json,
                 received_ms,
@@ -314,22 +283,16 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
     }
 
-    /// One message by local number, else by its old-server number: an import that reached this node after newer mail
-    /// got a new local number (see insert), but agents still cite the old server's.
+    /// One message by local number, if `viewer` may read it.
     pub fn get(&self, id: i64, viewer: &str) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
-        let mut row = db
+        let row = db
             .query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
             .optional()?;
-        if row.is_none() {
-            row = db
-                .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, id], read_row)
-                .optional()?;
-        }
         Ok(row.filter(|r| r.visible_to(viewer)))
     }
 
-    /// The old server's query(): rows in local-id order, at most `limit` (1000) or PAGE_CHARS of text.
+    /// Rows in local-id order, at most `limit` (1000) or PAGE_CHARS of text.
     pub fn query(&self, q: &Query, viewer: &str, text_cap: i64) -> Result<(Vec<Row>, bool)> {
         let mut wh = vec![visible_sql().to_string()];
         let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(viewer)))];
@@ -389,6 +352,7 @@ impl Store {
 
     /// A page of rows in (lo, hi) whose recipient contains one of `needles` (a prefilter for addressedTo), not sent by
     /// any of `subs`. Used by the inbox tool and MCPL backlog.
+    #[allow(clippy::too_many_arguments)]
     pub fn addressed_page(
         &self,
         viewer: &str,
@@ -568,8 +532,7 @@ impl Store {
         Ok(())
     }
 
-    /// Every sender already in the store becomes a known name (imports included), for stores written before imports
-    /// were recorded. Members keep their sub; only `seen` moves forward.
+    /// Every sender already in the store becomes a known name; only `seen` moves forward for names already known.
     pub fn names_from_messages(&self) -> Result<usize> {
         let db = self.db.lock().unwrap();
         Ok(db.execute(
@@ -601,14 +564,6 @@ impl Store {
             params![sub, id],
         )?;
         Ok(())
-    }
-
-    /// The row an old-server message was imported as, if any.
-    pub fn by_imported(&self, old_id: i64) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db
-            .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, old_id], read_row)
-            .optional()?)
     }
 
     /* Attachments */
@@ -709,44 +664,129 @@ impl Store {
         Ok(out)
     }
 
+    /* Certificates and revocations. Callers verify before storing; every reader re-checks against the current
+    member list (a cert whose node left the list stops counting). */
+
+    /// Stores a cert, keyed by (issuing node, agent key); the first one stored for that pair stays. True if new.
+    pub fn add_cert(&self, c: &Cert, now_ms: i64) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let n = db.execute(
+            "INSERT OR IGNORE INTO certs (node, key, name, lname, issued, json, received) VALUES (?,?,?,?,?,?,?)",
+            params![c.node, c.key, c.name, norm(&c.name), c.issued, serde_json::to_string(c)?, now_ms],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Stores a revocation, keyed by (signing node, agent key). True if new.
+    pub fn add_revocation(&self, r: &Revocation, now_ms: i64) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let n = db.execute(
+            "INSERT OR IGNORE INTO revocations (node, key, ts, json, received) VALUES (?,?,?,?,?)",
+            // A revocation whose time does not parse counts from the start of time.
+            params![r.node, r.key, mailcore::parse_ts(&r.ts).unwrap_or(0), serde_json::to_string(r)?, now_ms],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// True if `node` (as "ed25519:…") has revoked `key`.
+    pub fn node_revoked(&self, node: &str, key: &str) -> bool {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT 1 FROM revocations WHERE node = ? AND key = ?", params![node, key], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    /// When `node` revoked `key` (the revocation's own ts, ms), if it has.
+    pub fn revoked_at(&self, node: &str, key: &str) -> Option<i64> {
+        let db = self.db.lock().unwrap();
+        db.query_row("SELECT ts FROM revocations WHERE node = ? AND key = ?", params![node, key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// The cert `node` issued for `key`, if known (whatever its name).
+    pub fn cert_by(&self, node: &str, key: &str) -> Result<Option<Cert>> {
+        let db = self.db.lock().unwrap();
+        let raw: Option<String> = db
+            .query_row("SELECT json FROM certs WHERE node = ? AND key = ?", params![node, key], |r| r.get(0))
+            .optional()?;
+        Ok(raw.and_then(|j| serde_json::from_str(&j).ok()))
+    }
+
+    /// Known certs, oldest first, at most `limit`.
+    pub fn certs(&self, limit: i64) -> Result<Vec<Cert>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT json FROM certs ORDER BY received, rowid LIMIT ?")?;
+        let rows = st.query_map([limit], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+    }
+
+    /// Known revocations, oldest first, at most `limit`.
+    pub fn revocations(&self, limit: i64) -> Result<Vec<Revocation>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT json FROM revocations ORDER BY received, rowid LIMIT ?")?;
+        let rows = st.query_map([limit], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+    }
+
     pub fn count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
     }
 }
 
+impl KnownCerts for Store {
+    fn revoked(&self, cert: &Cert) -> bool {
+        self.node_revoked(&cert.node, &cert.key)
+    }
+
+    fn certs_for(&self, name: &str) -> Vec<Cert> {
+        let db = self.db.lock().unwrap();
+        let Ok(mut st) = db.prepare("SELECT json FROM certs WHERE lname = ? ORDER BY received, rowid") else {
+            return vec![];
+        };
+        let Ok(rows) = st.query_map([norm(name)], |r| r.get::<_, String>(0)) else { return vec![] };
+        rows.flatten().filter_map(|j| serde_json::from_str(&j).ok()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mailcore::keys::{fmt_key, Seed};
+
+    fn temp_store() -> (Store, std::path::PathBuf) {
+        let path = std::env::temp_dir()
+            .join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        (Store::open(&path).unwrap(), path)
+    }
 
     #[test]
-    fn opening_an_older_store_adds_and_backfills_agent_sig() {
-        let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-        {
-            let db = Connection::open(&path).unwrap();
-            db.execute_batch(SCHEMA).unwrap();
-            for (i, id) in ["a", "b"].iter().enumerate() {
-                db.execute(
-                    "INSERT INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, parents, env, received) \
-                     VALUES (?, 'd', 't', 's', 'ss', 'all', 't', 'members', 'x', '[]', ?, ?)",
-                    params![id, r#"{"attest":{"kind":"agent","sig":"SIG"}}"#, i as i64],
-                )
-                .unwrap();
-            }
-        }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        let store = Store::open(&path).unwrap();
+    fn store_is_private_and_certs_are_keyed_by_node_and_key() {
+        let (store, path) = temp_store();
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
-        let row = store.by_agent_sig("SIG").unwrap().expect("backfilled");
-        assert_eq!(row.env_id, "a", "an existing duplicate keeps only the first copy indexed");
+        let (a, b, agent) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let ts = mailcore::now_ts();
+        let from_b = Cert::issue(&b, "b.x", &agent.public(), &ts);
+        let from_a = Cert::issue(&a, "a.x", &agent.public(), &ts);
+        assert!(store.add_cert(&from_b, 1).unwrap());
+        assert!(store.add_cert(&from_a, 2).unwrap(), "another node's cert for the same key does not block this one");
+        assert!(!store.add_cert(&Cert::issue(&a, "a.y", &agent.public(), &ts), 3).unwrap(), "first one per (node, key) stays");
+        assert_eq!(store.cert_by(&fmt_key(&a.public()), &fmt_key(&agent.public())).unwrap().unwrap().name, "a.x");
+        assert_eq!(store.certs_for("A.X").len(), 1, "names compare case-insensitively");
+        assert_eq!(store.certs(10).unwrap().len(), 2);
+        let r = Revocation::sign(&b, "b.x", &agent.public(), &ts);
+        assert!(store.add_revocation(&r, 4).unwrap());
+        assert!(!store.add_revocation(&r, 5).unwrap());
+        assert!(store.revoked(&from_b));
+        assert!(!store.revoked(&from_a), "a revocation counts only against its own node's cert");
         drop(store);
-        Store::open(&path).unwrap();
         let _ = std::fs::remove_file(path);
     }
 }

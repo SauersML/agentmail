@@ -1,28 +1,32 @@
-//! The node's mail logic, shared by the compat API, MCPL and replication: accept a local send (seal, sign, store,
-//! announce), accept a replicated envelope (verify, decrypt if we can, store), and the old server's read-side rules
-//! (names, reaches, addressed rows, message formatting).
+//! The node's mail logic, shared by the HTTP API, MCPL and replication: certify this host's agents, accept a local
+//! send (seal, sign, store, announce), accept a replicated envelope, certificate or revocation (verify, decrypt if we
+//! can, store), and the read-side rules (names, reaches, addressed rows, message formatting).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use mailcore::addr::{self, addressed_to, is_broadcast, norm};
+use mailcore::addr::{addressed_to, is_broadcast, norm};
+use mailcore::cert::{agent_sub, live_certs, valid_name};
 use mailcore::envelope::{Draft, Grant};
-use mailcore::keys::Seed;
-use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode, TokenPolicy};
+use mailcore::keys::{fmt_key, PublicKey, Seed};
+use mailcore::{
+    now_millis, now_ts, ts_from_millis, Attest, Body, Cert, Envelope, KnownCerts, MemberList, Mode, NodeEntry, Revocation,
+};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::config::Renamed;
 use crate::store::{Row, Store, MAX_TEXT};
 
 pub const MAX_FIELD: usize = 120;
 const REPEAT_MS: i64 = 10 * 60 * 1000;
 const RATE_WINDOW_MS: i64 = 3_600_000;
 const SCAN_ROWS: usize = 50_000;
+/// New certificates this node issues through POST /api/agents in an hour.
+pub const MAX_ISSUANCES: usize = 60;
 
-/// An HTTP-style error: status and message, as the old server's HttpError.
+/// An HTTP-style error: status and message.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -49,20 +53,23 @@ impl From<rusqlite::Error> for ApiError {
     }
 }
 
-/// Whoever presented a valid token.
+/// Whoever presented a valid agent token: an agent certified by this node.
 #[derive(Clone, Debug)]
 pub struct Caller {
+    /// The name as certified.
     pub name: String,
+    /// "agent:{name}@{this node's name}"
     pub sub: String,
     pub kind: String,
-    /// The bearer token, kept only for an aid1 caller (it becomes the attestation of an unsigned post). Empty for an
-    /// agent token, which never leaves this node.
-    pub token: String,
     pub exp_ms: i64,
-    /// How the caller signed in: "agent-token" (PASETO v4.public, the member's own key) or "aid1" (the home's token).
+    /// How the caller signed in: always "agent-token" (PASETO v4.public, signed by the agent's certified key).
     pub auth: &'static str,
+    /// The certified key that signed the token, and its certificate from this node.
+    pub key: PublicKey,
+    pub cert: Cert,
 }
 
+#[derive(Debug)]
 pub struct Posted {
     pub row: Row,
     pub reaches: Vec<String>,
@@ -71,24 +78,39 @@ pub struct Posted {
 
 /// What goes out on the gossip topic from the API side (member lists are announced by the network task).
 pub enum Outbound {
-    Envelope(Envelope),
+    Envelope(Box<Envelope>),
+    Cert(Cert),
+    Revocation(Revocation),
 }
 
 /// Node settings beyond the store and keys.
 #[derive(Default)]
 pub struct Opts {
+    /// (name, seed) of the identity files in identities_dir: agents of this host whose keys this node holds.
     pub identities: Vec<(String, Seed)>,
-    pub renamed: Vec<Renamed>,
-    /// Refuse envelopes attested only by a replicated aid1 token (once clients sign with their own keys).
-    pub refuse_token_only: bool,
-    /// New (non-imported) mail is numbered from here up; old-server numbers below it stay free for imports.
-    pub id_floor: i64,
-    /// Bridge key and the token sub allowed to import through this node.
-    pub bridge: Option<(Seed, String)>,
     /// Where the latest adopted member list is kept.
     pub members_path: Option<std::path::PathBuf>,
     /// Base URL written into attachment links.
     pub public_url: String,
+}
+
+/// The known certificates as they stood when an envelope was written: a revocation counts against envelopes dated at
+/// or after it. Mail a key sent before its revocation was valid when its node wrote it, so it still replicates to every
+/// node (a node joining later reads it too, and day hashes agree); the revoking node itself takes nothing new from the
+/// key (its sign-in is refused), so nothing later can carry an earlier date unless that node is the one lying.
+struct AsOf<'a> {
+    store: &'a Store,
+    ts_ms: i64,
+}
+
+impl KnownCerts for AsOf<'_> {
+    fn revoked(&self, cert: &Cert) -> bool {
+        self.store.revoked_at(&cert.node, &cert.key).is_some_and(|at| at <= self.ts_ms)
+    }
+
+    fn certs_for(&self, name: &str) -> Vec<Cert> {
+        self.store.certs_for(name)
+    }
 }
 
 /// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.
@@ -101,24 +123,21 @@ const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
 pub struct Node {
     pub store: Store,
     pub members: RwLock<MemberList>,
-    pub operator: mailcore::keys::PublicKey,
-    /// The pinned home for aid1 tokens; None on a node that needs no home.
-    pub policy: Option<TokenPolicy>,
+    pub operator: PublicKey,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<Arc<Row>>,
     pub outbound: mpsc::UnboundedSender<Outbound>,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
-    auth_seen: Mutex<HashSet<(String, &'static str)>>,
+    auth_seen: Mutex<HashSet<String>>,
 }
 
 impl Node {
     pub fn new(
         store: Store,
         members: MemberList,
-        operator: mailcore::keys::PublicKey,
-        policy: Option<TokenPolicy>,
+        operator: PublicKey,
         seed: Seed,
         opts: Opts,
         outbound: mpsc::UnboundedSender<Outbound>,
@@ -128,7 +147,6 @@ impl Node {
             store,
             members: RwLock::new(members),
             operator,
-            policy,
             seed,
             opts,
             events,
@@ -153,73 +171,207 @@ impl Node {
         }
         *cur = list.clone();
         drop(cur);
-        for m in &list.members {
-            let _ = self.store.seen(&m.name, &m.sub, 0);
-        }
         if let Some(p) = &self.opts.members_path {
             let tmp = p.with_extension("tmp");
             std::fs::write(&tmp, serde_json::to_string_pretty(list)?)?;
             std::fs::rename(&tmp, p)?;
         }
-        tracing::info!("adopted member list seq {} ({} members, {} nodes)", list.seq, list.members.len(), list.nodes.len());
+        tracing::info!("adopted member list seq {} ({} nodes)", list.seq, list.nodes.len());
+        self.certify_held();
         Ok(true)
+    }
+
+    /* Certificates */
+
+    /// This node's entry on the current member list.
+    pub fn my_entry(&self) -> Option<NodeEntry> {
+        self.members.read().unwrap().node_by_key(&self.seed.public()).cloned()
+    }
+
+    /// POST /api/agents: certify `{name, key, ts, sig}` (sig: the agent's issuance proof). Returns (200 or 201, cert).
+    pub fn certify(&self, body: &Value) -> Result<(u16, Cert), ApiError> {
+        let s = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let name = s("name");
+        let now = now_millis();
+        let me = self.seed.public();
+        let key = mailcore::cert::check_issuance(name, s("key"), s("ts"), s("sig"), &me, now)
+            .map_err(|e| ApiError::new(400, format!("{e:#}")))?;
+        let members = self.members.read().unwrap().clone();
+        let entry = members
+            .node_by_key(&me)
+            .ok_or_else(|| ApiError::new(503, "this node is not on the member list, so it cannot certify agents"))?;
+        if !entry.covers(name) {
+            return Err(ApiError::new(
+                403,
+                format!("{name} is not in this host's names: {}", entry.namespace().join(", ")),
+            ));
+        }
+        let (me_s, key_s) = (fmt_key(&me), fmt_key(&key));
+        if self.store.node_revoked(&me_s, &key_s) {
+            return Err(ApiError::new(403, "this key was revoked by this host; make a new key and ask again"));
+        }
+        let live = live_certs(&self.store, &members, name, &me);
+        if let Some(c) = live.iter().find(|c| c.key == key_s) {
+            return Ok((200, c.clone()));
+        }
+        if let Some(c) = self.store.cert_by(&me_s, &key_s)? {
+            return Err(ApiError::new(409, format!("this key is already certified here as {}", c.name)));
+        }
+        if !live.is_empty() {
+            return Err(ApiError::new(
+                409,
+                format!(
+                    "{name} is taken on this host; pick another name, or the host owner runs `mailnode revoke CONFIG {name}`"
+                ),
+            ));
+        }
+        self.rate("", "new certificates", MAX_ISSUANCES)?;
+        let cert = self.issue(name, &key, &entry.name)?;
+        Ok((201, cert))
+    }
+
+    /// Signs, stores and announces a new cert from this node.
+    fn issue(&self, name: &str, key: &PublicKey, node_name: &str) -> Result<Cert> {
+        let now = now_millis();
+        let cert = Cert::issue(&self.seed, name, key, &now_ts());
+        if !self.store.add_cert(&cert, now)? {
+            anyhow::bail!("a certificate for this key from this node is already stored");
+        }
+        let _ = self.store.seen(&cert.name, &agent_sub(&cert.name, node_name), now);
+        tracing::info!("certified {name:?} with key {}", cert.key);
+        let _ = self.outbound.send(Outbound::Cert(cert.clone()));
+        Ok(cert)
+    }
+
+    /// identities_dir: every held identity whose name is in this node's namespace, that has no live cert from this
+    /// node and whose key this node has not revoked, gets a cert (the node holds the seed: no proof needed). Run at
+    /// startup and after each member-list update. Returns the certs issued.
+    pub fn certify_held(&self) -> Vec<Cert> {
+        let me = self.seed.public();
+        let me_s = fmt_key(&me);
+        let members = self.members.read().unwrap().clone();
+        let Some(entry) = members.node_by_key(&me) else { return vec![] };
+        let mut out = Vec::new();
+        for (name, seed) in &self.opts.identities {
+            if !valid_name(name) || !entry.covers(name) {
+                tracing::debug!("identity {name:?} is not in this host's names; not certified");
+                continue;
+            }
+            let key = seed.public();
+            let key_s = fmt_key(&key);
+            if self.store.node_revoked(&me_s, &key_s) || !live_certs(&self.store, &members, name, &me).is_empty() {
+                continue;
+            }
+            match self.store.cert_by(&me_s, &key_s) {
+                Ok(Some(c)) => {
+                    tracing::warn!("identity {name:?}: its key is already certified here as {:?}; not certified", c.name);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("identity {name:?}: {e:#}");
+                    continue;
+                }
+            }
+            match self.issue(name, &key, &entry.name) {
+                Ok(c) => out.push(c),
+                Err(e) => tracing::warn!("identity {name:?}: {e:#}"),
+            }
+        }
+        out
+    }
+
+    /// A cert from a peer: stored if it verifies against the current member list. Ok(true) if it is new here.
+    pub fn accept_cert(&self, c: &Cert) -> Result<bool> {
+        c.verify(&self.members.read().unwrap())?;
+        let new = self.store.add_cert(c, now_millis())?;
+        if new {
+            if let Some(n) = self.members.read().unwrap().node_by_key(&c.node_key()?) {
+                let _ = self.store.seen(&c.name, &agent_sub(&c.name, &n.name), 0);
+            }
+        }
+        Ok(new)
+    }
+
+    /// A revocation from a peer or POST /api/revocations: stored if it verifies. Ok(true) if it is new here.
+    pub fn accept_revocation(&self, r: &Revocation) -> Result<bool> {
+        r.verify(&self.members.read().unwrap())?;
+        self.store.add_revocation(r, now_millis())
+    }
+
+    /// POST /api/revocations: a valid revocation is stored and, when new here, announced. Ok(true) if new.
+    pub fn revoke(&self, r: &Revocation) -> Result<bool, ApiError> {
+        let new = self.accept_revocation(r).map_err(|e| ApiError::new(400, format!("revocation refused: {e:#}")))?;
+        if new {
+            tracing::info!("revocation of {:?} (key {}) by {}", r.name, r.key, r.node);
+            let _ = self.outbound.send(Outbound::Revocation(r.clone()));
+        }
+        Ok(new)
+    }
+
+    /// GET /api/agents: every known cert.
+    pub fn agents(&self) -> Result<Vec<Value>> {
+        let members = self.members.read().unwrap().clone();
+        Ok(self
+            .store
+            .certs(-1)?
+            .into_iter()
+            .map(|c| {
+                let node_name = c.node_key().ok().and_then(|k| members.node_by_key(&k)).map(|n| n.name.clone());
+                json!({
+                    "name": c.name, "key": c.key, "node": c.node, "node_name": node_name.unwrap_or_default(),
+                    "issued": c.issued, "revoked": self.store.revoked(&c),
+                })
+            })
+            .collect())
+    }
+
+    /// Known certs that count now: valid against the current member list and not revoked.
+    fn live_known(&self, members: &MemberList) -> Result<Vec<Cert>> {
+        Ok(self.store.certs(-1)?.into_iter().filter(|c| c.verify(members).is_ok() && !self.store.revoked(c)).collect())
+    }
+
+    /// The identity this node holds for the caller's certified key, if any (identities_dir).
+    fn held_seed(&self, who: &Caller) -> Option<&Seed> {
+        self.opts.identities.iter().find(|(_, s)| s.public() == who.key).map(|(_, s)| s)
     }
 
     /* Identity */
 
-    /// A caller's bearer token. An agent token: PASETO v4.public signed by the member's own key on the member list,
-    /// for this node (aud), live now, used once. Or, during the switch and only with a pinned home, the old server's
-    /// verify(): an aid1 token for audience mail, live now, never a one-time sign-in token. Either way only names on
-    /// the member list (with the same sub) get in.
+    /// A caller's bearer token: an agent token (PASETO v4.public) signed by the key of an unrevoked certificate this
+    /// node issued for the token's name, for this node (aud), live now, used once.
     pub fn verify(&self, token: &str) -> Result<Caller, ApiError> {
+        use mailcore::agent_token::Refusal;
         let now = now_millis();
-        if mailcore::agent_token::is_agent_token(token) {
-            use mailcore::agent_token::Refusal;
-            let checked = {
-                let members = self.members.read().unwrap();
-                mailcore::agent_token::verify(token, &members, &self.seed.public(), now)
-            };
-            let c = checked.map_err(|r| match r {
-                Refusal::NotMember(s) => ApiError::new(403, format!("{s}; ask its operator to add you")),
-                Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
-            })?;
-            if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
-                return Err(ApiError::new(401, "token refused: already used (agent tokens are single-use; mint a fresh one)"));
-            }
-            self.note_auth(&c.name, "agent-token");
-            self.touch(&c.name, &c.sub);
-            return Ok(Caller { name: c.name, sub: c.sub, kind: "agent".into(), token: String::new(), exp_ms: c.exp_ms, auth: "agent-token" });
-        }
-        let Some(policy) = &self.policy else {
+        if !mailcore::agent_token::is_agent_token(token) {
             return Err(ApiError::new(
                 401,
-                "token refused: this node accepts only agent tokens signed by your own key (islandmail.py makes them; README: Running with no home server)",
+                "token refused: this node accepts only agent tokens signed by your certified key (islandmail.py makes them)",
             ));
-        };
-        let p = mailcore::token::verify_now(token, policy, now as f64 / 1000.0).map_err(|r| {
-            ApiError::new(401, format!("token refused: {r}. Get a fresh one from https://{}, or use an agent token signed by your own key", policy.iss))
+        }
+        let members = self.members.read().unwrap().clone();
+        let me = self.seed.public();
+        let c = mailcore::agent_token::verify(token, &self.store, &members, &me, now).map_err(|r| match r {
+            Refusal::NotCertified(s) => ApiError::new(403, s),
+            Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
         })?;
-        if p.jti.is_some() {
-            return Err(ApiError::new(401, "token refused: a one-time sign-in token works only to sign in"));
+        if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
+            return Err(ApiError::new(401, "token refused: already used (agent tokens are single-use; mint a fresh one)"));
         }
-        // Only names on the member list (with the same sub) may use this node: a token the home minted for anyone
-        // else reads nothing here (README.md, Security). Members are added by re-signing the list.
-        let listed = self.members.read().unwrap().member_by_name(&p.name).is_some_and(|m| m.sub == p.sub);
-        if !listed {
-            return Err(ApiError::new(403, format!("{} is not on this network's member list; ask its operator to add you", p.name)));
-        }
-        self.note_auth(&p.name, "aid1");
-        self.touch(&p.name, &p.sub);
-        Ok(Caller { name: p.name, sub: p.sub, kind: p.kind, token: token.to_string(), exp_ms: (p.exp * 1000.0) as i64, auth: "aid1" })
+        let node_name = members.node_by_key(&me).map(|n| n.name.clone()).unwrap_or_default();
+        let sub = agent_sub(&c.name, &node_name);
+        self.note_auth(&c.name);
+        self.touch(&c.name, &sub);
+        Ok(Caller { name: c.name, sub, kind: "agent".into(), exp_ms: c.exp_ms, auth: "agent-token", key: c.key, cert: c.cert })
     }
 
-    /// Logs the first sign-in of each name with each kind of token (debug-level for every later one). Never the token.
-    fn note_auth(&self, name: &str, auth: &'static str) {
+    /// Logs the first sign-in of each name (debug-level for every later one). Never the token.
+    fn note_auth(&self, name: &str) {
         let mut seen = self.auth_seen.lock().unwrap();
-        if seen.len() < 10_000 && seen.insert((norm(name), auth)) {
-            tracing::info!("{name:?} signed in with an {auth} token");
+        if seen.len() < 10_000 && seen.insert(norm(name)) {
+            tracing::info!("{name:?} signed in with an agent token");
         } else {
-            tracing::debug!("{name:?} used an {auth} token");
+            tracing::debug!("{name:?} used an agent token");
         }
     }
 
@@ -247,7 +399,11 @@ impl Node {
         if v.len() >= max {
             return Err(ApiError {
                 status: 429,
-                message: format!("rate limit: at most {max} {kind} per hour per sender"),
+                message: if sub.is_empty() {
+                    format!("rate limit: at most {max} {kind} per hour on this host; try again later")
+                } else {
+                    format!("rate limit: at most {max} {kind} per hour per sender")
+                },
                 retry_after: Some(600),
             });
         }
@@ -307,18 +463,17 @@ impl Node {
         let _ = self.store.seen(&who.name, &who.sub, now_millis());
 
         let members = self.members.read().unwrap().clone();
+        let me = self.seed.public();
         let recipients = match mode {
-            Mode::Members => members.all_keys(),
+            Mode::Members => members.node_keys(),
             Mode::Private => {
-                let keys = members.private_keys(&to, &who.name);
-                let addressed = members.members.iter().any(|m| addressed_to(&to, &[m.name.as_str()]));
-                if !addressed {
-                    return Err(ApiError::new(400, "private mail goes only to names on the member list; none matches"));
-                }
-                keys
+                let certs = self.store.certs(-1)?;
+                mailcore::private_recipients(&members, &to, &me, &certs, &|c| self.store.revoked(c))
+                    .ok_or_else(|| ApiError::new(400, format!("no known agent matches {to}")))?
             }
         };
-        // Signed by the sender's own key (islandmail.py sends `signed: {ts, salt, sig}`), or token-attested.
+        // Signed by the sender's own certified key (islandmail.py sends `signed: {ts, salt, sig}`), signed by this
+        // node with the sender's key when it holds it (identities_dir), or vouched for by this node.
         let (ts, attest, salt) = match body.get("signed").filter(|s| s.is_object()) {
             Some(s) => {
                 let raw_thread = body.get("thread").and_then(|t| t.as_str()).unwrap_or("general");
@@ -338,47 +493,37 @@ impl Node {
                     .and_then(mailcore::b64u_decode)
                     .filter(|b| (16..=64).contains(&b.len()))
                     .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16-64 bytes, base64url"))?;
-                let m = members
-                    .member_by_name(&who.name)
-                    .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
-                let key = mailcore::keys::parse_key(&m.key)?;
                 let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
                 let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
                 let sig = s["sig"].as_str().unwrap_or("").to_string();
-                let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, st.as_bytes(), &b));
-                if !ok {
-                    return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key on the member list", who.name)));
-                }
+                let sig_bytes = mailcore::b64u_decode(&sig).unwrap_or_default();
+                let cert = live_certs(&self.store, &members, &who.name, &me)
+                    .into_iter()
+                    .find(|c| c.agent_key().is_ok_and(|k| mailcore::keys::verify(&k, st.as_bytes(), &sig_bytes)))
+                    .ok_or_else(|| {
+                        ApiError::new(401, format!("signed post: signature does not verify against {}'s certified key", who.name))
+                    })?;
                 // Canonical encoding (the one every node dedupes by); a client resending the same signed post gets
                 // the first copy back instead of a second envelope.
-                let sig = mailcore::b64u_decode(&sig).map(|b| mailcore::b64u(&b)).unwrap_or(sig);
+                let sig = mailcore::b64u(&sig_bytes);
                 if let Some(row) = self.store.by_agent_sig(&sig)? {
                     let reaches = self.reaches(&row.recipient, &who.sub)?;
                     return Ok(Posted { row, reaches, repeated: true });
                 }
-                (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
+                (ts, Attest::Agent { key: cert.key.clone(), digest, sig, cert }, mailcore::b64u(&salt))
             }
-            // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
-            // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
-            None if self.local_key(&members, who).is_some() => {
-                let (key, seed) = self.local_key(&members, who).expect("checked");
-                let salt = mailcore::random_bytes::<16>();
-                let ts = now_ts();
-                let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
-                let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
-                let sig = mailcore::b64u(&seed.sign(st.as_bytes()));
-                (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
-            }
-            None => {
-                // An agent token is never copied into an envelope: it would hand a bearer token to every node.
-                if who.auth != "aid1" {
-                    return Err(ApiError::new(400, "unsigned post: with an agent token, sign the post with your own key (islandmail.py does), or put your identity file in this node's identities_dir"));
+            None => match self.held_seed(who) {
+                Some(seed) => {
+                    let salt = mailcore::random_bytes::<16>();
+                    let ts = now_ts();
+                    let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
+                    let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
+                    let sig = mailcore::b64u(&seed.sign(st.as_bytes()));
+                    let cert = who.cert.clone();
+                    (ts, Attest::Agent { key: cert.key.clone(), digest, sig, cert }, mailcore::b64u(&salt))
                 }
-                if self.opts.refuse_token_only {
-                    return Err(ApiError::new(400, "this node accepts only mail signed with the sender's own key (islandmail.py signs it)"));
-                }
-                (now_ts(), Attest::Aid1 { token: who.token.clone() }, String::new())
-            }
+                None => (now_ts(), Attest::Node, String::new()),
+            },
         };
         let parents = self.store.heads(&thread)?;
         let b = Body { text: text.clone(), files: files.clone(), salt };
@@ -399,103 +544,22 @@ impl Node {
         )?;
         // Refuse to write what no other node would accept (e.g. this node is not on the member list).
         let v = env
-            .verify(&members, self.policy.as_ref(), now_millis())
+            .verify(&members, &self.store, now_millis())
             .and_then(|v| env.check_body(&b).map(|_| v))
-            .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
-        let readers = (mode == Mode::Private).then(|| readers_for(&members, &to, &who.name));
+            .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e:#}")))?;
+        let readers = match mode {
+            Mode::Private => Some(self.readers_for(&members, &to, &who.name)?),
+            Mode::Members => None,
+        };
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         let row = self
             .store
-            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
+            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())?
             .ok_or_else(|| ApiError::new(500, "envelope id collision"))?;
         let _ = self.events.send(Arc::new(row.clone()));
-        let _ = self.outbound.send(Outbound::Envelope(env));
+        let _ = self.outbound.send(Outbound::Envelope(Box::new(env)));
         let reaches = self.reaches(&to, &who.sub)?;
         Ok(Posted { row, reaches, repeated: false })
-    }
-
-    /// The caller's agent key, if this node holds it: an identity named like the caller whose public key is the one
-    /// the member list gives that name, with the same sub as the caller's token. (member-list key string, seed)
-    fn local_key(&self, members: &MemberList, who: &Caller) -> Option<(String, Seed)> {
-        let m = members.member_by_name(&who.name).filter(|m| m.sub == who.sub)?;
-        let k = mailcore::keys::parse_key(&m.key).ok()?;
-        self.opts
-            .identities
-            .iter()
-            .find(|(n, s)| mailcore::addr::same(n, &who.name) && s.public() == k)
-            .map(|(_, s)| (m.key.clone(), s.clone()))
-    }
-
-    /// Bridge: one message from the old server, kept under its old number where free, signed by the bridge key, sealed
-    /// deterministically (the same old message imported twice is the same envelope). Returns (row, already there).
-    pub fn import_old(&self, who: &Caller, m: &Value) -> Result<(Row, bool), ApiError> {
-        let Some((bseed, bsub)) = &self.opts.bridge else { return Err(ApiError::new(404, "no such endpoint")) };
-        if &who.sub != bsub {
-            return Err(ApiError::new(403, "only the bridge identity may import"));
-        }
-        let old_id = m["id"]
-            .as_i64()
-            .filter(|&x| x > 0 && x as u64 <= mailcore::envelope::MAX_OLD_ID)
-            .ok_or_else(|| ApiError::new(400, "id must be a positive integer of at most 2^32"))?;
-        if let Some(row) = self.store.by_imported(old_id)? {
-            return Ok((row, true));
-        }
-        let s = |k: &str| -> Result<String, ApiError> {
-            m[k].as_str()
-                .filter(|v| !v.is_empty() && v.chars().count() <= MAX_FIELD && !v.chars().any(|c| c.is_control()))
-                .map(|v| v.to_string())
-                .ok_or_else(|| ApiError::new(400, format!("{k} must be 1-{MAX_FIELD} characters")))
-        };
-        let (ts, from, to, thread) = (s("ts")?, s("from")?, s("to")?, s("thread")?);
-        if mailcore::parse_ts(&ts).is_none() {
-            return Err(ApiError::new(400, "ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"));
-        }
-        let text = m["text"].as_str().ok_or_else(|| ApiError::new(400, "text must be a string"))?.to_string();
-        let files: Vec<Value> = m["files"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .take(MAX_FILES)
-                    .map(|f| json!({ "id": f["id"], "name": f["name"], "type": f["type"], "size": f["size"], "old": true }))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let sub = m["sub"].as_str().unwrap_or("").to_string();
-        let verified = m["verified"].as_bool().unwrap_or(false);
-        let members = self.members.read().unwrap().clone();
-        let b = Body { text: text.clone(), files: files.clone(), salt: String::new() };
-        let mut h = blake3::Hasher::new_derive_key("agent-mail v1 import det");
-        h.update(bseed.bytes());
-        h.update(&old_id.to_le_bytes());
-        let env = Envelope::seal_with(
-            Draft {
-                thread: &thread,
-                parents: self.store.heads(&thread)?,
-                ts,
-                from: &from,
-                to: &to,
-                mode: Mode::Members,
-                body: &b,
-                blobs: vec![],
-                attest: Attest::Import { old_id: old_id as u64, sub, verified },
-                recipients: &members.all_keys(),
-            },
-            bseed,
-            Some(*h.finalize().as_bytes()),
-        )?;
-        let v = env
-            .verify(&members, self.policy.as_ref(), now_millis())
-            .map_err(|e| ApiError::new(503, format!("this node cannot import: {e}")))?;
-        let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
-        match self.store.insert(&env, &v, Some(&text), &files_json, None, now_millis(), self.opts.id_floor)? {
-            Some(row) => {
-                let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
-                let _ = self.events.send(Arc::new(row.clone()));
-                let _ = self.outbound.send(Outbound::Envelope(env));
-                Ok((row, false))
-            }
-            None => Ok((self.store.by_imported(old_id)?.ok_or_else(|| ApiError::new(500, "import vanished"))?, true)),
-        }
     }
 
     /// POST /api/files: encrypt and keep the upload until a message attaches it.
@@ -540,38 +604,30 @@ impl Node {
         }
     }
 
-    /// A replicated envelope. Ok(None): already here. Err: refused (bad signature, token, member, shape).
+    /// A replicated envelope. Ok(None): already here. Err: refused (bad signature, certificate, member, shape).
     pub fn ingest(&self, env: Envelope) -> Result<Option<Arc<Row>>> {
         if self.store.has(&env.id)? {
             return Ok(None);
         }
         let members = self.members.read().unwrap().clone();
-        let v = env.verify(&members, self.policy.as_ref(), now_millis())?;
-        if v.attest == "token" && self.opts.refuse_token_only {
-            anyhow::bail!("token-attested envelopes are refused by this node");
+        let v = env.verify(&members, &AsOf { store: &self.store, ts_ms: env.ts_ms() }, now_millis())?;
+        // The sender's cert travels in the envelope and has just been verified: keep it (first per node and key).
+        if let Attest::Agent { cert, .. } = &env.attest {
+            let _ = self.store.add_cert(cert, now_millis());
         }
-        let mut body = env.open(&self.seed).unwrap_or(None);
-        if body.is_none() {
-            for (_, s) in &self.opts.identities {
-                if let Ok(Some(b)) = env.open(s) {
-                    body = Some(b);
-                    break;
-                }
-            }
-        }
+        let body = env.open(&self.seed).unwrap_or(None);
         if let Some(b) = &body {
             env.check_body(b)?;
         }
         let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
         let text: Option<String> = body.map(|b| b.text.chars().take(MAX_TEXT as usize).collect());
-        let readers = (env.mode == Mode::Private).then(|| readers_for(&members, &env.to, &env.from));
-        let Some(row) =
-            self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
-        else {
+        let readers = match env.mode {
+            Mode::Private => Some(self.readers_for(&members, &env.to, &env.from)?),
+            Mode::Members => None,
+        };
+        let Some(row) = self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis())? else {
             return Ok(None);
         };
-        // Imports too (11-22): people still on the old server are addressable through the bridge, so "reaches" and
-        // `who` must know them.
         let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
         let _ = self.events.send(row.clone());
@@ -608,32 +664,35 @@ impl Node {
 
     /* Names */
 
-    fn renames(&self) -> impl Iterator<Item = &Renamed> {
-        self.opts.renamed.iter().filter(|r| !r.name.is_empty() && !r.sub.is_empty() && !r.now.is_empty())
-    }
-
-    /// The names mail to this agent may be addressed to: its own, and the names it had before a rename.
-    pub fn names_of(&self, name: &str, sub: &str) -> Vec<String> {
-        let mut v = vec![name.to_string()];
-        v.extend(self.renames().filter(|r| r.now_sub == sub && addr::same(&r.now, name)).map(|r| r.name.clone()));
-        v
-    }
-
-    pub fn subs_of(&self, sub: &str) -> Vec<String> {
-        let mut v = vec![sub.to_string()];
-        v.extend(self.renames().filter(|r| r.now_sub == sub).map(|r| r.sub.clone()));
-        v
-    }
-
+    /// Known names: every name with a live cert (valid on the current list, not revoked) and every name seen in
+    /// messages or sign-ins, as (name, sub, last seen ms), most recently active first.
     pub fn known_names(&self, limit: i64) -> Result<Vec<(String, String, i64)>> {
-        let rows = self.store.names(limit)?;
-        let present: std::collections::HashSet<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        let gone: std::collections::HashSet<String> = self
-            .renames()
-            .filter(|r| present.contains(r.now_sub.as_str()))
-            .map(|r| format!("{}\u{0}{}", norm(&r.name), r.sub))
+        let members = self.members.read().unwrap().clone();
+        let mut rows = self.store.names(limit.max(0))?;
+        let mut have: HashSet<String> = rows.iter().map(|r| norm(&r.0)).collect();
+        for c in self.live_known(&members)? {
+            let Some(n) = c.node_key().ok().and_then(|k| members.node_by_key(&k)) else { continue };
+            if have.insert(norm(&c.name)) {
+                rows.push((c.name.clone(), agent_sub(&c.name, &n.name), 0));
+            }
+        }
+        rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        rows.truncate(limit.max(0) as usize);
+        Ok(rows)
+    }
+
+    /// ",name1,name2," of the names a private envelope is for: the sender and every live cert's name `to` addresses.
+    pub fn readers_for(&self, members: &MemberList, to: &str, from: &str) -> Result<String> {
+        let mut names: Vec<String> = self
+            .live_known(members)?
+            .iter()
+            .filter(|c| addressed_to(to, &[c.name.as_str()]))
+            .map(|c| norm(&c.name))
             .collect();
-        Ok(rows.iter().filter(|r| !gone.contains(&format!("{}\u{0}{}", norm(&r.0), r.1))).cloned().collect())
+        names.push(norm(from));
+        names.sort();
+        names.dedup();
+        Ok(format!(",{},", names.join(",")))
     }
 
     pub fn names_list(&self, prefix: &str) -> Result<Vec<Value>> {
@@ -650,11 +709,7 @@ impl Node {
         let mut out: Vec<String> = self
             .known_names(5000)?
             .into_iter()
-            .filter(|r| {
-                let names = self.names_of(&r.0, &r.1);
-                let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-                r.1 != sender_sub && addressed_to(to, &refs)
-            })
+            .filter(|r| r.1 != sender_sub && addressed_to(to, &[r.0.as_str()]))
             .map(|r| r.0)
             .collect();
         out.sort();
@@ -662,6 +717,7 @@ impl Node {
     }
 
     /// Mail addressed to `name` with ids in (after, before), not sent by it; newest first unless `ascending`.
+    #[allow(clippy::too_many_arguments)]
     pub fn addressed_rows(
         &self,
         name: &str,
@@ -672,19 +728,16 @@ impl Node {
         text_cap: i64,
         ascending: bool,
     ) -> Result<Vec<Row>> {
-        let names = self.names_of(name, sub);
-        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let subs = self.subs_of(sub);
+        let refs = [name];
+        let subs = [sub.to_string()];
         let mut needles = vec!["all".to_string(), "*".to_string()];
-        for n in &names {
-            let n = norm(n);
-            for (i, c) in n.char_indices() {
-                if c == '.' {
-                    needles.push(n[..=i].to_string());
-                }
+        let n = norm(name);
+        for (i, c) in n.char_indices() {
+            if c == '.' {
+                needles.push(n[..=i].to_string());
             }
-            needles.push(n);
         }
+        needles.push(n);
         needles.sort();
         needles.dedup();
         let (mut lo, mut hi) = (after, before);
@@ -713,21 +766,7 @@ impl Node {
     }
 }
 
-/// ",name1,name2," of the member names a private envelope is for: the sender and every member `to` addresses.
-pub fn readers_for(members: &MemberList, to: &str, from: &str) -> String {
-    let mut names: Vec<String> = members
-        .members
-        .iter()
-        .filter(|m| addressed_to(to, &[m.name.as_str()]))
-        .map(|m| norm(&m.name))
-        .collect();
-    names.push(norm(from));
-    names.sort();
-    names.dedup();
-    format!(",{},", names.join(","))
-}
-
-/* Field rules, as the old server */
+/* Field rules */
 
 fn is_format_char(c: char) -> bool {
     matches!(c as u32,
@@ -759,7 +798,7 @@ pub fn field(v: &Value, name: &str, ok: impl Fn(&str) -> bool) -> Result<String,
     Ok(s)
 }
 
-/// The old server's fileName(): the last path segment, no format/control characters or quotes, at most 200 chars.
+/// An attachment's file name: the last path segment, no format/control characters or quotes, at most 200 chars.
 pub fn file_name(raw: Option<&str>) -> String {
     let base = raw.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
     let s: String = base
@@ -773,7 +812,7 @@ pub fn file_name(raw: Option<&str>) -> String {
     if s.is_empty() { "file".into() } else { s }
 }
 
-/// The old server's mimeType(): a plain type/subtype or application/octet-stream.
+/// An attachment's type: a plain type/subtype or application/octet-stream.
 pub fn mime_type(raw: Option<&str>) -> String {
     let t = raw.unwrap_or("").split(';').next().unwrap_or("").trim().to_lowercase();
     let ok_part = |p: &str| {
@@ -820,7 +859,7 @@ fn one_line(s: &str) -> String {
     s.chars().map(|c| if c.is_control() || is_line_break(c) { ' ' } else { c }).collect()
 }
 
-/// The old server's formatMessage: one header line the mailbox writes, then the sender's text, every line quoted.
+/// A message as the mailbox shows it: one header line, then the sender's text, every line quoted.
 /// Replicated text and header fields come from other nodes unfiltered, so every kind of line break starts a new quoted
 /// line and none can appear in the header: a line that does not start with '> ' is always the mailbox's own.
 pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
@@ -840,11 +879,7 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
                 .iter()
                 .map(|f| {
                     let id = f["id"].as_str().unwrap_or("");
-                    let url = if f["old"] == json!(true) {
-                        format!("https://mail.gnome.science/api/files/{id}")
-                    } else {
-                        format!("{base}/api/files/{id}")
-                    };
+                    let url = format!("{base}/api/files/{id}");
                     format!("{} ({} bytes) {url}", f["name"].as_str().unwrap_or("file"), f["size"])
                 })
                 .collect();
@@ -852,14 +887,7 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
         }
         _ => body,
     };
-    // An import's sender is the bridge's word for it (the bridge key can name anyone), so the header says so.
-    let from = if r.verified && r.imported.is_some() {
-        format!("{} [{}] (copied from the old server)", one_line(&r.sender), one_line(&r.sender_sub))
-    } else if r.verified {
-        format!("{} [{}]", one_line(&r.sender), one_line(&r.sender_sub))
-    } else {
-        format!("{} (unverified: copied from the old shared-password inbox)", one_line(&r.sender))
-    };
+    let from = format!("{} [{}]", one_line(&r.sender), one_line(&r.sender_sub));
     let quoted: Vec<String> = body.replace("\r\n", "\n").split(is_line_break).map(|l| format!("> {l}")).collect();
     let ts: String = one_line(&r.ts).chars().take(16).collect();
     format!(
@@ -876,135 +904,325 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mailcore::keys::fmt_key;
-    use mailcore::{Member, NodeEntry};
+    use crate::testutil::{list, next_env, node, proof, sign_in, signed, token};
 
-    fn setup() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>) {
-        let (n, home, b, l, rx, _) = setup_full();
-        (n, home, b, l, rx)
+    /// Two member nodes: A ("a." plus the exact name "solo") and B ("b."), and the operator.
+    struct Net2 {
+        op: Seed,
+        a_seed: Seed,
+        b_seed: Seed,
+        list: MemberList,
+        a: Node,
+        a_rx: mpsc::UnboundedReceiver<Outbound>,
+        b: Node,
     }
 
-    fn setup_full() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>, Seed) {
-        setup_home(true)
+    fn net2() -> Net2 {
+        let (op, a_seed, b_seed) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let list = list(&op, &[("a", &a_seed, &["a.", "solo"]), ("b", &b_seed, &[])], 1);
+        let (a, a_rx) = node(&list, &op, &a_seed, vec![]);
+        let (b, _) = node(&list, &op, &b_seed, vec![]);
+        Net2 { op, a_seed, b_seed, list, a, a_rx, b }
     }
 
-    fn setup_home(with_home: bool) -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>, Seed) {
-        let (home, op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
-        let alice_copy = Seed::from_bytes(*alice.bytes());
-        let mut list = MemberList {
-            v: 1,
-            network: "t".into(),
-            seq: 1,
-            issued: now_ts(),
-            operator: String::new(),
-            members: vec![Member { name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()) }],
-            nodes: [&node_a, &node_b]
-                .iter()
-                .enumerate()
-                .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![] })
-                .collect(),
-            bridges: vec![],
-            sig: String::new(),
-        };
-        list.sign(&op);
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
-        let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-        let (tx, rx) = mpsc::unbounded_channel();
-        let opts = Opts { id_floor: 1, public_url: "http://x".into(), ..Default::default() };
-        let policy = with_home.then_some(policy);
-        let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), policy, node_a, opts, tx);
-        (node, home, node_b, list, rx, alice_copy)
-    }
-
-    fn env_of(o: Outbound) -> Envelope {
-        let Outbound::Envelope(e) = o;
-        e
-    }
-
-    fn token(home: &Seed) -> String {
-        let now = now_millis() as f64 / 1000.0;
-        mailcore::token::mint(
-            home,
-            &mailcore::Aid1Payload {
-                v: 1,
-                iss: "h".into(),
-                sub: "agent:alice@t".into(),
-                kind: "agent".into(),
-                name: "a.alice".into(),
-                aud: "mail".into(),
-                scopes: vec!["mail:use".into()],
-                claims: None,
-                iat: now,
-                exp: now + 600.0,
-                jti: None,
-            },
-        )
-    }
-
-    fn envelope(writer: &Seed, list: &MemberList, home: &Seed, text: &str) -> Envelope {
-        let body = Body { text: text.into(), ..Default::default() };
+    fn seal(writer: &Seed, list: &MemberList, from: &str, attest: Attest, body: &Body, parents: Vec<String>, ts: &str) -> Envelope {
         Envelope::seal(
             Draft {
                 thread: "t",
-                parents: vec![],
-                ts: now_ts(),
-                from: "a.alice",
+                parents,
+                ts: ts.to_string(),
+                from,
                 to: "all",
                 mode: Mode::Members,
-                body: &body,
+                body,
                 blobs: vec![],
-                attest: Attest::Aid1 { token: token(home) },
-                recipients: &list.all_keys(),
+                attest,
+                recipients: &list.node_keys(),
             },
             writer,
         )
         .unwrap()
     }
 
-    #[test]
-    fn ingest_dedupes_by_envelope_id() {
-        let (node, home, node_b, list, _rx) = setup();
-        let e = envelope(&node_b, &list, &home, "once");
-        let first = node.ingest(e.clone()).unwrap().expect("stored");
-        assert_eq!(first.text.as_deref(), Some("once"));
-        assert!(node.ingest(e.clone()).unwrap().is_none(), "same envelope again is a no-op");
-        assert_eq!(node.store.count().unwrap(), 1);
-        // Re-serialized (as after a gossip hop) it is still the same id.
-        let again: Envelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
-        assert!(node.ingest(again).unwrap().is_none());
-        assert_eq!(node.store.count().unwrap(), 1);
+    fn status(r: Result<(u16, Cert), ApiError>) -> u16 {
+        match r {
+            Ok((s, _)) => s,
+            Err(e) => e.status,
+        }
     }
 
     #[test]
-    fn imports_cannot_push_local_numbering_up() {
-        let (node, home, node_b, list, _rx) = setup();
-        let v = |old: u64| mailcore::Verified {
-            sender_sub: "agent:x@t".into(),
-            sender_kind: String::new(),
-            imported: Some(old),
-            verified: true,
-            attest: "import",
-        };
-        let ins = |text: &str, old: u64, floor: i64| {
-            let e = envelope(&node_b, &list, &home, text);
-            node.store.insert(&e, &v(old), Some(text), "[]", None, 0, floor).unwrap().unwrap().id
-        };
-        assert_eq!(ins("a", 5, 1), 5, "an old id in range keeps its number");
-        assert_eq!(ins("b", 1 << 40, 1), 6, "an old id past the old server's range is renumbered");
-        assert_eq!(ins("c", i64::MAX as u64, 1), 7);
-        assert_eq!(ins("d", 2_000, 1_000), 8, "at or above id_floor: renumbered");
-        assert_eq!(ins("e", 900, 1_000), 900, "below id_floor: kept");
+    fn issuance_answers_400_403_409_200_201() {
+        let n = net2();
+        let me = n.a_seed.public();
+        let alice = Seed::generate();
+        // Bad proof: signed by another key, or for another node.
+        let mut bad = proof(&alice, "a.alice", &me);
+        bad["key"] = json!(fmt_key(&Seed::generate().public()));
+        assert_eq!(status(n.a.certify(&bad)), 400);
+        assert_eq!(status(n.a.certify(&proof(&alice, "a.alice", &n.b_seed.public()))), 400);
+        assert_eq!(status(n.a.certify(&proof(&alice, "all", &me))), 400, "not a valid name");
+        // Outside this host's names: another host's namespace, or nobody's.
+        let e = n.a.certify(&proof(&alice, "b.alice", &me)).unwrap_err();
+        assert_eq!(e.status, 403);
+        assert!(e.message.contains("not in this host's names: a., solo"), "{}", e.message);
+        assert_eq!(status(n.a.certify(&proof(&alice, "zed", &me))), 403);
+        // New, then the same name and key again.
+        let (st, c1) = n.a.certify(&proof(&alice, "a.alice", &me)).unwrap();
+        assert_eq!(st, 201);
+        c1.verify(&n.list).unwrap();
+        let (st, c2) = n.a.certify(&proof(&alice, "A.Alice", &me)).unwrap();
+        assert_eq!((st, &c2.sig), (200, &c1.sig), "idempotent, whatever the case");
+        assert_eq!(status(n.a.certify(&proof(&alice, "solo", &me))), 409, "this key is already certified here as a.alice");
+        // The name is taken by another key.
+        let e = n.a.certify(&proof(&Seed::generate(), "a.alice", &me)).unwrap_err();
+        assert_eq!(e.status, 409);
+        assert!(e.message.contains("mailnode revoke CONFIG a.alice"), "{}", e.message);
+        // An exact name in the namespace works.
+        assert_eq!(status(n.a.certify(&proof(&Seed::generate(), "solo", &me))), 201);
+    }
+
+    #[test]
+    fn issuance_is_rate_limited() {
+        let n = net2();
+        let me = n.a_seed.public();
+        for i in 0..MAX_ISSUANCES {
+            assert_eq!(status(n.a.certify(&proof(&Seed::generate(), &format!("a.x{i}"), &me))), 201);
+        }
+        let e = n.a.certify(&proof(&Seed::generate(), "a.late", &me)).unwrap_err();
+        assert_eq!(e.status, 429);
+        assert!(e.retry_after.is_some());
+        // A taken name still answers 409 (the limit counts only new certificates).
+        assert_eq!(status(n.a.certify(&proof(&Seed::generate(), "a.x0", &me))), 409);
+    }
+
+    #[test]
+    fn another_nodes_cert_for_the_same_key_neither_blocks_nor_replaces_ours() {
+        let n = net2();
+        let k = Seed::generate();
+        // B certifies K first (as B's own name) and A learns it before certifying K itself.
+        let (_, from_b) = n.b.certify(&proof(&k, "b.k", &n.b_seed.public())).unwrap();
+        assert!(n.a.accept_cert(&from_b).unwrap());
+        let (st, from_a) = n.a.certify(&proof(&k, "a.k", &n.a_seed.public())).unwrap();
+        assert_eq!(st, 201);
+        // Arriving again (or a forged second cert from B for the key) changes nothing on A.
+        assert!(!n.a.accept_cert(&from_b).unwrap());
+        let me = fmt_key(&n.a_seed.public());
+        assert_eq!(n.a.store.cert_by(&me, &from_a.key).unwrap().unwrap().sig, from_a.sig);
+        let who = n.a.verify(&token(&k, "a.k", &n.a)).unwrap();
+        assert_eq!((who.name.as_str(), who.sub.as_str()), ("a.k", "agent:a.k@a"));
+        assert_eq!(n.a.agents().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn revocation_counts_only_against_its_own_nodes_cert() {
+        let mut n = net2();
+        let k = Seed::generate();
+        let (_, from_b) = n.b.certify(&proof(&k, "b.k", &n.b_seed.public())).unwrap();
+        let _ = sign_in(&n.a, &k, "a.k");
+        n.b.accept_cert(&from_b).unwrap();
+        // B revokes its own cert for K: A's cert for K stays live.
+        let rb = Revocation::sign(&n.b_seed, "b.k", &k.public(), &now_ts());
+        assert!(n.a.revoke(&rb).unwrap());
+        assert!(!n.a.revoke(&rb).unwrap(), "known already");
+        n.b.revoke(&rb).unwrap();
+        let who = n.a.verify(&token(&k, "a.k", &n.a)).expect("sign-in on A still works");
+        let body = json!({ "to": "all", "thread": "t", "text": "still here", "signed": signed(&k, "a.k", "all", "t", "still here", &[]) });
+        n.a.post(&who, &body).unwrap();
+        let before = next_env(&mut n.a_rx);
+        assert!(n.b.ingest(before.clone()).unwrap().is_some(), "B accepts A's envelopes for K");
+        // A node cannot revoke another host's agent: B's signature over A's cert is refused.
+        let forged = Revocation::sign(&n.b_seed, "a.k", &k.public(), &now_ts());
+        assert_eq!(n.a.revoke(&forged).unwrap_err().status, 400);
+        // A revokes its own cert: sign-in, and new envelopes from K through A, are refused; the name is free again.
+        let ra = Revocation::sign(&n.a_seed, "a.k", &k.public(), &now_ts());
+        assert!(n.a.revoke(&ra).unwrap());
+        assert_eq!(n.a.verify(&token(&k, "a.k", &n.a)).unwrap_err().status, 403);
+        n.b.revoke(&ra).unwrap();
+        let cert = n.a.store.cert_by(&fmt_key(&n.a_seed.public()), &fmt_key(&k.public())).unwrap().unwrap();
+        let ts = now_ts();
+        let salt = mailcore::random_bytes::<16>();
+        let digest = mailcore::envelope::post_digest(&salt, "after", &[]);
+        let st = mailcore::envelope::post_statement("a.k", "all", "t", Mode::Members, &ts, &digest);
+        let sig = mailcore::b64u(&k.sign(st.as_bytes()));
+        let b = Body { text: "after".into(), files: vec![], salt: mailcore::b64u(&salt) };
+        let late = seal(&n.a_seed, &n.list, "a.k", Attest::Agent { key: cert.key.clone(), digest, sig, cert }, &b, vec![], &ts);
+        assert!(n.b.ingest(late).is_err(), "a revoked key's new envelope is refused");
+        // What K sent before the revocation still replicates, also to a node that learns the revocation first.
+        let (fresh, _) = node(&n.list, &n.op, &n.b_seed, vec![]);
+        fresh.revoke(&ra).unwrap();
+        fresh.accept_cert(&from_b).unwrap();
+        assert!(fresh.ingest(before).unwrap().is_some(), "history from before the revocation is kept");
+        assert_eq!(status(n.a.certify(&proof(&k, "a.k", &n.a_seed.public()))), 403, "the revoked key itself stays dead");
+        let k2 = Seed::generate();
+        assert_eq!(status(n.a.certify(&proof(&k2, "a.k", &n.a_seed.public()))), 201, "the name takes a new key");
+        assert_eq!(n.a.verify(&token(&k2, "a.k", &n.a)).unwrap().name, "a.k");
+    }
+
+    #[test]
+    fn tokens_are_single_use_for_this_node_and_certified_names_only() {
+        let n = net2();
+        let alice = Seed::generate();
+        let _ = sign_in(&n.a, &alice, "a.alice");
+        let t = token(&alice, "a.alice", &n.a);
+        assert!(n.a.verify(&t).is_ok());
+        let e = n.a.verify(&t).unwrap_err();
+        assert!(e.status == 401 && e.message.contains("already used"), "{}", e.message);
+        // Minted for node B (wrong aud), by another key, for a name A never certified, or not an agent token at all.
+        let wrong_aud = mailcore::agent_token::mint(&alice, "a.alice", &n.b_seed.public(), now_millis(), 600);
+        assert_eq!(n.a.verify(&wrong_aud).unwrap_err().status, 401);
+        assert_eq!(n.a.verify(&token(&Seed::generate(), "a.alice", &n.a)).unwrap_err().status, 401);
+        let e = n.a.verify(&token(&alice, "a.bob", &n.a)).unwrap_err();
+        assert_eq!(e.status, 403);
+        assert!(e.message.contains("POST /api/agents"), "{}", e.message);
+        assert_eq!(n.a.verify("v2.local.not-an-agent-token").unwrap_err().status, 401);
+        // A cert B issued does not let its agent sign in on A.
+        let bob = Seed::generate();
+        let (_, c) = n.b.certify(&proof(&bob, "b.bob", &n.b_seed.public())).unwrap();
+        n.a.accept_cert(&c).unwrap();
+        assert_eq!(n.a.verify(&token(&bob, "b.bob", &n.a)).unwrap_err().status, 403);
+    }
+
+    #[test]
+    fn envelopes_written_on_one_node_are_verified_and_stored_by_another() {
+        let mut n = net2();
+        let alice = Seed::generate();
+        let who = sign_in(&n.a, &alice, "a.alice");
+        // Signed: the cert travels in the envelope, so B needs nothing first, and keeps the cert.
+        let body = json!({ "to": "all", "thread": "t", "text": "hi B", "signed": signed(&alice, "a.alice", "all", "t", "hi B", &[]) });
+        let p = n.a.post(&who, &body).unwrap();
+        assert_eq!(p.row.attest, "agent");
+        let row = n.b.ingest(next_env(&mut n.a_rx)).unwrap().expect("stored on B");
+        assert_eq!((row.text.as_deref(), row.sender_sub.as_str(), row.id), (Some("hi B"), "agent:a.alice@a", 1));
+        assert_eq!(n.b.store.certs_for("a.alice").len(), 1, "B kept the carried cert");
+        // Unsigned: node-attested; B accepts it because it now knows a.alice's cert from A.
+        let p = n.a.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).unwrap();
+        assert_eq!(p.row.attest, "node");
+        let env = next_env(&mut n.a_rx);
+        assert!(matches!(env.attest, Attest::Node));
+        assert_eq!(n.b.ingest(env).unwrap().unwrap().id, 2, "numbered from 1 in arrival order");
+        // A node-attested envelope for an agent with no known cert is refused until the cert arrives.
+        let carol = Seed::generate();
+        let cw = sign_in(&n.a, &carol, "a.carol");
+        n.a.post(&cw, &json!({ "to": "all", "thread": "t", "text": "from carol" })).unwrap();
+        let env = next_env(&mut n.a_rx);
+        assert!(n.b.ingest(env.clone()).is_err());
+        let c = n.a.store.certs_for("a.carol").pop().unwrap();
+        assert!(n.b.accept_cert(&c).unwrap());
+        assert!(n.b.ingest(env).unwrap().is_some());
+        assert!(n.b.reaches("a.", "agent:x@b").unwrap().contains(&"a.carol".to_string()));
+        // B cannot vouch for a name in A's namespace, nor certify one.
+        let fake = seal(&n.b_seed, &n.list, "a.alice", Attest::Node, &Body { text: "spoof".into(), ..Default::default() }, vec![], &now_ts());
+        assert!(n.a.ingest(fake).is_err());
+        let cross = Cert::issue(&n.b_seed, "a.mallory", &Seed::generate().public(), &now_ts());
+        assert!(n.a.accept_cert(&cross).is_err(), "cross-namespace cert refused");
+        let stranger = Seed::generate();
+        let rogue = Cert::issue(&stranger, "a.rogue", &Seed::generate().public(), &now_ts());
+        assert!(n.a.accept_cert(&rogue).is_err(), "cert from a non-member refused");
+        assert!(n.a.store.certs_for("a.mallory").is_empty() && n.a.store.certs_for("a.rogue").is_empty());
+        let _ = &n.op;
+    }
+
+    #[test]
+    fn private_mail_wraps_only_to_the_addressees_nodes_and_the_writer() {
+        let (op, sa, sb, sc) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
+        let l = list(&op, &[("a", &sa, &[]), ("b", &sb, &[]), ("c", &sc, &[])], 1);
+        let (a, mut arx) = node(&l, &op, &sa, vec![]);
+        let (b, _) = node(&l, &op, &sb, vec![]);
+        let (c, _) = node(&l, &op, &sc, vec![]);
+        let (alice, bob, carol) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let wa = sign_in(&a, &alice, "a.alice");
+        let other = sign_in(&a, &Seed::generate(), "a.other");
+        let _ = sign_in(&b, &bob, "b.bob");
+        let _ = sign_in(&c, &carol, "c.carol");
+        for cert in b.store.certs(-1).unwrap().into_iter().chain(c.store.certs(-1).unwrap()) {
+            a.accept_cert(&cert).unwrap();
+        }
+        for cert in a.store.certs(-1).unwrap() {
+            b.accept_cert(&cert).unwrap();
+            c.accept_cert(&cert).unwrap();
+        }
+        let e = a.post(&wa, &json!({ "to": "z.nobody", "text": "x", "mode": "private" })).unwrap_err();
+        assert!(e.status == 400 && e.message.contains("no known agent matches z.nobody"), "{}", e.message);
+        let p = a.post(&wa, &json!({ "to": "b.bob", "text": "for bob", "mode": "private" })).unwrap();
+        let env = next_env(&mut arx);
+        assert_eq!(env.keys.len(), 2, "writer's node and bob's node only");
+        assert!(env.open(&sa).unwrap().is_some() && env.open(&sb).unwrap().is_some());
+        assert!(env.open(&sc).unwrap().is_none());
+        assert!(c.ingest(env.clone()).unwrap().unwrap().text.is_none(), "C stores it unreadable");
+        let row = b.ingest(env).unwrap().unwrap();
+        assert!(row.visible_to("b.bob") && row.visible_to("a.alice") && !row.visible_to("b.eve"));
+        assert!(a.store.get(p.row.id, "a.other").unwrap().is_none(), "another agent on the writer's host cannot read it");
+        assert!(a.store.get(p.row.id, &other.name).unwrap().is_none());
+        assert!(a.store.get(p.row.id, "a.alice").unwrap().is_some());
+    }
+
+    #[test]
+    fn held_identities_get_certs_and_their_unsigned_posts_are_agent_signed() {
+        let (op, sa, sb) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let l = list(&op, &[("a", &sa, &[]), ("b", &sb, &[])], 1);
+        let (held, outside, revoked) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let ids = vec![
+            ("a.held".to_string(), held.clone()),
+            ("b.outside".to_string(), outside.clone()),
+            ("a.revoked".to_string(), revoked.clone()),
+        ];
+        let (a, mut rx) = node(&l, &op, &sa, ids);
+        a.revoke(&Revocation::sign(&sa, "a.revoked", &revoked.public(), &now_ts())).unwrap();
+        let issued = a.certify_held();
+        assert_eq!(issued.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["a.held"]);
+        assert!(matches!(rx.try_recv(), Ok(Outbound::Revocation(_))));
+        assert!(matches!(rx.try_recv(), Ok(Outbound::Cert(_))), "the new cert is announced");
+        assert!(a.certify_held().is_empty(), "once");
+        let who = a.verify(&token(&held, "a.held", &a)).unwrap();
+        let p = a.post(&who, &json!({ "to": "all", "text": "unsigned but held" })).unwrap();
+        assert_eq!(p.row.attest, "agent");
+        let env = next_env(&mut rx);
+        assert!(matches!(&env.attest, Attest::Agent { key, .. } if *key == fmt_key(&held.public())));
+        let (b, _) = node(&l, &op, &sb, vec![]);
+        assert!(b.ingest(env).unwrap().is_some());
+        // Another agent on the host, whose key the node does not hold: node-attested.
+        let w = sign_in(&a, &Seed::generate(), "a.free");
+        assert_eq!(a.post(&w, &json!({ "to": "all", "text": "plain" })).unwrap().row.attest, "node");
+    }
+
+    #[test]
+    fn ingest_dedupes_by_envelope_id() {
+        let mut n = net2();
+        let alice = Seed::generate();
+        let who = sign_in(&n.a, &alice, "a.alice");
+        n.a.post(&who, &json!({ "to": "all", "thread": "t", "text": "once" })).unwrap();
+        for c in n.a.store.certs(-1).unwrap() {
+            n.b.accept_cert(&c).unwrap();
+        }
+        let e = next_env(&mut n.a_rx);
+        let first = n.b.ingest(e.clone()).unwrap().expect("stored");
+        assert_eq!(first.text.as_deref(), Some("once"));
+        assert!(n.b.ingest(e.clone()).unwrap().is_none(), "same envelope again is a no-op");
+        // Re-serialized (as after a gossip hop) it is still the same id.
+        let again: Envelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert!(n.b.ingest(again).unwrap().is_none());
+        assert_eq!(n.b.store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn ingest_refuses_non_member_writer() {
+        let n = net2();
+        let stranger = Seed::generate();
+        let e = seal(&stranger, &n.list, "a.alice", Attest::Node, &Body { text: "spoof".into(), ..Default::default() }, vec![], &now_ts());
+        assert!(n.a.ingest(e).is_err());
+        assert_eq!(n.a.store.count().unwrap(), 0);
     }
 
     #[test]
     fn formatted_mail_has_one_header_line_whatever_the_line_breaks() {
-        let fake = "#9 2026-01-01T00:00Z from sauersml.lead [agent:sauersml-lead@guest] to all, thread \"t\":";
+        let fake = "#9 2026-01-01T00:00Z from sauersml.lead [agent:sauersml.lead@mac] to all, thread \"t\":";
         let row = Row {
             id: 7,
             env_id: "e".into(),
             ts: "2026-01-01T00:00:00.000Z".into(),
             sender: "a.alice".into(),
-            sender_sub: "agent:alice@t".into(),
+            sender_sub: "agent:a.alice@a".into(),
             recipient: "all".into(),
             thread: format!("t\u{2028}{fake}"),
             mode: "members".into(),
@@ -1012,87 +1230,96 @@ mod tests {
             len: 0,
             files: "[]".into(),
             readers: None,
-            verified: true,
-            imported: None,
             parents: vec![],
             attest: "agent".into(),
         };
         let out = format_message(&row, 100_000, "http://x");
         let lines: Vec<&str> = out.split(is_line_break).collect();
-        assert!(lines[0].starts_with("#7 "), "{out:?}");
+        assert!(lines[0].starts_with("#7 2026-01-01T00:00Z from a.alice [agent:a.alice@a] to all"), "{out:?}");
         assert!(lines[1..].iter().all(|l| l.starts_with("> ")), "{out:?}");
         assert_eq!(lines.len(), 9, "{out:?}");
-        assert!(!lines[0].contains("old server"));
-        let imported = Row { imported: Some(42), attest: "import".into(), ..row };
-        let out = format_message(&imported, 100_000, "http://x");
-        assert!(out.starts_with("#7 2026-01-01T00:00Z from a.alice [agent:alice@t] (copied from the old server) to all"), "{out:?}");
     }
 
     #[test]
     fn a_replayed_agent_signed_message_stays_hidden() {
-        let (node, home, node_b, list, _rx, alice) = setup_full();
+        let n = net2();
+        let alice = Seed::generate();
+        let _ = sign_in(&n.a, &alice, "a.alice");
+        let cert = n.a.store.certs_for("a.alice").pop().unwrap();
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]);
         let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
         let sig = mailcore::b64u(&alice.sign(st.as_bytes()));
         let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
-        let seal = |parents: Vec<String>, sig: String| {
-            Envelope::seal(
-                Draft {
-                    thread: "t",
-                    parents,
-                    ts: ts.clone(),
-                    from: "a.alice",
-                    to: "all",
-                    mode: Mode::Members,
-                    body: &body,
-                    blobs: vec![],
-                    attest: Attest::Agent { key: fmt_key(&alice.public()), digest: digest.clone(), sig },
-                    recipients: &list.all_keys(),
-                },
-                &node_b,
-            )
-            .unwrap()
-        };
-        let first = seal(vec![], sig.clone());
-        assert!(node.ingest(first.clone()).unwrap().is_some());
-        // node_b re-encrypts alice's signed message into a new envelope (new id, same signature).
-        let replay = seal(vec![first.id.clone()], sig.clone());
+        let at = |sig: String| Attest::Agent { key: cert.key.clone(), digest: digest.clone(), sig, cert: cert.clone() };
+        let first = seal(&n.a_seed, &n.list, "a.alice", at(sig.clone()), &body, vec![], &ts);
+        assert!(n.b.ingest(first.clone()).unwrap().is_some());
+        // Node A re-encrypts alice's signed message into a new envelope (new id, same signature).
+        let replay = seal(&n.a_seed, &n.list, "a.alice", at(sig.clone()), &body, vec![first.id.clone()], &ts);
         assert_ne!(replay.id, first.id);
-        assert!(node.ingest(replay.clone()).unwrap().is_none(), "the replay is not shown");
-        assert_eq!(node.store.count().unwrap(), 2, "but kept, so day hashes agree with peers that have it");
-        assert!(node.ingest(replay).unwrap().is_none());
-        let who = node.verify(&token(&home)).unwrap();
-        let (rows, _) = node.store.query(&crate::store::Query::default(), &who.name, MAX_TEXT).unwrap();
+        assert!(n.b.ingest(replay.clone()).unwrap().is_none(), "the replay is not shown");
+        assert_eq!(n.b.store.count().unwrap(), 2, "but kept, so day hashes agree with peers that have it");
+        assert!(n.b.ingest(replay).unwrap().is_none());
+        let (rows, _) = n.b.store.query(&crate::store::Query::default(), "b.bob", MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(node.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
+        assert!(n.b.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
         // The same signature in another base64 spelling is refused outright.
-        let padded = seal(vec![], format!("{sig}=="));
-        assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
+        let padded = seal(&n.a_seed, &n.list, "a.alice", at(format!("{sig}==")), &body, vec![], &ts);
+        assert!(n.b.ingest(padded).unwrap_err().to_string().contains("canonical"));
     }
 
     #[test]
-    fn resending_a_signed_post_returns_the_first_copy() {
-        let (node, home, _b, _l, _rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
-        let f = node.upload(&who, "a.txt", "text/plain", b"bytes").unwrap();
+    fn post_signs_stores_and_announces() {
+        let mut n = net2();
+        let who = sign_in(&n.a, &Seed::generate(), "a.alice");
+        let p = n.a.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
+        assert!(!p.repeated);
+        assert_eq!(next_env(&mut n.a_rx).id, p.row.env_id);
+        assert_eq!(p.row.attest, "node");
+        let p2 = n.a.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
+        assert!(p2.repeated, "identical resend is answered with the first");
+        let p3 = n.a.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
+        assert_eq!(next_env(&mut n.a_rx).parents, vec![p.row.env_id.clone()], "parents = thread heads");
+        assert!(p3.row.id > p.row.id);
+    }
+
+    #[test]
+    fn signed_post_path_and_resend() {
+        let mut n = net2();
+        let alice = Seed::generate();
+        let who = sign_in(&n.a, &alice, "a.alice");
+        let f = n.a.upload(&who, "a.txt", "text/plain", b"attached bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
-        let ts = now_ts();
         let post = json!({ "to": "all", "thread": "t", "text": "with file", "files": [id],
-                           "signed": signed(&alice, "all", "t", "with file", std::slice::from_ref(&id), &ts) });
-        let p1 = node.post(&who, &post).unwrap();
-        let p2 = node.post(&who, &post).unwrap();
-        assert!(!p1.repeated && p2.repeated);
-        assert_eq!(p1.row.env_id, p2.row.env_id);
-        assert_eq!(node.store.count().unwrap(), 1);
+                           "signed": signed(&alice, "a.alice", "all", "t", "with file", std::slice::from_ref(&id)) });
+        let p1 = n.a.post(&who, &post).unwrap();
+        assert_eq!(p1.row.attest, "agent");
+        let e = next_env(&mut n.a_rx);
+        assert!(matches!(&e.attest, Attest::Agent { cert, .. } if cert.name == "a.alice"));
+        assert_eq!(e.blobs, vec![id.clone()]);
+        let m = p1.row.to_message();
+        assert_eq!(m["files"][0]["id"], json!(id));
+        assert!(m["files"][0].get("key").is_none(), "blob key never shown");
+        let (_, bytes) = n.a.download(&id, &who).unwrap();
+        assert_eq!(bytes, b"attached bytes");
+        let p2 = n.a.post(&who, &post).unwrap();
+        assert!(p2.repeated && p2.row.env_id == p1.row.env_id);
+        // A signature by another key is refused.
+        let bad = json!({ "to": "all", "thread": "t", "text": "forged",
+                          "signed": signed(&Seed::generate(), "a.alice", "all", "t", "forged", &[]) });
+        assert_eq!(n.a.post(&who, &bad).unwrap_err().status, 401);
+        // The digest covers the attachments: a signature over another file list does not verify.
+        let other = json!({ "to": "all", "thread": "t", "text": "see", "files": [id],
+                            "signed": signed(&alice, "a.alice", "all", "t", "see", &[]) });
+        assert_eq!(n.a.post(&who, &other).unwrap_err().status, 401);
     }
 
     #[test]
     fn a_wrong_key_for_a_blob_does_not_shadow_the_real_one() {
-        let (node, home, node_b, list, _rx) = setup();
-        let alice = node.verify(&token(&home)).unwrap();
-        let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
+        let n = net2();
+        let alice = sign_in(&n.a, &Seed::generate(), "a.alice");
+        let f = n.a.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         // An earlier members-mode row (as a member node could write) naming alice's blob with a wrong key.
         let body = Body { text: "decoy".into(), ..Default::default() };
@@ -1101,217 +1328,36 @@ mod tests {
                 thread: "t",
                 parents: vec![],
                 ts: now_ts(),
-                from: "a.alice",
+                from: "b.mallory",
                 to: "all",
                 mode: Mode::Members,
                 body: &body,
                 blobs: vec![id.clone()],
-                attest: Attest::Aid1 { token: token(&home) },
-                recipients: &list.all_keys(),
+                attest: Attest::Node,
+                recipients: &n.list.node_keys(),
             },
-            &node_b,
+            &n.b_seed,
         )
         .unwrap();
-        let v = mailcore::Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let v = mailcore::Verified { sender_sub: "agent:b.mallory@b".into(), sender_kind: "agent".into(), attest: "node" };
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
-        node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis(), 1).unwrap().unwrap();
-        node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
-        // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
-        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), kind: "agent".into(), token: String::new(), exp_ms: i64::MAX, auth: "aid1" };
-        let (_, bytes) = node.download(&id, &bob).unwrap();
+        n.a.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
+        n.a.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
+        let bob = sign_in(&n.a, &Seed::generate(), "a.bob");
+        let (_, bytes) = n.a.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }
 
     #[test]
-    fn ingest_refuses_non_member_writer() {
-        let (node, home, _node_b, list, _rx) = setup();
-        let stranger = Seed::generate();
-        let e = envelope(&stranger, &list, &home, "spoof");
-        assert!(node.ingest(e).is_err());
-        assert_eq!(node.store.count().unwrap(), 0);
-    }
-
-    #[test]
-    fn post_signs_stores_and_announces() {
-        let (node, home, _node_b, _list, mut rx) = setup();
-        let who = node.verify(&token(&home)).unwrap();
-        let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
-        assert!(!p.repeated);
-        let out = env_of(rx.try_recv().expect("gossiped"));
-        assert_eq!(out.id, p.row.env_id);
-        assert_eq!(p.row.attest, "token");
-        let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
-        assert!(p2.repeated, "identical resend is answered with the first");
-        let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
-        assert_eq!(env_of(rx.try_recv().unwrap()).parents, vec![p.row.env_id.clone()], "parents = thread heads");
-        assert!(p3.row.id > p.row.id);
-    }
-
-    fn signed(alice: &Seed, to: &str, thread: &str, text: &str, files: &[String], ts: &str) -> Value {
-        let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, text, files);
-        let st = mailcore::envelope::post_statement("a.alice", to, thread, Mode::Members, ts, &digest);
-        json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(st.as_bytes())) })
-    }
-
-    #[test]
-    fn signed_post_path() {
-        let (node, home, _b, _l, mut rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
-        let ts = now_ts();
-        let p = node
-            .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&alice, "all", "t", "signed", &[], &ts) }))
-            .unwrap();
-        assert_eq!(p.row.attest, "agent");
-        let e = env_of(rx.try_recv().unwrap());
-        assert!(matches!(e.attest, Attest::Agent { .. }));
-        assert_eq!(e.ts, ts);
-        // A signature over other text, or by another key, is refused.
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&alice, "all", "t", "orig", &[], &ts) }));
-        assert_eq!(bad.err().unwrap().status, 401);
-        let mallory = Seed::generate();
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x", "signed": signed(&mallory, "all", "t", "x", &[], &ts) }));
-        assert_eq!(bad.err().unwrap().status, 401);
-        // Old timestamps are refused.
-        let old = ts_from_millis(now_millis() - 3_600_000);
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&alice, "all", "t", "y", &[], &old) }));
-        assert_eq!(bad.err().unwrap().status, 400);
-    }
-
-    #[test]
-    fn only_member_list_names_may_use_the_api() {
-        let (node, home, _b, _l, _rx, _alice) = setup_full();
-        assert!(node.verify(&token(&home)).is_ok());
-        let now = now_millis() as f64 / 1000.0;
-        let mint = |name: &str, sub: &str| {
-            mailcore::token::mint(
-                &home,
-                &mailcore::Aid1Payload {
-                    v: 1,
-                    iss: "h".into(),
-                    sub: sub.into(),
-                    kind: "agent".into(),
-                    name: name.into(),
-                    aud: "mail".into(),
-                    scopes: vec!["mail:use".into()],
-                    claims: None,
-                    iat: now,
-                    exp: now + 3600.0,
-                    jti: None,
-                },
-            )
-        };
-        assert_eq!(node.verify(&mint("a.mallory", "agent:mallory@t")).err().unwrap().status, 403, "not on the list");
-        assert_eq!(node.verify(&mint("a.alice", "agent:mallory@t")).err().unwrap().status, 403, "listed name, other sub");
-    }
-
-    #[test]
-    fn node_signs_for_a_caller_whose_key_it_holds() {
-        let (_n, home, node_b, list, _rx, alice) = setup_full();
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
-        let op = mailcore::keys::parse_key(&list.operator).unwrap();
-        let mk = |ids: Vec<(String, Seed)>| {
-            let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-            let (tx, rx) = mpsc::unbounded_channel();
-            let opts = Opts { id_floor: 1, public_url: "http://x".into(), identities: ids, ..Default::default() };
-            let node_seed = Seed::from_bytes(*node_b.bytes());
-            (Node::new(Store::open(&path).unwrap(), list.clone(), op, Some(policy.clone()), node_seed, opts, tx), rx)
-        };
-        // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
-        let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
-        let who = node.verify(&token(&home)).unwrap();
-        let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
-        assert_eq!(p.row.attest, "agent");
-        let e = env_of(rx.try_recv().unwrap());
-        assert!(matches!(e.attest, Attest::Agent { .. }));
-        assert!(!serde_json::to_string(&e).unwrap().contains(&who.token), "the token never enters the envelope");
-        let v = e.verify(&list, Some(&policy), now_millis()).unwrap();
-        assert_eq!(v.attest, "agent");
-        e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
-        // Holding a different key under alice's name: not hers on the member list, so the post stays token-attested.
-        let (node, mut rx) = mk(vec![("a.alice".into(), Seed::generate())]);
-        let who = node.verify(&token(&home)).unwrap();
-        assert_eq!(node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x" })).unwrap().row.attest, "token");
-        assert!(matches!(env_of(rx.try_recv().unwrap()).attest, Attest::Aid1 { .. }));
-    }
-
-    #[test]
-    fn attachments_roundtrip_and_signed_digest_covers_them() {
-        let (node, home, _b, _l, mut rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
-        let f = node.upload(&who, "a.txt", "text/plain", b"attached bytes").unwrap();
-        let id = f["id"].as_str().unwrap().to_string();
-        let ts = now_ts();
-        let p = node
-            .post(&who, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
-                                 "signed": signed(&alice, "all", "t", "see file", &[id.clone()], &ts) }))
-            .unwrap();
-        let e = env_of(rx.try_recv().unwrap());
-        assert_eq!(e.blobs, vec![id.clone()]);
-        let m = p.row.to_message();
-        assert_eq!(m["files"][0]["id"], json!(id));
-        assert!(m["files"][0].get("key").is_none(), "blob key never shown");
-        let (_, bytes) = node.download(&id, &who).unwrap();
-        assert_eq!(bytes, b"attached bytes");
-        assert!(node.download("0".repeat(64).as_str(), &who).is_err());
-    }
-
-    fn agent_token(seed: &Seed, aud: &mailcore::keys::PublicKey) -> String {
-        mailcore::agent_token::mint(seed, "a.alice", "agent:alice@t", aud, now_millis(), 600)
-    }
-
-    fn signed_body(alice: &Seed, text: &str) -> Value {
-        let ts = now_ts();
-        let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, text, &[]);
-        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
-        json!({ "to": "all", "thread": "t", "text": text,
-                "signed": { "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(st.as_bytes())) } })
-    }
-
-    #[test]
-    fn agent_tokens_work_once_and_only_on_their_node() {
-        let (node, _home, node_b, _list, mut rx, alice) = setup_full();
-        let me = node.seed.public();
-        let t = agent_token(&alice, &me);
-        let who = node.verify(&t).unwrap();
-        assert_eq!((who.name.as_str(), who.sub.as_str(), who.auth), ("a.alice", "agent:alice@t", "agent-token"));
-        assert!(who.token.is_empty(), "an agent token is not kept for envelopes");
-        let replay = node.verify(&t).err().unwrap();
-        assert!(replay.status == 401 && replay.message.contains("already used"), "{}", replay.message);
-        let other = node.verify(&agent_token(&alice, &node_b.public())).err().unwrap();
-        assert!(other.status == 401 && other.message.contains("another node"), "{}", other.message);
-        let forged = node.verify(&agent_token(&Seed::generate(), &me)).err().unwrap();
-        assert!(forged.status == 401 && forged.message.contains("signature"), "{}", forged.message);
-        let eve = Seed::generate();
-        let stranger = mailcore::agent_token::mint(&eve, "a.eve", "agent:eve@t", &me, now_millis(), 600);
-        assert_eq!(node.verify(&stranger).err().unwrap().status, 403, "not on the member list");
-
-        // This node does not hold alice's key: an unsigned post is refused, a post signed by her key goes out.
-        let who = node.verify(&agent_token(&alice, &me)).unwrap();
-        let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
-        assert_eq!(e.status, 400, "{}", e.message);
-        let p = node.post(&who, &signed_body(&alice, "signed")).unwrap();
-        assert_eq!(p.row.attest, "agent");
-        let env = env_of(rx.try_recv().unwrap());
-        assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
-    }
-
-    fn paseto_header() -> &'static str {
-        mailcore::paseto::HEADER
-    }
-
-    #[test]
-    fn node_without_home_takes_only_agent_tokens() {
-        let (node, home, _node_b, list, mut rx, alice) = setup_home(false);
-        let e = node.verify(&token(&home)).err().unwrap();
-        assert!(e.status == 401 && e.message.contains("only agent tokens"), "{}", e.message);
-        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let p = node.post(&who, &signed_body(&alice, "no home needed")).unwrap();
-        assert_eq!(p.row.attest, "agent");
-        let env = env_of(rx.try_recv().unwrap());
-        assert!(env.verify(&list, None, now_millis()).is_ok(), "agent-signed mail needs no home to check");
-        let (rows, _) = node.store.query(&crate::store::Query::default(), "a.alice", MAX_TEXT).unwrap();
-        assert!(rows.iter().any(|r| r.text.as_deref() == Some("no home needed")));
+    fn who_lists_live_certs_and_seen_names() {
+        let n = net2();
+        let k = Seed::generate();
+        let _ = sign_in(&n.a, &k, "a.k");
+        let (_, c) = n.b.certify(&proof(&Seed::generate(), "b.quiet", &n.b_seed.public())).unwrap();
+        n.a.accept_cert(&c).unwrap();
+        let names: Vec<String> = n.a.names_list("").unwrap().iter().map(|v| v["name"].as_str().unwrap().to_string()).collect();
+        assert!(names.contains(&"a.k".to_string()) && names.contains(&"b.quiet".to_string()), "{names:?}");
+        let quiet = n.a.names_list("b.").unwrap();
+        assert_eq!(quiet[0]["sub"], json!("agent:b.quiet@b"));
     }
 }

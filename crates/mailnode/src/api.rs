@@ -1,9 +1,9 @@
-//! The compat API on 127.0.0.1: the old server's routes and semantics (islandmail src/index.js) for /api/me,
-//! /api/messages, /api/threads, /api/names, /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket); POST/GET
-//! /api/files (encrypted, content-addressed blobs); POST /api/bridge/import for the history bridge; GET /api/node
-//! (no auth: this node's key, which agent tokens name as their audience). Bearer auth is an agent token (PASETO
-//! v4.public signed by the member's own key) or, while a home is pinned, the old server's aid1 token, both checked
-//! offline. Not here: the web reader, /login + session cookies.
+//! The node's HTTP API on 127.0.0.1, for this host's own processes: /api/me, /api/messages, /api/threads, /api/names,
+//! /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket); POST/GET /api/files (encrypted, content-addressed blobs).
+//! No auth: GET /api/node (this node's key, which agent tokens name as their audience, and this host's names),
+//! POST /api/agents (certify an agent key that proves itself) and POST /api/revocations (store and pass on a valid
+//! revocation). Every other route takes an agent token (PASETO v4.public signed by an agent key this node certified),
+//! checked offline. GET /api/agents lists every known certificate.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -67,7 +67,8 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(upload).layer(axum::extract::DefaultBodyLimit::max(crate::node::MAX_FILE + 1)),
         )
         .route("/api/files/{id}", get(download))
-        .route("/api/bridge/import", axum::routing::post(bridge_import))
+        .route("/api/agents", get(agents).post(certify))
+        .route("/api/revocations", axum::routing::post(revoke))
         .route("/mcpl", get(mcpl::handler))
         .fallback(|| async { ApiError::new(404, "no such endpoint") })
         .with_state(state)
@@ -96,7 +97,7 @@ pub fn params(raw: &Option<String>) -> HashMap<String, String> {
     m
 }
 
-/// The old server's intParam: Number(v) must be a safe non-negative integer ("" counts as 0, as in JS).
+/// A query number: Number(v) must be a safe non-negative integer ("" counts as 0, as in JS).
 fn int_param(p: &HashMap<String, String>, name: &str) -> Result<Option<i64>, ApiError> {
     let Some(v) = p.get(name) else { return Ok(None) };
     let v = v.trim();
@@ -122,16 +123,20 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
     })
 }
 
-/// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
+/// Public facts a client needs before it can sign in: the node key (an agent token's aud), this host's names (the
+/// namespace it certifies agents in) and which tokens it takes.
 async fn node_info(State(s): State<AppState>) -> Response {
-    let mut auth = vec!["agent-token"];
-    if s.node.policy.is_some() {
-        auth.push("aid1");
-    }
-    let network = s.node.members.read().unwrap().network.clone();
+    let (network, seq) = {
+        let m = s.node.members.read().unwrap();
+        (m.network.clone(), m.seq)
+    };
+    let entry = s.node.my_entry();
     json_resp(
-        json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": network,
-                "members_seq": s.node.members_seq(), "auth": auth,
+        json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()),
+                "name": entry.as_ref().map(|e| e.name.clone()).unwrap_or_default(),
+                "network": network, "members_seq": seq,
+                "names": entry.map(|e| e.namespace()).unwrap_or_default(),
+                "auth": ["agent-token"],
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",
                                  "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
         200,
@@ -140,18 +145,55 @@ async fn node_info(State(s): State<AppState>) -> Response {
 
 async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let who = caller(&s, &headers)?;
-    let island = match &s.node.policy {
-        Some(p) => p.iss.clone(),
-        None => s.node.members.read().unwrap().network.clone(),
-    };
+    let network = s.node.members.read().unwrap().network.clone();
     Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "island": island, "auth": who.auth,
+        json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "network": network, "auth": who.auth,
                 "last_id": s.node.store.last_id()?,
                 "node": mailcore::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
-                "features": ["signed-post", "private", "files", "agent-token"],
-                "refuse_token_only": s.node.opts.refuse_token_only }),
+                "features": ["signed-post", "private", "files", "agent-token", "certs"] }),
         200,
     ))
+}
+
+/// A JSON object body of at most 64 KiB, sent as application/json.
+fn json_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    if !ct.starts_with("application/json") {
+        return Err(ApiError::new(415, "send Content-Type: application/json"));
+    }
+    if body.len() > 64 * 1024 {
+        return Err(ApiError::new(413, "body is over 65536 bytes"));
+    }
+    let v: Value = serde_json::from_slice(body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
+    if !v.is_object() {
+        return Err(ApiError::new(400, "body must be a JSON object"));
+    }
+    Ok(v)
+}
+
+/// POST /api/agents {name, key, ts, sig}: 201 {cert} new, 200 {cert} already certified with this key.
+async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let v = json_body(&headers, &body)?;
+    let node = s.node.clone();
+    let (status, cert) = tokio::task::spawn_blocking(move || node.certify(&v))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "cert": cert }), status))
+}
+
+/// GET /api/agents: every known certificate {name, key, node, node_name, issued, revoked}.
+async fn agents(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    caller(&s, &headers)?;
+    Ok(json_resp(json!({ "agents": s.node.agents()? }), 200))
+}
+
+/// POST /api/revocations {v, name, key, node, ts, sig}: 200 {ok, new} once stored (and passed on when new).
+async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let v = json_body(&headers, &body)?;
+    let r: mailcore::Revocation =
+        serde_json::from_value(v).map_err(|e| ApiError::new(400, format!("not a revocation: {e}")))?;
+    let new = s.node.revoke(&r)?;
+    Ok(json_resp(json!({ "ok": true, "new": new }), 200))
 }
 
 async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
@@ -263,17 +305,6 @@ async fn download(
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
     Ok(r)
-}
-
-/// The history bridge: one old-server message in, kept under its old number. Only the configured bridge identity.
-async fn bridge_import(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
-    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
-    let node = s.node.clone();
-    let (row, existed) = tokio::task::spawn_blocking(move || node.import_old(&who, &v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    Ok(json_resp(json!({ "message": row.to_message(), "existed": existed }), if existed { 200 } else { 201 }))
 }
 
 fn sse_event(m: &Value) -> String {

@@ -1,4 +1,4 @@
-//! Ed25519 keys as the island writes them (`ed25519:<base64url of the 32 raw bytes>`), and the X25519 keys derived
+//! Ed25519 keys in their text form (`ed25519:<base64url of the 32 raw bytes>`), and the X25519 keys derived
 //! from them for encryption (the birational map for public keys; SHA-512 of the seed, clamped, for secrets).
 
 use anyhow::{anyhow, bail, Result};
@@ -116,7 +116,7 @@ mod tests {
         assert_eq!(ab.as_bytes(), ba.as_bytes());
         assert_eq!(Seed::from_hex(&a.to_hex()).unwrap().public(), a.public());
         assert!(!format!("{a:?}").contains(&a.to_hex()));
-        // 64 bytes but not ASCII (an identity file in identities_dir is read at start): an error, not a panic.
+        // 64 bytes but not ASCII (a hand-edited seed file): an error, not a panic.
         assert!(Seed::from_hex(&format!("0{}0", "é".repeat(31))).is_err());
         assert!(Seed::from_hex(&"é".repeat(32)).is_err());
     }

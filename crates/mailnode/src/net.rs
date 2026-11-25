@@ -1,10 +1,11 @@
-//! Replication over iroh. One gossip topic carries every new envelope (and every newly adopted member list);
-//! anti-entropy (a small request/response protocol on its own ALPN) runs with each member node on every gossip
-//! NeighborUp and every `sync_secs`: exchange member lists (the newest operator-signed one wins), compare per-day hashes
-//! of envelope-id sets, list ids of the days that differ, fetch the missing envelopes, then fetch attachment blobs
-//! referenced by stored envelopes and not yet here, then ask for grants (the content key re-wrapped for this node) for
-//! members-mode envelopes written before this node joined the list. Only member nodes may connect at all (an after-handshake hook
-//! checks the current member list), since envelopes carry sender tokens.
+//! Replication over iroh. One gossip topic carries every new envelope, agent certificate and revocation (and every
+//! newly adopted member list); anti-entropy (a small request/response protocol on its own ALPN) runs with each member
+//! node on every gossip NeighborUp and every `sync_secs`: exchange member lists (the newest operator-signed one wins),
+//! fetch every certificate and revocation the peer knows (before any envelope, since a node-attested envelope needs
+//! its sender's certificate), compare per-day hashes of envelope-id sets, list ids of the days that differ, fetch the
+//! missing envelopes, then fetch attachment blobs referenced by stored envelopes and not yet here, then ask for grants
+//! (the content key re-wrapped for this node) for members-mode envelopes written before this node joined the list.
+//! Only member nodes may connect at all (an after-handshake hook checks the current member list).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -22,12 +23,13 @@ use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use mailcore::keys::parse_key;
-use mailcore::{Envelope, MemberList};
+use mailcore::{Cert, Envelope, MemberList, Revocation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::node::{Node, Outbound};
+use crate::store::SYNC_CAP;
 
 pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/1";
 const MAX_GOSSIP: usize = 1 << 20;
@@ -51,6 +53,8 @@ enum Req {
     Blob { id: String },
     /// Content keys re-wrapped for the asking node, for members-mode envelopes it stored before it joined.
     Grants { ids: Vec<String> },
+    /// Every certificate and revocation the peer knows (at most SYNC_CAP of each).
+    Certs,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -67,6 +71,10 @@ struct Resp {
     blob: Option<String>,
     #[serde(default)]
     grants: BTreeMap<String, mailcore::envelope::Grant>,
+    #[serde(default)]
+    certs: Vec<Cert>,
+    #[serde(default)]
+    revocations: Vec<Revocation>,
     /// For `get`: how many of the requested ids this answer covers (the rest did not fit; ask again for them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taken: Option<usize>,
@@ -177,6 +185,10 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             let ids: Vec<String> = ids.into_iter().take(GRANTS_PER_CALL).collect();
             r.grants = node.grants_for(&ids, peer)?;
         }
+        Req::Certs => {
+            r.certs = node.store.certs(SYNC_CAP)?;
+            r.revocations = node.store.revocations(SYNC_CAP)?;
+        }
     }
     Ok(serde_json::to_vec(&r)?)
 }
@@ -195,6 +207,28 @@ fn get_within(node: &Node, ids: &[String], budget: usize) -> Result<(Vec<String>
         }
     }
     Ok((out, ids.len()))
+}
+
+/// Stores the certificates and revocations of a `certs` answer that verify against the current member list (a
+/// certificate from a node not on it, or for a name outside its node's namespace, is dropped). Returns how many of
+/// each were new here.
+fn take_certs(node: &Node, certs: Vec<Cert>, revocations: Vec<Revocation>, from: &str) -> (usize, usize) {
+    let (mut nc, mut nr) = (0, 0);
+    for c in certs.into_iter().take(SYNC_CAP as usize) {
+        match node.accept_cert(&c) {
+            Ok(true) => nc += 1,
+            Ok(false) => {}
+            Err(e) => tracing::debug!("sync from {from}: certificate for {:?} refused: {e:#}", c.name),
+        }
+    }
+    for r in revocations.into_iter().take(SYNC_CAP as usize) {
+        match node.accept_revocation(&r) {
+            Ok(true) => nr += 1,
+            Ok(false) => {}
+            Err(e) => tracing::debug!("sync from {from}: revocation for {:?} refused: {e:#}", r.name),
+        }
+    }
+    (nc, nr)
 }
 
 async fn call(conn: &Connection, req: &Req) -> Result<Resp> {
@@ -284,6 +318,14 @@ impl Ctx {
                 Err(e) => tracing::warn!("member list from {} refused: {e:#}", peer.fmt_short()),
             }
         }
+        // Certificates and revocations before envelopes: a node-attested envelope is refused until its sender's
+        // certificate is here, and a revoked key's envelopes must not slip in first.
+        let resp = call(&conn, &Req::Certs).await?;
+        let (n2, from) = (node.clone(), peer.fmt_short().to_string());
+        let (nc, nr) = tokio::task::spawn_blocking(move || take_certs(&n2, resp.certs, resp.revocations, &from)).await?;
+        if nc + nr > 0 {
+            tracing::info!("sync from {}: {nc} new certificates, {nr} new revocations", peer.fmt_short());
+        }
         let theirs = call(&conn, &Req::Days).await?.days;
         let n2 = node.clone();
         let mine = tokio::task::spawn_blocking(move || n2.store.day_hashes()).await??;
@@ -291,8 +333,8 @@ impl Ctx {
         let mut added = 0;
         for days in differ.chunks(100) {
             let ids = call(&conn, &Req::Ids { days: days.to_vec() }).await?.ids;
-            // Day by day, oldest first, each day's envelopes in time order (imports by old number), so local numbers
-            // follow time and imported history keeps its old numbers on a node catching up from empty.
+            // Day by day, oldest first, each day's envelopes in time order, so local numbers follow time on a node
+            // catching up from empty.
             for day_ids in ids.into_values() {
                 let mut missing = Vec::new();
                 for id in day_ids {
@@ -318,13 +360,7 @@ impl Ctx {
                         }
                     }
                 }
-                envs.sort_by(|a, b| {
-                    let old = |e: &Envelope| match &e.attest {
-                        mailcore::Attest::Import { old_id, .. } => *old_id,
-                        _ => u64::MAX,
-                    };
-                    (old(a), &a.ts, &a.id).cmp(&(old(b), &b.ts, &b.id))
-                });
+                envs.sort_by(|a, b| (&a.ts, &a.id).cmp(&(&b.ts, &b.id)));
                 for e in envs {
                     match node.ingest(e) {
                         Ok(Some(_)) => added += 1,
@@ -418,7 +454,8 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
     let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender, gate };
 
-    // Gossip in: envelopes and member lists; NeighborUp starts anti-entropy with that neighbor.
+    // Gossip in: envelopes, certificates, revocations and member lists; NeighborUp starts anti-entropy with that
+    // neighbor.
     let c = ctx.clone();
     tokio::spawn(async move {
         while let Some(ev) = receiver.next().await {
@@ -431,6 +468,31 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
                             continue;
                         }
                     };
+                    match v.get("gossip").and_then(|t| t.as_str()) {
+                        Some("cert") => {
+                            let r = serde_json::from_value::<Cert>(v["cert"].clone())
+                                .map_err(anyhow::Error::from)
+                                .and_then(|x| c.node.accept_cert(&x));
+                            if let Err(e) = r {
+                                tracing::warn!("gossip: certificate refused: {e:#}");
+                            }
+                            continue;
+                        }
+                        Some("revocation") => {
+                            let r = serde_json::from_value::<Revocation>(v["revocation"].clone())
+                                .map_err(anyhow::Error::from)
+                                .and_then(|x| c.node.accept_revocation(&x));
+                            if let Err(e) = r {
+                                tracing::warn!("gossip: revocation refused: {e:#}");
+                            }
+                            continue;
+                        }
+                        Some(other) => {
+                            tracing::debug!("gossip: unknown message kind {other:?}");
+                            continue;
+                        }
+                        None => {}
+                    }
                     if v.get("operator").is_some() && v.get("nodes").is_some() {
                         match serde_json::from_value::<MemberList>(v).map_err(anyhow::Error::from).and_then(|l| c.node.adopt_members(&l)) {
                             Ok(true) => {
@@ -481,12 +543,12 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
         }
     });
 
-    // Gossip out: every envelope this node writes, and member lists it adopts.
+    // Gossip out: every envelope this node writes, every certificate it issues and revocation it learns first, and
+    // member lists it adopts. Certificates and revocations are tagged {"gossip": "cert"|"revocation", …}.
     let c = ctx.clone();
     tokio::spawn(async move {
         while let Some(out) = outbound.recv().await {
-            let Outbound::Envelope(env) = &out;
-            let Ok(bytes) = serde_json::to_vec(env) else { continue };
+            let Ok(bytes) = gossip_bytes(&out) else { continue };
             if bytes.len() > MAX_GOSSIP {
                 continue; // anti-entropy carries it
             }
@@ -527,36 +589,59 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     Ok(Net { endpoint, router })
 }
 
+/// The gossip message for something this node announces.
+fn gossip_bytes(out: &Outbound) -> Result<Vec<u8>> {
+    Ok(match out {
+        Outbound::Envelope(env) => serde_json::to_vec(env)?,
+        Outbound::Cert(cert) => serde_json::to_vec(&serde_json::json!({ "gossip": "cert", "cert": cert }))?,
+        Outbound::Revocation(r) => serde_json::to_vec(&serde_json::json!({ "gossip": "revocation", "revocation": r }))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{Node, Opts};
-    use crate::store::Store;
+    use crate::testutil::{list, node, proof};
     use mailcore::envelope::Draft;
-    use mailcore::keys::{fmt_key, Seed};
-    use mailcore::{Attest, Body, Mode, NodeEntry, TokenPolicy, Verified};
+    use mailcore::keys::Seed;
+    use mailcore::{Attest, Body, KnownCerts, Mode, Verified};
+
+    #[test]
+    fn certs_answers_carry_only_what_verifies() {
+        let (op, sa, sb) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let l = list(&op, &[("a", &sa, &[]), ("b", &sb, &[])], 1);
+        let (a, _) = node(&l, &op, &sa, vec![]);
+        let (b, _) = node(&l, &op, &sb, vec![]);
+        let k = Seed::generate();
+        a.certify(&proof(&k, "a.k", &sa.public())).unwrap();
+        let r = Revocation::sign(&sa, "a.k", &k.public(), &mailcore::now_ts());
+        a.revoke(&r).unwrap();
+        // A's answer to `certs`, as B receives it, plus a cert from a non-member and a cross-namespace one.
+        let resp: Resp = serde_json::from_slice(&answer(&a, &sb.public(), br#""certs""#).unwrap()).unwrap();
+        let mut certs = resp.certs;
+        assert_eq!((certs.len(), resp.revocations.len()), (1, 1));
+        certs.push(Cert::issue(&Seed::generate(), "a.rogue", &Seed::generate().public(), &mailcore::now_ts()));
+        certs.push(Cert::issue(&sb, "a.cross", &Seed::generate().public(), &mailcore::now_ts()));
+        let mut revs = resp.revocations;
+        revs.push(Revocation::sign(&sb, "a.k", &k.public(), &mailcore::now_ts()));
+        assert_eq!(take_certs(&b, certs.clone(), revs.clone(), "a"), (1, 1));
+        assert_eq!(take_certs(&b, certs, revs, "a"), (0, 0), "nothing new the second time");
+        assert_eq!(b.store.certs(-1).unwrap().len(), 1);
+        assert!(b.store.revoked(&b.store.certs(-1).unwrap()[0]));
+        // Gossip tags keep certificates and revocations apart from envelopes and member lists.
+        let g: serde_json::Value =
+            serde_json::from_slice(&gossip_bytes(&Outbound::Revocation(r)).unwrap()).unwrap();
+        assert_eq!(g["gossip"], "revocation");
+        assert!(g.get("operator").is_none() && g.get("attest").is_none());
+    }
 
     #[test]
     fn get_answers_stay_within_the_byte_budget() {
-        let (op, home, me) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let mut list = MemberList {
-            v: 1,
-            network: "t".into(),
-            seq: 1,
-            issued: mailcore::now_ts(),
-            operator: String::new(),
-            members: vec![],
-            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![] }],
-            bridges: vec![],
-            sig: String::new(),
-        };
-        list.sign(&op);
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
-        let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let recipients = list.all_keys();
-        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), Some(policy), me, Opts::default(), tx);
-        let v = Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let (op, me) = (Seed::generate(), Seed::generate());
+        let l = list(&op, &[("n", &me, &[])], 1);
+        let recipients = l.node_keys();
+        let (node, _rx) = node(&l, &op, &me, vec![]);
+        let v = Verified { sender_sub: "agent:n.x@n".into(), sender_kind: "agent".into(), attest: "node" };
         let mut ids = Vec::new();
         for i in 0..5 {
             let body = Body { text: format!("{i}").repeat(10_000), ..Default::default() };
@@ -565,18 +650,18 @@ mod tests {
                     thread: "t",
                     parents: vec![],
                     ts: mailcore::now_ts(),
-                    from: "a.x",
+                    from: "n.x",
                     to: "all",
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Aid1 { token: "aid1.x.y".into() },
+                    attest: Attest::Node,
                     recipients: &recipients,
                 },
                 &node.seed,
             )
             .unwrap();
-            node.store.insert(&e, &v, Some("x"), "[]", None, 0, 1).unwrap().unwrap();
+            node.store.insert(&e, &v, Some("x"), "[]", None, 0).unwrap().unwrap();
             ids.push(e.id);
         }
         ids.insert(2, "0".repeat(64)); // one id the peer does not have
@@ -594,6 +679,5 @@ mod tests {
         assert_eq!((got.len(), taken), (1, 1));
         let (got, taken) = get_within(&node, &ids, usize::MAX).unwrap();
         assert_eq!((got.len(), taken), (5, 6));
-        let _ = std::fs::remove_file(path);
     }
 }

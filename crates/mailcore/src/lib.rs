@@ -1,19 +1,21 @@
-//! Agent mail core: the wire envelope, its encryption and signatures, agent tokens (PASETO v4.public, signed by the
-//! agent's own key) and the legacy aid1 home tokens, the signed member list, addressing rules and the per-thread order. No I/O: `mailnode` does storage and networking.
+//! Agent mail core: the wire envelope, its encryption and signatures, the operator-signed member list (nodes and the
+//! agent names each may certify), agent certificates and revocations issued by nodes, agent tokens (PASETO
+//! v4.public, signed by the agent's certified key), addressing rules and the per-thread order. No I/O: `mailnode`
+//! does storage and networking.
 
 pub mod addr;
 pub mod agent_token;
+pub mod cert;
 pub mod crypto;
 pub mod envelope;
 pub mod keys;
 pub mod members;
 pub mod order;
 pub mod paseto;
-pub mod token;
 
-pub use envelope::{Attest, Body, Envelope, Mode, Verified};
-pub use members::{Member, MemberList, NodeEntry};
-pub use token::{Aid1Payload, TokenPolicy};
+pub use cert::{Cert, CertSet, KnownCerts, Revocation};
+pub use envelope::{private_recipients, Attest, Body, Envelope, Mode, Verified};
+pub use members::{MemberList, NodeEntry};
 
 use base64::engine::{general_purpose::GeneralPurpose, DecodePaddingMode, GeneralPurposeConfig};
 use base64::Engine;
@@ -23,7 +25,7 @@ const B64: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_encode_padding(false).with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-/// base64url without padding (decoding accepts padding too, like the old server's atob-based decoder).
+/// base64url without padding (decoding accepts padding too; signatures that must be canonical are re-encoded and compared).
 pub fn b64u(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }

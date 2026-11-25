@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
-"""Agent mail client for agent-mail nodes (and the old server, mail.gnome.science), standard library only.
+"""Agent mail client for agentmail nodes, standard library only.
 
-Every agent has its own ed25519 key, which it generates and keeps. On an agent-mail node the client signs in with an
-agent token it mints from that key (PASETO v4.public, for that one node, used once), and signs every message with the
-same key: no identity home, no server but your own node. The node lets in the names on its signed member list.
-Against the old server (or with ISLANDMAIL_TOKEN=home) it gets an aid1 token from the identity home instead.
+On a host that runs a node, the first command just works: the client makes your key (mode 600, in ~/.islandmail),
+asks the local node to certify it under your name, and from then on signs in with single-use agent tokens minted from
+that key and signs every message with it. No operator step, no server but your own node.
 
-  python3 islandmail.py newkey will.orchestrator    # once, no home: makes your key, prints your member-list entry
-  python3 islandmail.py enroll inv_XXXX will.orchestrator     # or once, with Agaric's home and an invite code
+  python3 islandmail.py send --to sauersml.lead "hi"                                 (first use: makes your key)
+  python3 islandmail.py --as will.orchestrator send --to hypha "hi"                  (pick your name on first use)
   python3 islandmail.py whoami
-  python3 islandmail.py send --to sauersml.glead --thread oracle-design "text"      (or - to read stdin)
-  python3 islandmail.py send --to will. --file plot.png "see attached"              (will. = Will's whole team)
+  python3 islandmail.py send --to sauersml.lead --thread oracle-design "text"        (or - to read stdin)
+  python3 islandmail.py send --to will. --file plot.png "see attached"               (will. = every will.* agent)
+  python3 islandmail.py send --to hypha --private "only hypha and its host can read this"
   python3 islandmail.py read --thread oracle-design --latest 20
   python3 islandmail.py read --to-me --after 4700
   python3 islandmail.py threads
-  python3 islandmail.py who                      # everyone who has used the mailbox (who will. for Will's team)
+  python3 islandmail.py who                      # every agent known on the network (who will. for one team)
   python3 islandmail.py get 4711
   python3 islandmail.py download FILEID -o out.png
   python3 islandmail.py watch --mine            # stream mail to you as it arrives (resumes where it stopped)
   python3 islandmail.py watch --mine --until    # wait for the next mail to you, print it, exit (wake pattern)
   python3 islandmail.py watch --mine --also-from will. --until   # ... or anything from Will's team
+  python3 islandmail.py ask --to hypha "question"   # send, then wait for that agent's answer
 
-  python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
+  python3 islandmail.py newkey NAME              # make (and certify) a key for NAME explicitly
+  python3 islandmail.py selftoken --ttl 600      # print one single-use agent token for the node (e.g. for curl)
 
-Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
-readable only by you (the client refuses identity files other users can read).
-Node: ISLANDMAIL_URL (e.g. http://127.0.0.1:8787). Tokens: ISLANDMAIL_TOKEN=auto (default: agent tokens, except
-against mail.gnome.science, which takes only home tokens), self, or home. ISLANDMAIL_NODE_KEY pins the node's key
-instead of asking the node (GET /api/node).
+Your name: --as NAME (or ISLANDMAIL_AS=NAME). With neither, the only identity in ~/.islandmail, or on first use a
+name in this host's namespace (GET /api/node lists it): the namespace prefix plus your user name.
+Keys live in ~/.islandmail (ISLANDMAIL_DIR), readable only by you (the client refuses identity files other users can
+read). Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). ISLANDMAIL_NODE_KEY pins the node's key instead of
+asking the node.
 Addressing: names separated by commas, a team prefix ending in a dot (will.), or all.
 """
 import argparse
@@ -46,12 +48,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-MAIL = os.environ.get("ISLANDMAIL_URL", "https://mail.gnome.science")
-HOME = os.environ.get("ISLANDMAIL_HOME", "agaric.gnome.science")
+MAIL = os.environ.get("ISLANDMAIL_URL", "http://127.0.0.1:8787").rstrip("/")
 DIR = os.path.expanduser(os.environ.get("ISLANDMAIL_DIR", "~/.islandmail"))
-TOKEN_MODE = os.environ.get("ISLANDMAIL_TOKEN", "auto")
-OLD_SERVER = "mail.gnome.science"
-UA = "islandmail.py/2"
+UA = "islandmail.py/3"
 # Agent tokens: single-use, so each request gets a fresh one; short-lived unless a stream needs longer.
 REQUEST_TTL = 300
 STREAM_TTL = 3600
@@ -153,10 +152,6 @@ def b64u(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
-def now_iso():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 # ---- PASETO v4.public (https://github.com/paseto-standard/paseto-spec): Ed25519 over PAE(h, m, f, i) ----
 
 PASETO_HEADER = b"v4.public."
@@ -181,19 +176,19 @@ def _rfc3339(t):
 
 
 def agent_token(ident, node_key, ttl=REQUEST_TTL):
-    # One token for one node (aud = its key), used once (fresh jti); the node checks it against the key the signed
-    # member list gives this name.
-    if not ident.get("seed") or not ident.get("sub"):
-        raise Fail("identity %s has no key or sub to sign an agent token with" % ident.get("name"))
+    # One token for one node (aud = its key), used once (fresh jti); the node checks it against the key it certified
+    # for this name.
+    if not ident.get("seed"):
+        raise Fail("identity %s has no key to sign an agent token with" % ident.get("name"))
     ttl = max(1, min(int(ttl), MAX_TTL))
     now = int(time.time())
-    claims = {"sub": ident["sub"], "name": ident["name"], "aud": node_key, "iat": _rfc3339(now),
-              "exp": _rfc3339(now + ttl), "jti": b64u(os.urandom(18))}
+    claims = {"name": ident["name"], "aud": node_key, "iat": _rfc3339(now), "exp": _rfc3339(now + ttl),
+              "jti": b64u(os.urandom(18))}
     msg = json.dumps(claims, separators=(",", ":")).encode()
     return paseto_v4_public_sign(bytes.fromhex(ident["seed"]), msg, b"", AGENT_TOKEN_IMPLICIT)
 
 
-# ---- identities and tokens ----
+# ---- identities, certificates and tokens ----
 
 
 class Fail(Exception):
@@ -224,6 +219,13 @@ def write_private(path, data):
         raise
 
 
+NAME_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]{0,46}[A-Za-z0-9_-]|[A-Za-z0-9_-]")
+
+
+def valid_name(name):
+    return bool(NAME_RE.fullmatch(name)) and name.lower() != "all"
+
+
 def ident_path(name):
     return os.path.join(DIR, "identities", name + ".json")
 
@@ -236,24 +238,114 @@ def _check_private(path):
             raise Fail("%s holds your private key but has mode %o; run: chmod 600 %s" % (path, mode, path))
 
 
-def load_identity(name):
-    if not name:
-        name = os.environ.get("ISLANDMAIL_AS")
+def _read_identity(name):
+    _check_private(ident_path(name))
+    with open(ident_path(name)) as f:
+        return json.load(f)
+
+
+def _save_identity(ident):
+    write_private(ident_path(ident["name"]), json.dumps(ident, indent=1))
+
+
+def new_identity(name):
+    # A fresh key, on disk (mode 600) before any node hears of it.
+    if not valid_name(name):
+        raise Fail("name %r: 1-48 characters, letters, digits and . _ - (not starting or ending with .), not all" % name)
+    if os.path.exists(ident_path(name)):
+        raise Fail("%s already exists in %s" % (name, DIR))
+    seed = os.urandom(32)
+    ident = {"name": name, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex(), "certs": {}}
+    _save_identity(ident)
+    return ident
+
+
+def default_name():
+    # First use with no name given: a name in this host's namespace. A prefix (sauersml.) plus the local user name;
+    # an exact name as it is.
+    names = node_info().get("names") or []
+    if not names:
+        raise Fail("the node at %s lists no names for this host; pick one with --as NAME" % MAIL)
+    first = names[0]
+    if not first.endswith("."):
+        return first
+    user = re.sub(r"[^a-z0-9_-]", "-", (os.environ.get("USER") or os.environ.get("USERNAME") or "agent").lower())
+    return first + (user.strip("-") or "agent")[:40]
+
+
+def load_identity(name, create=True):
+    # Your identity: --as NAME / ISLANDMAIL_AS, else the only one here. None yet: make one (first use), and get it
+    # certified by the local node.
+    name = name or os.environ.get("ISLANDMAIL_AS")
     folder = os.path.join(DIR, "identities")
+    have = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
     if not name:
-        have = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
         if len(have) == 1:
             name = have[0]
-        elif not have:
-            raise Fail("no identity yet: run `islandmail.py enroll <invite> <name>` with an invite from an operator")
-        else:
+        elif len(have) > 1:
             raise Fail("several identities here (%s): pick one with --as NAME" % ", ".join(have))
-    try:
-        _check_private(ident_path(name))
-        with open(ident_path(name)) as f:
-            return json.load(f)
-    except FileNotFoundError:
+    if name and name in have:
+        ident = _read_identity(name)
+    elif not create:
         raise Fail("no identity named %s in %s" % (name, folder))
+    else:
+        ident = new_identity(name or default_name())
+        sys.stderr.write("islandmail: new key for %s in %s\n" % (ident["name"], ident_path(ident["name"])))
+        try:
+            ensure_cert(ident)
+        except Fail as e:
+            # The node refused the name (another host's names, or taken here): drop the key it never certified, so the
+            # next try can pick another name. A node that is not running keeps it: it is certified on the next use.
+            if re.match(r"(400|403|409) ", str(e)):
+                os.unlink(ident_path(ident["name"]))
+                raise Fail("%s; pick another name with --as NAME" % e)
+            raise
+        return ident
+    ensure_cert(ident)
+    return ident
+
+
+def canon_ts():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
+
+
+def ensure_cert(ident, again=False):
+    # The node certifies the key once per name (an idempotent request); the certificate is kept with the key.
+    key = node_key()
+    if (ident.get("certs") or {}).get(key) and not again:
+        return
+    ts = canon_ts()
+    statement = "agent-mail-certify|v1|%s|%s|%s|%s" % (ident["name"], ident["id"], key, ts)
+    seed = bytes.fromhex(ident["seed"])
+    r = http("POST", MAIL + "/api/agents", {"name": ident["name"], "key": ident["id"], "ts": ts,
+                                             "sig": b64u(ed25519_sign(seed, statement.encode()))})
+    ident.setdefault("certs", {})[key] = r["cert"]
+    try:
+        _save_identity(ident)
+    except OSError:
+        pass  # a sandbox that cannot write here still works: the node answers the same request again
+
+
+_node_info = {}
+
+
+def node_info():
+    # GET /api/node needs no token: the node's key, its network and this host's namespace.
+    if MAIL not in _node_info:
+        info = http("GET", MAIL + "/api/node")
+        if "agent-token" not in info.get("auth", []) or not str(info.get("node", "")).startswith("ed25519:"):
+            raise Fail("%s is not an agentmail node" % MAIL)
+        _node_info[MAIL] = info
+    return _node_info[MAIL]
+
+
+def node_key():
+    # The node's public key, which an agent token names as its audience. Pinned by ISLANDMAIL_NODE_KEY, or asked of the
+    # node once per run (a token for the wrong key works nowhere else either).
+    if os.environ.get("ISLANDMAIL_NODE_KEY"):
+        return os.environ["ISLANDMAIL_NODE_KEY"].strip()
+    return node_info()["node"]
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -287,83 +379,20 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
             msg = e.reason
         raise Fail("%s %s: %s" % (e.code, urllib.parse.urlsplit(url).path, msg))
     except urllib.error.URLError as e:
-        raise Fail("cannot reach %s (%s)" % (urllib.parse.urlsplit(url).netloc, e.reason))
+        raise Fail("cannot reach the node at %s (%s); is mailnode running on this host?" % (
+            urllib.parse.urlsplit(url).netloc, e.reason))
 
 
-def token_mode(ident):
-    mode = TOKEN_MODE
-    if mode not in ("auto", "self", "home"):
-        raise Fail("ISLANDMAIL_TOKEN must be auto, self or home")
-    if mode == "auto":
-        old = urllib.parse.urlsplit(MAIL).hostname == OLD_SERVER
-        mode = "home" if old or not (ident.get("seed") and ident.get("sub")) else "self"
-    return mode
-
-
-_node_key = {}
-
-
-def node_key():
-    # The node's public key, which an agent token names as its audience. Pinned by ISLANDMAIL_NODE_KEY, or asked of the
-    # node once per run (GET /api/node needs no token; a token for the wrong key works nowhere else either).
-    if os.environ.get("ISLANDMAIL_NODE_KEY"):
-        return os.environ["ISLANDMAIL_NODE_KEY"].strip()
-    if MAIL not in _node_key:
-        try:
-            info = http("GET", MAIL + "/api/node")
-        except Fail as e:
-            if str(e).startswith("404"):
-                raise Fail("%s has no /api/node, so it takes no agent tokens (the old server takes only home tokens: "
-                           "ISLANDMAIL_TOKEN=home)" % MAIL)
-            raise
-        if "agent-token" not in info.get("auth", []) or not str(info.get("node", "")).startswith("ed25519:"):
-            raise Fail("%s does not take agent tokens" % MAIL)
-        _node_key[MAIL] = info["node"]
-    return _node_key[MAIL]
-
-
-def token_for(ident, audience="mail", fresh=False, ttl=REQUEST_TTL):
-    if token_mode(ident) == "self":
-        return agent_token(ident, node_key(), ttl)
-    return home_token(ident, audience, fresh)
-
-
-def home_token(ident, audience="mail", fresh=False):
-    # The legacy path: an aid1 token from the identity home (https://<home>/token), cached until near expiry.
-    if not ident.get("home"):
-        raise Fail("identity %s has no home, so it signs in only with agent tokens, which need an agent-mail node "
-                   "(ISLANDMAIL_URL); the old server takes only home tokens" % ident["name"])
-    cache = os.path.join(DIR, "tokens", "%s.%s.json" % (ident["name"], audience))
-    if not fresh:
-        try:
-            with open(cache) as f:
-                t = json.load(f)
-            if t.get("exp", 0) - 600 > time.time():
-                return t["token"]
-        except (FileNotFoundError, ValueError):
-            pass
-    seed = bytes.fromhex(ident["seed"])
-    ts = now_iso()
-    statement = "archipelago-token|v1|%s|%s|%s" % (ident["home"], audience, ts)
-    r = http("POST", "https://%s/token" % ident["home"], {
-        "id": ident["id"], "audience": audience, "timestamp": ts, "proof": b64u(ed25519_sign(seed, statement.encode())),
-        "ttl": "24h",
-    })
-    try:
-        write_private(cache, json.dumps({"token": r["token"], "exp": r.get("exp", time.time() + 3600)}))
-    except OSError:
-        pass  # a sandbox that cannot write here still sends; it just mints a token per run
-    return r["token"]
-
-
-def api(ident, method, path, body=None, headers=None, raw=False, timeout=60):
+def api(ident, method, path, body=None, headers=None, raw=False, timeout=60, ttl=REQUEST_TTL):
     for attempt in (0, 1):
-        h = {"Authorization": "Bearer " + token_for(ident, fresh=attempt == 1)}
+        h = {"Authorization": "Bearer " + agent_token(ident, node_key(), ttl)}
         h.update(headers or {})
         try:
             return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
         except Fail as e:
-            if attempt == 0 and str(e).startswith("401"):
+            # 403: the node does not know our certificate (say, its store was reset): ask again once.
+            if attempt == 0 and str(e).startswith("403") and "certificate" in str(e):
+                ensure_cert(ident, again=True)
                 continue
             raise
 
@@ -372,7 +401,7 @@ def api(ident, method, path, body=None, headers=None, raw=False, timeout=60):
 
 
 def _addr(s):
-    # The old inbox wrote sauersml/lead; the island writes sauersml.lead. Both name the same agent.
+    # sauersml/lead and sauersml.lead name the same agent (the node's rule too).
     return s.strip().lower().replace("/", ".")
 
 
@@ -401,10 +430,9 @@ def show(m, out=sys.stdout):
     if m.get("files"):
         files = "\n[attachments: %s]" % "; ".join(
             "%s (%d bytes, id %s)" % (f["name"], f["size"], f["id"]) for f in m["files"])
-    if m.get("verified", True):
-        sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"])) if m.get("sub") else _one_line(m["from"])
-    else:
-        sender = "%s (unverified: copied from the old shared-password inbox)" % _one_line(m["from"])
+    sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"])) if m.get("sub") else _one_line(m["from"])
+    if m.get("attest") == "node":
+        sender += " (vouched for by its host node, not signed by its own key)"
     body = "\n".join("> " + line for line in _BREAKS.split(m["text"] + files))
     out.write("#%d %sZ from %s to %s, thread \"%s\":\n%s\n\n" % (
         m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), _one_line(m["thread"]), body))
@@ -414,63 +442,25 @@ def show(m, out=sys.stdout):
 # ---- commands ----
 
 
-def cmd_enroll(a):
-    name = a.name
-    if os.path.exists(ident_path(name)):
-        raise Fail("%s already exists in %s" % (name, DIR))
-    # The key is on disk before the home learns it, so a lost reply never leaves an enrolled name with no key; a rerun
-    # after a failure reuses the same key.
-    pending = os.path.join(DIR, "identities", name + ".pending")
-    try:
-        with open(pending) as f:
-            seed = bytes.fromhex(json.load(f)["seed"])
-    except (FileNotFoundError, ValueError, KeyError):
-        seed = os.urandom(32)
-        write_private(pending, json.dumps({"name": name, "home": a.home, "seed": seed.hex()}))
-    kid = "ed25519:" + b64u(ed25519_public(seed))
-    ts = now_iso()
-    statement = "archipelago-enroll|v2|%s|%s|%s|%s" % (a.home, a.invite, name, ts)
-    try:
-        r = http("POST", "https://%s/enroll" % a.home, {
-            "v": 2, "invite": a.invite, "id": kid, "name": name, "timestamp": ts,
-            "proof": b64u(ed25519_sign(seed, statement.encode())),
-        })
-    except Fail as e:
-        raise Fail("%s (the key is kept in %s; rerun the same command to retry with it)" % (e, pending))
-    write_private(ident_path(name), json.dumps(
-        {"name": name, "sub": r["sub"], "home": a.home, "id": kid, "seed": seed.hex()}, indent=1))
-    os.unlink(pending)
-    print("enrolled as %s (%s) on %s; key saved in %s" % (name, r["sub"], a.home, ident_path(name)))
-
-
 def cmd_newkey(a):
-    # An identity with no home: a fresh key, your name and a durable sub. The operator adds the printed entry to the
-    # member list and re-signs it; then any node of the network lets you in with agent tokens.
-    name = a.name
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
-        raise Fail("name: 1-48 characters, letters, digits and . _ -")
-    if os.path.exists(ident_path(name)):
-        raise Fail("%s already exists in %s" % (name, DIR))
-    seed = os.urandom(32)
-    kid = "ed25519:" + b64u(ed25519_public(seed))
-    sub = a.sub or "agent:%s" % name
-    write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1))
-    sys.stderr.write("key saved in %s; give the operator this member-list entry:\n" % ident_path(name))
-    print(json.dumps({"name": name, "sub": sub, "key": kid}))
+    # Make a key for NAME now (first use of any other command does the same for the default name) and get it certified.
+    ident = load_identity(a.name)
+    cert = ident["certs"][node_key()]
+    print("%s: key %s in %s, certified by node %s" % (ident["name"], ident["id"], ident_path(ident["name"]), cert["node"]))
 
 
 def cmd_selftoken(a):
     if not 1 <= a.ttl <= MAX_TTL:
         raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
     ident = load_identity(a.as_)
-    key = a.node_key or node_key()
-    print(agent_token(ident, key, a.ttl))
+    print(agent_token(ident, a.node_key or node_key(), a.ttl))
 
 
 def cmd_whoami(a):
     ident = load_identity(a.as_)
     me = api(ident, "GET", "/api/me")
-    print("%s (%s) on %s; mailbox at %s, last message #%d" % (me["name"], me["sub"], me["island"], MAIL, me["last_id"]))
+    print("%s (%s) on network %s; node %s at %s, last message #%d" % (
+        me["name"], me["sub"], me["network"], me["node"], MAIL, me["last_id"]))
 
 
 def cmd_send(a):
@@ -494,11 +484,10 @@ def norm_text(s):
 
 
 def signed_block(ident, to, thread, text, ids, mode):
-    # agent-mail (p2p) nodes check this signature by the agent's own key against the member list; the old server
-    # ignores the field. digest = SHA-256(salt || text || 0x00 || file ids joined by ",").
+    # Every node checks this signature against the agent's certified key.
+    # digest = SHA-256(salt || text || 0x00 || file ids joined by ",").
     seed = bytes.fromhex(ident["seed"])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
+    ts = canon_ts()
     salt = os.urandom(16)
     digest = hashlib.sha256(salt + text.encode() + b"\x00" + ",".join(ids).encode()).hexdigest()
     statement = "agent-mail-post|v1|%s|%s|%s|%s|%s|%s" % (ident["name"], to, thread, mode, ts, digest)
@@ -510,7 +499,7 @@ def send(ident, a):
     to, thread = norm_field(a.to), norm_field(a.thread)
     mode = "private" if getattr(a, "private", False) else "members"
     if mode == "private" and "private" not in api(ident, "GET", "/api/me").get("features", []):
-        raise Fail("--private needs an agent-mail node (on the old server every message is readable by all)")
+        raise Fail("this node does not support --private")
     ids = []
     for path in a.file or []:
         with open(path, "rb") as f:
@@ -531,7 +520,7 @@ def send(ident, a):
     elif reaches:
         note = "; reaches %s" % ", ".join(reaches[:12]) + (" and %d more" % (len(reaches) - 12) if len(reaches) > 12 else "")
     else:
-        note = "; warning: no one who has used the mailbox matches %s yet" % m["to"]
+        note = "; warning: no known agent matches %s yet" % m["to"]
     print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], note), flush=True)
     m["reaches"] = reaches
     return m
@@ -545,9 +534,6 @@ def cmd_ask(a):
     ident = load_identity(a.as_)
     a.file = None
     sent = send(ident, a)
-    # An agent renamed on Agaric's home answers under its new name, which the mailbox gives as the one name reached.
-    if len(sent.get("reaches") or []) == 1:
-        to = _addr(sent["reaches"][0])
     deadline, delay = time.time() + a.wait, 3
     while time.time() < deadline:
         time.sleep(min(delay, max(0.0, deadline - time.time())))
@@ -621,12 +607,15 @@ def cmd_watch(a):
         with open(resume) as f:
             after = int(f.read().strip())
     except (FileNotFoundError, ValueError):
-        after = api(ident, "GET", "/api/me")["last_id"]
+        after = None
+    last = api(ident, "GET", "/api/me")["last_id"]
+    if after is None or after > last:  # no resume point, or one from another node's numbering
+        after = last
     delay = 1
     while True:
         try:
             req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
-                "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
+                "Authorization": "Bearer " + agent_token(ident, node_key(), STREAM_TTL), "Accept": "text/event-stream",
                 "User-Agent": UA})
             with _opener.open(req, timeout=90) as r:
                 delay = 1
@@ -646,11 +635,8 @@ def cmd_watch(a):
                     show(m)
                     if a.until:
                         return
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and token_mode(ident) == "home":
-                token_for(ident, fresh=True)
-            else:  # agent tokens are fresh on every connect anyway
-                sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
+        except urllib.error.HTTPError as e:  # agent tokens are fresh on every connect
+            sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
         except Exception as e:  # network drops, timeouts: resume from the last id
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
@@ -659,16 +645,11 @@ def cmd_watch(a):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one)")
+    ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("enroll", help="register once with an invite code")
-    p.add_argument("invite")
-    p.add_argument("name", help="1-48 characters: letters, digits, . _ - (no spaces); e.g. will.orchestrator")
-    p.add_argument("--home", default=HOME)
-    p.set_defaults(fn=cmd_enroll)
-    p = sub.add_parser("newkey", help="make your key with no home server; prints the member-list entry for the operator")
-    p.add_argument("name")
-    p.add_argument("--sub", help="durable id for the member list (default agent:NAME)")
+    p = sub.add_parser("newkey", help="make a key for NAME and get it certified by the local node (first use of "
+                                      "any command does this for the default name)")
+    p.add_argument("name", help="1-48 characters: letters, digits, . _ - ; must be in this host's names (GET /api/node)")
     p.set_defaults(fn=cmd_newkey)
     p = sub.add_parser("selftoken", help="print one single-use agent token for the node (signed by your own key)")
     p.add_argument("--ttl", type=int, default=STREAM_TTL, help="seconds it stays valid, at most 86400 (default 3600)")
@@ -700,7 +681,7 @@ def main():
     p = sub.add_parser("threads")
     p.add_argument("--limit", type=int, default=40)
     p.set_defaults(fn=cmd_threads)
-    p = sub.add_parser("who", help="everyone who has used the mailbox, most recently active first")
+    p = sub.add_parser("who", help="every agent known on the network, most recently active first")
     p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. will.")
     p.set_defaults(fn=cmd_who)
     p = sub.add_parser("get")

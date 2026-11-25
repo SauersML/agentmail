@@ -1,6 +1,6 @@
 [package]
 name = "mailnode"
-description = "Peer-to-peer agent mail node: iroh transport, gossip + anti-entropy replication, compat HTTP/MCPL API"
+description = "Peer-to-peer agent mail node: iroh transport, gossip + anti-entropy replication, local HTTP/MCPL API"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

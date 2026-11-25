@@ -4,97 +4,60 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mailcore::keys::{parse_key, Seed};
-use mailcore::{MemberList, TokenPolicy};
+use mailcore::MemberList;
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct HomeConfig {
-    /// The home's pinned token-signing key, e.g. "ed25519:2uXa…"
-    pub key: String,
-    /// The home's domain (the tokens' iss), e.g. agaric.gnome.science
-    pub iss: String,
-    #[serde(default = "default_aud")]
-    pub aud: String,
-    #[serde(default = "default_scope")]
-    pub scope: String,
-}
-
-fn default_aud() -> String {
-    "mail".into()
-}
-fn default_scope() -> String {
-    "mail:use".into()
-}
-
-/// Same shape as the old server's RENAMED var: mail to `name` reaches whoever now holds `now` under `now_sub`.
-#[derive(Debug, Deserialize, Clone)]
-pub struct Renamed {
-    pub name: String,
-    pub sub: String,
-    pub now: String,
-    #[serde(rename = "nowSub")]
-    pub now_sub: String,
-}
+/// Keys of earlier config formats. A config that still has any of them is refused at load.
+const RETIRED_FIELDS: &[&str] = &["home", "renamed", "refuse_token_only", "id_floor", "bridge"];
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
+    /// Where the store and the adopted member list live (default "data").
+    #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
-    /// Compat API, e.g. "127.0.0.1:8787"
+    /// Local HTTP API, e.g. "127.0.0.1:8787"
     #[serde(default = "default_api")]
     pub api_listen: String,
     /// UDP port for iroh (0 = any)
     #[serde(default)]
     pub iroh_port: u16,
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
+    #[serde(default = "default_node_key_file")]
     pub node_key_file: PathBuf,
     /// The operator key the member list must be signed by.
     pub operator_key: String,
+    /// The operator-signed member list (default "members.json").
+    #[serde(default = "default_members_file")]
     pub members_file: PathBuf,
-    /// The identity home whose aid1 tokens this node still accepts during the switch. Optional: without it the node
-    /// accepts only agent tokens (signed by each member's own key) and needs no server at all.
-    #[serde(default)]
-    pub home: Option<HomeConfig>,
     /// "disabled" (direct addresses only), "n0" (n0's public relays and address lookup), the URL of our own
     /// iroh-relay (e.g. "http://203.0.113.7:3340"), or a list mixing URLs and "n0" (our relays first, n0 as fallback).
     #[serde(default = "default_relay")]
     pub relay: Relay,
-    /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
-    /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
+    /// Optional folder of identity files ({name, seed, …}, mode 600) of agents on this host whose keys this node
+    /// holds. Each one in this node's namespace gets a certificate from this node at startup, and an unsigned post
+    /// from it is signed by the node with its key. Seeds are read, never logged or copied.
     #[serde(default)]
     pub identities_dir: Option<PathBuf>,
     #[serde(default = "default_sync")]
     pub sync_secs: u64,
-    #[serde(default)]
-    pub renamed: Vec<Renamed>,
-    /// Refuse token-only (unsigned) mail, once every client signs with its own key.
-    #[serde(default)]
-    pub refuse_token_only: bool,
-    /// New mail is numbered from here up, leaving the old server's numbers free for the bridge's imports.
-    #[serde(default = "default_floor")]
-    pub id_floor: i64,
-    /// Present on the one node the bridge talks to.
-    #[serde(default)]
-    pub bridge: Option<BridgeConfig>,
     /// Base URL for attachment links in formatted mail (default http://<api_listen>).
     #[serde(default)]
     pub public_url: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct BridgeConfig {
-    /// Hex seed of the bridge key (listed under `bridges` in the member list).
-    pub key_file: PathBuf,
-    /// The token sub of the bridge identity allowed to call POST /api/bridge/import.
-    pub sub: String,
+fn default_data_dir() -> PathBuf {
+    "data".into()
 }
-
-fn default_floor() -> i64 {
-    1
+fn default_node_key_file() -> PathBuf {
+    "node.seed".into()
 }
-
+fn default_members_file() -> PathBuf {
+    "members.json".into()
+}
 fn default_api() -> String {
     "127.0.0.1:8787".into()
 }
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum Relay {
@@ -112,7 +75,7 @@ impl Relay {
 }
 
 fn default_relay() -> Relay {
-    Relay::One("disabled".into())
+    Relay::One("n0".into())
 }
 fn default_sync() -> u64 {
     30
@@ -121,8 +84,11 @@ fn default_sync() -> u64 {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut c: Config = serde_json::from_str(&raw).context("config is not valid JSON")?;
-        let base = path.parent().unwrap_or(Path::new("."));
+        let mut c = Config::parse(&raw)?;
+        let base = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
         let fix = |p: &mut PathBuf| {
             if p.is_relative() {
                 *p = base.join(&*p);
@@ -134,10 +100,22 @@ impl Config {
         if let Some(d) = c.identities_dir.as_mut() {
             fix(d);
         }
-        if let Some(b) = c.bridge.as_mut() {
-            fix(&mut b.key_file);
-        }
         Ok(c)
+    }
+
+    /// Parses config JSON (paths as written). Refuses fields of earlier formats by name.
+    pub fn parse(raw: &str) -> Result<Config> {
+        let v: serde_json::Value = serde_json::from_str(raw).context("config is not valid JSON")?;
+        let obj = v.as_object().context("config must be a JSON object")?;
+        let old: Vec<&str> = RETIRED_FIELDS.iter().copied().filter(|k| obj.contains_key(*k)).collect();
+        if !old.is_empty() {
+            anyhow::bail!(
+                "config has fields from the old setup that no longer exist: {}. Delete them; agents now get a \
+                 certificate from this node on first use.",
+                old.join(", ")
+            );
+        }
+        serde_json::from_value(v).context("config does not have the expected fields")
     }
 
     pub fn adopted_members_path(&self) -> PathBuf {
@@ -158,16 +136,6 @@ impl Config {
         })
     }
 
-    pub fn policy(&self) -> Result<Option<TokenPolicy>> {
-        let Some(home) = &self.home else { return Ok(None) };
-        Ok(Some(TokenPolicy {
-            home_key: parse_key(&home.key).context("home.key")?,
-            iss: home.iss.clone(),
-            aud: home.aud.clone(),
-            scope: home.scope.clone(),
-        }))
-    }
-
     pub fn members(&self) -> Result<MemberList> {
         let raw = std::fs::read_to_string(&self.members_file)
             .with_context(|| format!("reading {}", self.members_file.display()))?;
@@ -180,30 +148,45 @@ impl Config {
         read_or_create_seed(&self.node_key_file)
     }
 
-    /// (name, seed) of each local identity file. Files that do not parse, and files other users could read (group or
-    /// world bits set), are skipped with a warning.
+    /// (name, seed) of each identity file in `identities_dir`. Files that do not parse, and files other users could
+    /// read (group or world bits set), are skipped with a warning.
     pub fn identities(&self) -> Vec<(String, Seed)> {
         let Some(dir) = &self.identities_dir else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
-        let mut out = Vec::new();
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            if let Err(e) = check_private(&p) {
-                tracing::warn!("skipping identity file: {e:#}");
-                continue;
-            }
-            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-            let (Some(name), Some(seed)) = (v["name"].as_str(), v["seed"].as_str()) else { continue };
-            if let Ok(s) = Seed::from_hex(seed) {
-                out.push((name.to_string(), s));
-            }
-        }
-        out
+        read_identities(dir)
     }
+}
+
+/// (name, seed) of each `*.json` identity file in `dir` (see `Config::identities`).
+pub fn read_identities(dir: &Path) -> Vec<(String, Seed)> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        tracing::warn!("identities_dir {} cannot be read", dir.display());
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        if let Err(e) = check_private(&p) {
+            tracing::warn!("skipping identity file: {e:#}");
+            continue;
+        }
+        let parsed = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|v| {
+                let name = v["name"].as_str()?.to_string();
+                let seed = Seed::from_hex(v["seed"].as_str()?).ok()?;
+                Some((name, seed))
+            });
+        match parsed {
+            Some(x) => out.push(x),
+            None => tracing::warn!("skipping identity file {}: it needs a \"name\" and a hex \"seed\"", p.display()),
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Refuses a key file other users could read or write: any group or world permission bit, or not a regular file.
@@ -246,4 +229,41 @@ pub fn read_or_create_seed(path: &Path) -> Result<Seed> {
     let s = Seed::generate();
     write_seed(path, &s)?;
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_config_gets_defaults() {
+        let c = Config::parse(r#"{"operator_key": "ed25519:AAAA"}"#).unwrap();
+        assert_eq!(c.data_dir, PathBuf::from("data"));
+        assert_eq!(c.node_key_file, PathBuf::from("node.seed"));
+        assert_eq!(c.members_file, PathBuf::from("members.json"));
+        assert_eq!(c.relay.entries(), vec!["n0".to_string()]);
+        assert_eq!(c.api_listen, "127.0.0.1:8787");
+        assert!(c.identities_dir.is_none());
+    }
+
+    #[test]
+    fn retired_fields_refused_by_name() {
+        let e = Config::parse(r#"{"operator_key": "ed25519:AAAA", "home": {}, "id_floor": 5}"#).unwrap_err();
+        let m = format!("{e:#}");
+        assert!(m.contains("home, id_floor"), "{m}");
+        assert!(m.contains("Delete them"), "{m}");
+    }
+
+    #[test]
+    fn relative_paths_follow_the_config_folder() {
+        let dir = std::env::temp_dir().join(format!("mailnode-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        std::fs::write(&p, r#"{"operator_key": "ed25519:AAAA", "identities_dir": "ids"}"#).unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.data_dir, dir.join("data"));
+        assert_eq!(c.members_file, dir.join("members.json"));
+        assert_eq!(c.identities_dir, Some(dir.join("ids")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

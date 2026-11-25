@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for  # noqa: E402
+from lib import Client, Node, check, finish, free_port, member_list, req, run, wait_for  # noqa: E402
 
 
 def grep(path, needle):
@@ -52,28 +52,21 @@ def main():
     if os.path.exists(work):
         shutil.move(work, work + ".old-%d" % int(time.time()))
     os.makedirs(os.path.join(work, "keys"))
-    os.makedirs(os.path.join(work, "home"))
+    os.makedirs(os.path.join(work, "home"))  # the host's HOME
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    pub = {n: run(bin_, "keygen", k(n)) for n in ("home", "operator", "nodeA", "alice", "hostagent")}
-    iss = "home.test"
+    pub = {n: run(bin_, "keygen", k(n)) for n in ("operator", "nodeA")}
     api, udp = free_port(), free_port(socket.SOCK_DGRAM)
-    lst = {"v": 1, "network": "test", "seq": 1, "issued": "", "operator": "",
-           "members": [{"name": "t.alice", "sub": "agent:alice@test", "key": pub["alice"]},
-                       {"name": "t.hostagent", "sub": "agent:hostagent@test", "key": pub["hostagent"]}],
-           "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % udp]}], "bridges": [], "sig": ""}
-    json.dump(lst, open(os.path.join(work, "members.unsigned.json"), "w"))
-    run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
+    members = member_list(bin_, work, k("operator"), 1, [("t", pub["nodeA"], None, ["127.0.0.1:%d" % udp])])
     A = Node(bin_, work, "A", {
         "data_dir": os.path.join(work, "dataA"), "api_listen": "127.0.0.1:%d" % api, "iroh_port": udp,
-        "node_key_file": k("nodeA"), "operator_key": pub["operator"], "members_file": os.path.join(work, "members.json"),
-        "home": {"key": pub["home"], "iss": iss}, "relay": "disabled", "sync_secs": 5})
-    tok_agent = run(bin_, "mint-token", k("home"), iss, "t.hostagent", "agent:hostagent@test", "3600")
-    tok_alice = run(bin_, "mint-token", k("home"), iss, "t.alice", "agent:alice@test", "3600")
+        "node_key_file": k("nodeA"), "operator_key": pub["operator"], "members_file": members, "relay": "disabled",
+        "sync_secs": 5})
+    alice, hostagent = Client(work, "alice", A), Client(work, "hostagent", A)
     recipe = {
         "name": "agent-mail host test",
         "description": "Throwaway: mock provider, one MCPL server (an agent-mail node).",
         "agent": {"name": "hostagent", "provider": "mock", "systemPrompt": "You are a mock agent for an agent-mail test."},
-        "mcpServers": {"mail": {"url": "ws://127.0.0.1:%d/mcpl" % api, "token": tok_agent}},
+        "mcpServers": {"mail": {"url": "ws://127.0.0.1:%d/mcpl" % api, "token": ""}},
         "modules": {"subagents": False, "lessons": False, "retrieval": False, "wake": False, "workspace": False},
     }
     rpath = os.path.join(work, "recipe.json")
@@ -87,6 +80,10 @@ def main():
     nlog = os.path.join(work, "A.log")
     try:
         check("node starts", A.start())
+        # The host agent's key, certified by the node; the host dials with an agent token minted from it.
+        tok_agent = hostagent.token(3600)
+        recipe["mcpServers"]["mail"]["token"] = tok_agent
+        json.dump(recipe, open(rpath, "w"), indent=1)
         host = subprocess.Popen(["nice", "-n", "19", a.bun, "src/index.ts", rpath, "--headless"], cwd=a.host_dir, env=env,
                                 stdout=open(os.path.join(work, "host.out"), "w"), stderr=subprocess.STDOUT)
         got, dt = wait_for(lambda: grep(nlog, "mcpl t.hostagent: initialize"), timeout=120, every=1)
@@ -95,7 +92,8 @@ def main():
         line = got[0].split("mailnode::mcpl")[-1].strip()[:200] if got else ""
         check("MCPL 0.5 featureSets/update grant arrives", got, line)
         check("grant gives full mode (push enabled)", bool(got) and "full" in line.rsplit("->", 1)[-1], line)
-        st, r = req("POST", api, "/api/messages", tok_alice, {"to": "t.hostagent", "thread": "hosttest", "text": "ping from alice: kumquat-7"})
+        st, r = req("POST", api, "/api/messages", alice.token(), {"to": "t.hostagent", "thread": "hosttest",
+                                                               "text": "ping from alice: kumquat-7"})
         mid = r.get("message", {}).get("id")
         check("alice posts to the agent", st == 201, "#%s" % mid)
         got, dt = wait_for(lambda: grep(nlog, "push of #%s accepted" % mid), timeout=60, every=1)
@@ -112,10 +110,7 @@ def main():
         A.stop()
     for l in grep(nlog, "mailnode::mcpl"):
         print("  node:", l.split("mailnode::mcpl")[-1].strip()[:200])
-    failed = [r for r in RESULTS if not r[1]]
-    print("\n%d checks, %d failed; logs in %s" % (len(RESULTS), len(failed), work))
-    sys.exit(1 if failed else 0)
-
+    finish(work)
 
 if __name__ == "__main__":
     main()
