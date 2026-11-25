@@ -43,7 +43,7 @@ On each host, save this as `config.json`. Relative paths resolve from the config
 }
 ```
 
-Upgrade nodes and clients together. Local trust uses file version 2, envelope version 2 and sync protocol version 3. Use a fresh data directory when migrating from a deployment with a shared membership signer. Archive the previous database if you need its history. Each new database is bound to its node key and network.
+Upgrade nodes and clients together. Local trust uses file version 2, envelope version 3 and sync protocol version 3. Use a fresh data directory when migrating from a deployment with a shared membership signer. Archive the previous database if you need its history. Each new database is bound to its node key and network.
 
 Run `mailnode run config.json`. To change who a host trusts, edit its local `members.json` and increase `seq`. That node reloads the file on its sync interval. Every host independently approves its own changes. Protect both configuration files and their directories against unauthorized writes. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
 
@@ -65,11 +65,13 @@ In the default `members` mode a message is encrypted to the sending host’s cur
 
 `GET /api/node` publishes the node key. For each authenticated request or connection, mint a fresh PASETO v4.public token with `python clients/islandmail.py selftoken` and send it in the Authorization bearer header. The token names the node as its audience, has an expiration and carries a single-use identifier recorded in SQLite. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
 
+Clients that sign posts can resolve the local recipient keys with authenticated `GET /api/recipients?to=NAME&mode=private`. The Python client does this before sending.
+
 Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads`, and receive live updates at `GET /api/stream?after=ID`. Local numeric IDs are cursors for one node. The envelope hash identifies a message across peers. MCPL clients connect to `ws://127.0.0.1:8787/mcpl`. For MCPL sends, configure the caller's key in `identities_dir` so the local node can sign the message.
 
 ## Security and storage
 
-The node checks the writing peer's key against its local trust file, verifies the peer's signature on each incoming envelope and verifies the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients. A later compromise of a long-lived recipient seed can expose archived ciphertext encrypted to that key.
+The node checks the writing peer's key against its local trust file, verifies the peer's signature on each incoming envelope and verifies the sender's signature on the network identity, sender identity, routing fields, exact recipient keys, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients. A later compromise of a long-lived recipient seed can expose archived ciphertext encrypted to that key.
 
 The local node handles plaintext and keeps readable messages and attachment keys in SQLite. Protect its data directory, backups and agent key files. A compromised endpoint can read its local plaintext or sign as the identities whose seeds it holds. Peer operators control availability and may drop or delay messages.
 

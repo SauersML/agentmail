@@ -245,17 +245,7 @@ impl Node {
         let _ = self.store.seen(&who.name, &who.sub, now_millis());
 
         let members = self.members.read().unwrap().clone();
-        let recipients = match mode {
-            Mode::Members => members.all_keys(),
-            Mode::Private => {
-                let keys = members.private_keys(&to, &who.name);
-                let addressed = members.members.iter().any(|m| addressed_to(&to, &[m.name.as_str()]));
-                if !addressed {
-                    return Err(ApiError::new(400, "private mail goes only to names on the member list; none matches"));
-                }
-                keys
-            }
-        };
+        let recipients = Self::recipients(&members, &to, &who.name, mode)?;
         // Signed by the sender's own key (islandmail.py sends `signed: {ts, salt, sig}`), or token-attested.
         let (ts, attest, salt) = match body.get("signed") {
             Some(s) => {
@@ -281,7 +271,7 @@ impl Node {
                     .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
                 let key = mailcore::keys::parse_key(&m.key)?;
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
-                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids);
+                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids, &recipients);
                 let sig = s["sig"].as_str().unwrap_or("").to_string();
                 let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, &st, &b));
                 if !ok {
@@ -312,7 +302,7 @@ impl Node {
                 let salt = mailcore::random_bytes::<16>();
                 let ts = now_ts();
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
-                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids);
+                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids, &recipients);
                 let sig = mailcore::b64u(&seed.sign(&st));
                 (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
             }
@@ -367,6 +357,14 @@ impl Node {
             .iter()
             .find(|(n, s)| mailcore::addr::same(n, &who.name) && s.public() == k)
             .map(|(_, s)| (m.key.clone(), s.clone()))
+    }
+
+    pub fn recipients(members: &MemberList, to: &str, from: &str, mode: Mode) -> Result<Vec<mailcore::keys::PublicKey>, ApiError> {
+        if mode == Mode::Members { return Ok(members.all_keys()); }
+        if !members.members.iter().any(|m| addressed_to(to, &[&m.name])) {
+            return Err(ApiError::new(400, "no trusted agent matches the private recipient"));
+        }
+        Ok(members.private_keys(to, from))
     }
 
     /// POST /api/files: encrypt and keep the upload until a message attaches it.
@@ -653,7 +651,7 @@ mod tests {
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, text, &[]).unwrap();
-        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[]);
+        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[], &list.all_keys());
         let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
         Envelope::seal(
@@ -727,7 +725,7 @@ mod tests {
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]).unwrap();
-        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[]);
+        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[], &list.all_keys());
         let sig = mailcore::b64u(&alice.sign(&st));
         let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
         let seal = |parents: Vec<String>, sig: String| {
@@ -855,7 +853,7 @@ mod tests {
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, text, files).unwrap();
         let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
-        let st = mailcore::envelope::post_statement(list, "a.alice", to, thread, Mode::Members, ts, &digest, &ids);
+        let st = mailcore::envelope::post_statement(list, "a.alice", to, thread, Mode::Members, ts, &digest, &ids, &list.all_keys());
         json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(&st)) })
     }
 

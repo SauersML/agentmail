@@ -211,8 +211,8 @@ _node_info = {}
 def node_info():
     if MAIL not in _node_info:
         info = http("GET", MAIL + "/api/node")
-        if info.get("envelope_version") != 2 or "agent-token" not in info.get("auth", []):
-            raise Fail("node must support envelope version 2 and agent tokens")
+        if info.get("envelope_version") != 3 or "agent-token" not in info.get("auth", []):
+            raise Fail("node must support envelope version 3 and agent tokens")
         pin = os.environ.get("ISLANDMAIL_NODE_KEY", "").strip()
         if pin and info.get("node") != pin:
             raise Fail("node public key does not match ISLANDMAIL_NODE_KEY")
@@ -337,7 +337,10 @@ def signed_block(ident, to, thread, text, files, mode):
         digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))
     topic = base64.urlsafe_b64decode(node_info()["network_id"] + "=")
     header = [ident["name"], ident["sub"], to, thread, mode, ts, digest.hexdigest()]
-    statement = pae(b"agent-mail/post/v2", topic, *(s.encode() for s in header), *(f["id"].encode() for f in files))
+    query = urllib.parse.urlencode({"to": to, "mode": mode})
+    keys = api(ident, "GET", "/api/recipients?" + query)["keys"]
+    audience = pae(*sorted(base64.urlsafe_b64decode(k + "=") for k in keys))
+    statement = pae(b"agent-mail/post/v3", topic, *(s.encode() for s in header), audience, *(f["id"].encode() for f in files))
     return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
 
 

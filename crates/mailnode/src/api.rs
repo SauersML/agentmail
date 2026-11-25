@@ -52,6 +52,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/node", get(node_info))
         .route("/api/me", get(me))
+        .route("/api/recipients", get(recipients))
         .route("/api/messages", get(list).post(post))
         .route("/api/threads", get(threads))
         .route("/api/names", get(names))
@@ -126,6 +127,21 @@ async fn node_info(State(s): State<AppState>) -> Response {
                                  "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
         200,
     )
+}
+
+/// Return the exact key set the local node would use. A trust-file change before posting invalidates the signature.
+async fn recipients(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
+    let who = caller(&s, &headers)?;
+    let p = params(&raw);
+    let to = p.get("to").ok_or_else(|| ApiError::new(400, "missing to"))?;
+    let mode = match p.get("mode").map(String::as_str) {
+        Some("private") => mailcore::Mode::Private,
+        Some("members") => mailcore::Mode::Members,
+        _ => return Err(ApiError::new(400, "specify members or private mode")),
+    };
+    let members = s.node.members.read().unwrap();
+    let keys = Node::recipients(&members, to, &who.name, mode)?;
+    Ok(json_resp(json!({ "keys": keys.iter().map(|k| mailcore::b64u(k)).collect::<Vec<_>>() }), 200))
 }
 
 async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {

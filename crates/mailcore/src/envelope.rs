@@ -8,7 +8,7 @@ use crate::keys::{self, fmt_key, parse_key, PublicKey, Seed};
 use crate::members::MemberList;
 use crate::{b64u, b64u_decode, parse_ts};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_CIPHERTEXT: usize = 512 * 1024;
@@ -17,7 +17,7 @@ pub const MAX_KEYS: usize = 1000;
 pub const MAX_BLOBS: usize = 10;
 /// An envelope dated further than this past the receiver's clock is refused (it will be fetched again later).
 pub const FUTURE_SKEW_MS: i64 = 10 * 60 * 1000;
-const SIG_CONTEXT: &[u8] = b"agent-mail/envelope/v2\n";
+const SIG_CONTEXT: &[u8] = b"agent-mail/envelope/v3\n";
 const AD_CONTEXT: &str = "agent-mail/body/v1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -46,11 +46,15 @@ pub enum Attest {
     Agent { key: String, digest: String, sig: String },
 }
 
-pub fn post_statement(members: &MemberList, from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str, blobs: &[String]) -> Vec<u8> {
+pub fn post_statement(members: &MemberList, from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str, blobs: &[String], recipients: &[PublicKey]) -> Vec<u8> {
     let sub = members.member_by_name(from).map_or("", |m| m.sub.as_str());
     let topic = members.topic();
-    let mut fields: Vec<&[u8]> = vec![b"agent-mail/post/v2", &topic, from.as_bytes(), sub.as_bytes(),
-        to.as_bytes(), thread.as_bytes(), mode.as_str().as_bytes(), ts.as_bytes(), digest.as_bytes()];
+    // Membership can change after delivery. Verify against the audience recorded in the envelope.
+    let mut recipients = recipients.to_vec();
+    recipients.sort_unstable();
+    let audience = crate::paseto::pae(&recipients.iter().map(|k| k.as_slice()).collect::<Vec<_>>());
+    let mut fields: Vec<&[u8]> = vec![b"agent-mail/post/v3", &topic, from.as_bytes(), sub.as_bytes(),
+        to.as_bytes(), thread.as_bytes(), mode.as_str().as_bytes(), ts.as_bytes(), digest.as_bytes(), &audience];
     fields.extend(blobs.iter().map(|s| s.as_bytes()));
     crate::paseto::pae(&fields)
 }
@@ -223,7 +227,8 @@ impl Envelope {
             bail!("bad key list");
         }
         // Every wrap is a recipient key and a 32-byte content key + 16-byte tag; the ephemeral key is 32 bytes.
-        if !self.wraps()?.iter().all(|w| w.k.len() == 48) {
+        let wraps = self.wraps()?;
+        if !wraps.iter().all(|w| w.k.len() == 48) {
             bail!("bad wrapped key");
         }
         if b64u_decode(&self.epk).is_none_or(|b| b.len() != 32) {
@@ -262,7 +267,8 @@ impl Envelope {
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
-                let st = post_statement(members, &self.from, &self.to, &self.thread, self.mode, &self.ts, digest, &self.blobs);
+                let st = post_statement(members, &self.from, &self.to, &self.thread, self.mode, &self.ts, digest, &self.blobs,
+                    &wraps.iter().map(|w| w.to).collect::<Vec<_>>());
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
                 // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
                 if b64u(&s) != *sig {
@@ -323,11 +329,11 @@ mod tests {
         let salt = crate::random_bytes::<16>();
         let body = Body { text: format!("hi from {from}"), salt: b64u(&salt), files: vec![] };
         let digest = post_digest(&salt, &body.text, &[]).unwrap();
-        let sig = b64u(&signer.sign(&post_statement(&w.members, from, to, "t", mode, &ts, &digest, &[])));
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
             Mode::Private => w.members.private_keys(to, from),
         };
+        let sig = b64u(&signer.sign(&post_statement(&w.members, from, to, "t", mode, &ts, &digest, &[], &recipients)));
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -350,7 +356,7 @@ mod tests {
     fn signed_env(w: &World, from: &str, signer: &Seed, text: &str, ts: String) -> Envelope {
         let salt = crate::random_bytes::<16>();
         let digest = post_digest(&salt, text, &[]).unwrap();
-        let st = post_statement(&w.members, from, "all", "t", Mode::Members, &ts, &digest, &[]);
+        let st = post_statement(&w.members, from, "all", "t", Mode::Members, &ts, &digest, &[], &w.members.all_keys());
         let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
         Envelope::seal(
@@ -380,6 +386,10 @@ mod tests {
         assert_eq!(v.sender_sub, "agent:a.alice@test");
         let body = e.open(&w.node).unwrap().unwrap();
         e.check_body(&body).unwrap();
+        let mut altered = e.clone();
+        altered.keys.pop();
+        altered.sig = b64u(&w.node.sign(&altered.signing_bytes()));
+        assert!(altered.verify(&w.members, now).unwrap_err().to_string().contains("sender signature"));
         // Bob's key claiming to be alice.
         let e = signed_env(&w, "a.alice", &w.bob, "forged", crate::now_ts());
         assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("not a.alice's key"));
@@ -407,7 +417,7 @@ mod tests {
         let salt = crate::random_bytes::<16>();
         let digest = post_digest(&salt, "hi", &[]).unwrap();
         // alice signs to "all", thread "x|y".
-        let st = post_statement(&w.members, "a.alice", "all", "x|y", Mode::Members, &ts, &digest, &[]);
+        let st = post_statement(&w.members, "a.alice", "all", "x|y", Mode::Members, &ts, &digest, &[], &w.members.all_keys());
         let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)) };
         let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
         let mk = |to: &str, thread: &str| {
