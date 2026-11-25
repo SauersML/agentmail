@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, XChaCha20Poly1305};
 use x25519_dalek::{PublicKey as XPublic, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::keys::{x25519_public, PublicKey, Seed};
 
@@ -43,9 +43,9 @@ pub fn seal(plain: &[u8], ad: &[u8], recipients: &[PublicKey]) -> Result<Sealed>
     if recipients.is_empty() {
         bail!("no recipient keys");
     }
-    let mut ck = crate::random_bytes::<32>();
+    let ck = Zeroizing::new(crate::random_bytes::<32>());
     let nonce = crate::random_bytes::<24>();
-    let body = XChaCha20Poly1305::new((&ck).into())
+    let body = XChaCha20Poly1305::new((&*ck).into())
         .encrypt((&nonce).into(), Payload { msg: plain, aad: ad })
         .map_err(|_| anyhow!("encrypt failed"))?;
     let mut ciphertext = nonce.to_vec();
@@ -55,23 +55,23 @@ pub fn seal(plain: &[u8], ad: &[u8], recipients: &[PublicKey]) -> Result<Sealed>
     let epk = XPublic::from(&esk).to_bytes();
     let mut keys = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let mut exchanges = std::collections::BTreeSet::new();
     for r in recipients {
         if !seen.insert(*r) {
             continue;
         }
         let rx = x25519_public(r)?;
+        anyhow::ensure!(exchanges.insert(rx), "distinct signing keys share one X25519 public key");
         let shared = esk.diffie_hellman(&XPublic::from(rx));
         if !shared.was_contributory() {
             bail!("recipient key is low order");
         }
-        let mut wk = wrap_key(&epk, &rx, shared.as_bytes());
-        let k = ChaCha20Poly1305::new((&wk).into())
-            .encrypt(&[0u8; 12].into(), Payload { msg: &ck, aad: r })
+        let wk = Zeroizing::new(wrap_key(&epk, &rx, shared.as_bytes()));
+        let k = ChaCha20Poly1305::new((&*wk).into())
+            .encrypt(&[0u8; 12].into(), Payload { msg: ck.as_slice(), aad: r })
             .map_err(|_| anyhow!("wrap failed"))?;
-        wk.zeroize();
         keys.push(Wrapped { to: *r, k });
     }
-    ck.zeroize();
     Ok(Sealed { ciphertext, epk, keys })
 }
 
@@ -99,12 +99,12 @@ fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
         bail!("ephemeral key is low order");
     }
     let rx = XPublic::from(&sk).to_bytes();
-    let mut wk = wrap_key(epk, &rx, shared.as_bytes());
-    let ck = ChaCha20Poly1305::new((&wk).into())
+    let wk = Zeroizing::new(wrap_key(epk, &rx, shared.as_bytes()));
+    let ck = ChaCha20Poly1305::new((&*wk).into())
         .decrypt(&[0u8; 12].into(), Payload { msg: k, aad: &my_pub })
         .map_err(|_| anyhow!("key unwrap failed"));
-    wk.zeroize();
-    ck?.try_into().map_err(|_| anyhow!("bad content key"))
+    let plain = Zeroizing::new(ck?);
+    plain.as_slice().try_into().map_err(|_| anyhow!("bad content key"))
 }
 
 fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
@@ -160,6 +160,9 @@ mod tests {
         let a = Seed::generate();
         let b = Seed::generate();
         let c = Seed::generate();
+        let mut opposite = a.public();
+        opposite[31] ^= 0x80;
+        assert!(seal(b"hello", b"hdr", &[a.public(), opposite]).is_err());
         let s = seal(b"hello", b"hdr", &[a.public(), b.public()]).unwrap();
         assert_eq!(s.keys.len(), 2);
         assert_eq!(open(&s.ciphertext, b"hdr", &s.epk, &s.keys, &a).unwrap().unwrap(), b"hello");
