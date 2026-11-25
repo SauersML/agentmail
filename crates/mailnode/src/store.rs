@@ -67,7 +67,6 @@ pub struct Row {
     pub files: String,
     pub readers: Option<String>,
     pub wrapped_to: String,
-    pub parents: Vec<String>,
 }
 
 /// Attachment metadata as clients see it (the blob key never leaves the node).
@@ -125,7 +124,7 @@ pub struct Store {
 }
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
-                    length(text) AS len, files, readers, parents, \
+                    length(text) AS len, files, readers, \
                     (SELECT group_concat(value->>'to') FROM json_each(env, '$.keys'))";
 
 fn visible_sql() -> &'static str {
@@ -134,7 +133,6 @@ fn visible_sql() -> &'static str {
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
-    let parents: String = r.get(12)?;
     Ok(Row {
         id: r.get(0)?,
         env_id: r.get(1)?,
@@ -148,8 +146,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         len: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
         files: r.get(10)?,
         readers: r.get(11)?,
-        parents: serde_json::from_str(&parents).unwrap_or_default(),
-        wrapped_to: r.get::<_, Option<String>>(13)?.unwrap_or_default(),
+        wrapped_to: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
     })
 }
 
@@ -377,20 +374,37 @@ impl Store {
         Ok(rows)
     }
 
-    /// All rows of a thread the viewer may read, in the causal thread order every node agrees on.
-    pub fn thread_causal(&self, thread: &str, viewer: &Caller, text_cap: i64) -> Result<Vec<Row>> {
-        let rows: Vec<Row> = {
-            let db = self.db.lock().unwrap();
-            let mut st = db.prepare(&format!("SELECT {COLS} FROM messages WHERE thread = ?"))?;
-            let r = st.query_map(params![text_cap, thread], read_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-            r
-        };
-        let items: Vec<mailcore::order::Item> = rows
-            .iter()
-            .map(|r| mailcore::order::Item { id: &r.env_id, ts: &r.ts, parents: &r.parents })
-            .collect();
-        let order = mailcore::order::thread_order(&items);
-        Ok(order.into_iter().map(|i| rows[i].clone()).filter(|r| r.visible_to(viewer)).collect())
+    /// Sort lightweight graph metadata first, then load a page of visible bodies in causal order.
+    pub fn thread_causal(&self, thread: &str, viewer: &Caller, q: &Query, text_cap: i64) -> Result<(Vec<Row>, bool)> {
+        let db = self.db.lock().unwrap();
+        let mut graph = db.prepare("SELECT id, env_id, ts, parents FROM messages WHERE thread=?")?;
+        let mut nodes = Vec::new();
+        let mut records = graph.query([thread])?;
+        while let Some(r) = records.next()? {
+            let parents: Vec<String> = serde_json::from_str(r.get_ref(3)?.as_str()?)?;
+            nodes.push((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, parents));
+        }
+        let items: Vec<_> = nodes.iter().map(|(_, id, ts, parents)| mailcore::order::Item { id, ts, parents }).collect();
+        let mut order = mailcore::order::thread_order(&items);
+        let position = |id| order.iter().position(|&i| nodes[i].0 == id);
+        let start = q.after.filter(|&id| id != 0).map_or(0, |id| position(id).map_or(order.len(), |i| i + 1));
+        let end = q.before.map_or(order.len(), |id| position(id).unwrap_or(0));
+        let window = &mut order[start.min(end)..end];
+        if q.latest.is_some() { window.reverse(); }
+        let limit = q.latest.or(q.limit).unwrap_or(PAGE).clamp(0, PAGE) as usize;
+        let name = format!(",{},", norm(&viewer.name));
+        let mut read = db.prepare(&format!("SELECT {COLS} FROM messages WHERE id=? AND {}", visible_sql()))?;
+        let mut rows = Vec::new();
+        let mut bytes = 0;
+        let mut more = false;
+        for &i in window.iter() {
+            let Some(row) = read.query_row(params![text_cap, nodes[i].0, name, viewer.key], read_row).optional()? else { continue };
+            bytes += row.text.as_deref().map_or(0, str::len) + row.files.len() + 200;
+            if rows.len() == limit || (!rows.is_empty() && bytes > PAGE_CHARS) { more = true; break; }
+            rows.push(row);
+        }
+        if q.latest.is_some() { rows.reverse(); }
+        Ok((rows, more))
     }
 
     /// Thread heads: envelopes of the thread no other envelope of it names as a parent (latest 16 by ts).

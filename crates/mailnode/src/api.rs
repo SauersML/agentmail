@@ -164,9 +164,12 @@ async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQ
     // Extension: order=causal gives one thread in the order every node agrees on (parents first, then (ts, id)).
     if p.get("order").map(|s| s.as_str()) == Some("causal") {
         let thread = q.thread.clone().ok_or_else(|| ApiError::new(400, "order=causal needs thread"))?;
-        let rows = s.node.store.thread_causal(&thread, &who, MAX_TEXT)?;
+        if q.q.is_some() || q.from.is_some() || q.to.is_some() {
+            return Err(ApiError::new(400, "causal order supports thread, after, before, limit and latest"));
+        }
+        let (rows, more) = s.node.store.thread_causal(&thread, &who, &q, MAX_TEXT)?;
         let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();
-        return Ok(json_resp(json!({ "messages": msgs, "more": false, "last_id": s.node.store.last_id()? }), 200));
+        return Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200));
     }
     let (rows, more) = s.node.store.query(&q, &who, MAX_TEXT)?;
     let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();

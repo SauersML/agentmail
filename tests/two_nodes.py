@@ -230,6 +230,12 @@ def main():
         oa = [m["env"] for m in req("GET", pa, "/api/messages?thread=t1&order=causal", token("A", "alice"))[1]["messages"]]
         ob = [m["env"] for m in req("GET", pb, "/api/messages?thread=t1&order=causal", token("B", "bob"))[1]["messages"]]
         check("same causal thread order on A and B", oa == ob and len(oa) == 5, "%d messages" % len(oa))
+        route = "/api/messages?thread=t1&order=causal"
+        first = req("GET", pa, route + "&limit=2", token("A", "alice"))[1]
+        rest = req("GET", pa, route + "&after=%d" % first["messages"][-1]["id"], token("A", "alice"))[1]
+        check("causal pages resume after the last delivered message", first["more"] and not rest["more"]
+              and len(first["messages"]) == 2 and [m["env"] for m in first["messages"] + rest["messages"]] == oa)
+
         st, th_ = req("GET", pb, "/api/threads", token("B", "bob"))
         check("GET /api/threads on B", st == 200 and any(t["thread"] == "t1" and t["n"] == 5 for t in th_["threads"]))
         st, nm = req("GET", pb, "/api/names?prefix=t.", token("B", "bob"))

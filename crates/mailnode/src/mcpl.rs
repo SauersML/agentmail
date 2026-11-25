@@ -384,9 +384,8 @@ impl Conn {
             }
             "thread" => {
                 let thread = args["thread"].as_str().map(|s| s.to_string()).unwrap_or_else(|| args["thread"].to_string());
-                let rows = n.store.thread_causal(&thread, me, 2000)?;
-                let k = cap(&args["limit"], 30) as usize;
-                let rows = &rows[rows.len().saturating_sub(k)..];
+                let page = Query { latest: Some(cap(&args["limit"], 30)), ..Default::default() };
+                let (rows, _) = n.store.thread_causal(&thread, me, &page, 2000)?;
                 if rows.is_empty() {
                     return Ok(format!("No thread named \"{}\".", thread.chars().take(80).collect::<String>()));
                 }

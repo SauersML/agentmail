@@ -705,7 +705,6 @@ mod tests {
             files: "[]".into(),
             readers: None,
             wrapped_to: String::new(),
-            parents: vec![],
         };
         let out = format_message(&row, 100_000, "http://x");
         let lines: Vec<&str> = out.split(is_line_break).collect();
