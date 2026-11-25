@@ -146,6 +146,7 @@ struct Conn {
 async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::UnboundedReceiver<(u16, String)>) {
     let (mut sink, mut stream) = socket.split();
     let mut events = node.events.subscribe();
+    let mut trust = node.trust.subscribe();
     let mut c = Conn {
         node,
         who,
@@ -172,6 +173,7 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => c.flush_backlog(),
                 Err(_) => break,
             },
+            _ = trust.changed() => if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed") },
             k = kill.recv() => { if let Some((code, reason)) = k { c.close(code, &reason) } else { break } },
             _ = tick.tick() => {
                 if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed"); }

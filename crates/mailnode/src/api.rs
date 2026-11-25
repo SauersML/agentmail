@@ -378,6 +378,7 @@ async fn stream(
         _ => s.node.store.last_id()?,
     };
     let mut rx = s.node.events.subscribe();
+    let mut trust = s.node.trust.subscribe();
     let node = s.node.clone();
     let (tx, out) = mpsc::channel::<Result<Bytes, Infallible>>(1);
     tokio::spawn(async move {
@@ -402,6 +403,8 @@ async fn stream(
                 // A notification is only a wakeup. SQLite supplies committed messages in cursor order.
                 event = rx.recv() => if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; },
                 _ = beat.tick() => chunk.push_str(": ping\n\n"),
+                // A trust change (revocation, trust file edit): the loop re-checks the caller first.
+                _ = trust.changed() => {}
                 _ = tx.closed() => break,
             }
         }

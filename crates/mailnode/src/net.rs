@@ -313,6 +313,29 @@ impl Ctx {
     }
 }
 
+/// How often the trust file is checked for changes.
+pub const TRUST_POLL: Duration = Duration::from_secs(1);
+
+/// Re-reads the trust file every TRUST_POLL and adopts a change (Node::reload_members wakes open sessions);
+/// `adopted` runs after each adopted change.
+pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) {
+    let mut last: Option<Vec<u8>> = None;
+    let mut tick = tokio::time::interval(TRUST_POLL);
+    loop {
+        tick.tick().await;
+        let raw = std::fs::read(&cfg.members_file).ok();
+        if raw.is_some() && raw == last {
+            continue;
+        }
+        match cfg.members().and_then(|list| node.reload_members(&list)) {
+            Ok(true) => adopted(),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("local trust file refused: {e:#}"),
+        }
+        last = raw;
+    }
+}
+
 /// A gossiped certificate ({"cert": …}) or revocation ({"revocation": …}); None for anything else (an envelope).
 fn trust_message(node: &Node, raw: &[u8]) -> Option<Result<bool>> {
     #[derive(Deserialize)]
@@ -417,18 +440,17 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<E
         }
     });
 
-    // Every sync_secs: pick up a newer member list from the config file, anti-entropy with every member node, and
-    // re-join the topic so a restarted or new peer is found again.
+    // The local trust file, on its own timer: a slow or offline peer never delays a change (a removed agent or
+    // node), and open sessions and connections are cut off as soon as it is adopted.
+    let gate = ctx.gate.clone();
+    tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || { gate.close_removed(); }));
+
+    // Every sync_secs: anti-entropy with every member node, and re-join the topic so a restarted or new peer is
+    // found again.
     let c = ctx.clone();
     let every = Duration::from_secs(cfg.sync_secs.max(1));
-    let cfg2 = cfg.clone();
     tokio::spawn(async move {
         loop {
-            match cfg2.members().and_then(|list| c.node.reload_members(&list)) {
-                Ok(true) => { c.gate.close_removed(); }
-                Ok(false) => {}
-                Err(e) => tracing::warn!("local trust file refused: {e:#}"),
-            }
             let peers = c.peers();
             futures::stream::iter(peers.iter().copied()).for_each_concurrent(4, |peer| {
                 let c = &c;
@@ -511,5 +533,42 @@ mod tests {
         let (got, taken) = get_within(&node, &ids, usize::MAX).unwrap();
         assert_eq!((got.len(), taken), (5, 6));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn trust_file_changes_cut_off_sessions_on_their_own_timer() {
+        let (me, alice) = (Seed::generate(), Seed::generate());
+        let dir = std::env::temp_dir().join(format!("mailnode-trust-{}", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("members.json");
+        let network = mailcore::b64u(&mailcore::random_bytes::<32>());
+        let list = |seq: u64, with_alice: bool| mailcore::MemberList {
+            v: 2, network: network.clone(), seq,
+            members: if with_alice {
+                vec![mailcore::Member { name: "a.alice".into(), sub: "agent:a.alice".into(), key: fmt_key(&alice.public()) }]
+            } else { vec![] },
+            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
+        };
+        std::fs::write(&file, serde_json::to_vec(&list(1, true)).unwrap()).unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({
+            "data_dir": dir, "node_key_file": dir.join("node.seed"), "members_file": file })).unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        let store = Store::open(&dir.join("mail.sqlite")).unwrap();
+        store.bind_roster(&me.public(), &list(1, true)).unwrap();
+        let node = Arc::new(Node::new(store, list(1, true), me.clone(), Opts::default(), tx));
+        let tok = mailcore::agent_token::mint(&alice, "a.alice", "agent:a.alice", &me.public(), mailcore::now_millis(), 600);
+        let who = node.verify(&tok).unwrap();
+        let mut trust = node.trust.subscribe();
+        trust.mark_unchanged();
+        let adopted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let a2 = adopted.clone();
+        tokio::spawn(watch_trust_file(cfg, node.clone(), move || { a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(!trust.has_changed().unwrap(), "an unchanged file is not adopted again");
+        std::fs::write(&file, serde_json::to_vec(&list(2, false)).unwrap()).unwrap();
+        tokio::time::timeout(TRUST_POLL * 3, trust.changed()).await.expect("sessions are woken within seconds").unwrap();
+        assert!(!node.active(&who), "the removed agent's session is over");
+        assert_eq!(adopted.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
