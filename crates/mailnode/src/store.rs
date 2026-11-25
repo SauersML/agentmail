@@ -19,6 +19,7 @@ pub const PAGE_CHARS: usize = 4_000_000;
 pub const MAX_TEXT: i64 = 100_000;
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS local_trust (id INTEGER PRIMARY KEY CHECK(id=1), node TEXT NOT NULL, roster TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   env_id TEXT NOT NULL UNIQUE,
@@ -121,6 +122,7 @@ pub struct Query {
 
 pub struct Store {
     db: Mutex<Connection>,
+    _exclusive: std::fs::File,
 }
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
@@ -164,30 +166,49 @@ fn like_prefix(s: &str) -> String {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store> {
-        let db = Connection::open(path)?;
-        // The store holds the plaintext of everything this node can read (private mail included), attachment keys and
-        // private attachment metadata. Restrict access to this user, whatever the umask. SQLite
-        // gives its -wal/-shm files the database's mode; older ones are fixed here too.
-        {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut p = path.as_os_str().to_owned();
-                p.push(suffix);
-                if std::path::Path::new(&p).exists() {
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-                }
+        use rusqlite::OpenFlags;
+        use std::fs::{OpenOptions, Permissions};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let secure = |file: &std::fs::File| -> Result<()> {
+            let md = file.metadata()?;
+            anyhow::ensure!(md.is_file() && md.nlink() == 1, "mail store must be a regular file with one link");
+            file.set_permissions(Permissions::from_mode(0o600))?;
+            Ok(())
+        };
+        // Use a separate lock file so the process lock cannot contend with SQLite's own locks.
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let exclusive = options.clone().create(true).open(lock_path)?;
+        secure(&exclusive)?;
+        exclusive.try_lock().map_err(|e| anyhow::anyhow!("mail store already in use or cannot be locked: {e}"))?;
+        let file = options.clone().create(true).open(path)?;
+        secure(&file)?;
+        drop(file);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sibling = path.as_os_str().to_owned();
+            sibling.push(suffix);
+            match options.open(sibling) {
+                Ok(file) => secure(&file)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
         }
-        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        let mut db = Connection::open_with_flags(path.canonicalize()?, flags)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF")?;
         let old_store = db.prepare("SELECT 1 FROM sqlite_schema WHERE name='messages'")?.exists([])?
             && !db.prepare("SELECT 1 FROM sqlite_schema WHERE name='local_trust'")?.exists([])?;
         anyhow::ensure!(!old_store, "existing database predates local trust; use a new data directory");
-        db.execute_batch(SCHEMA)?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS local_trust (id INTEGER PRIMARY KEY CHECK(id=1), node TEXT NOT NULL, roster TEXT NOT NULL)")?;
+        let tx = db.transaction()?;
+        tx.execute_batch(SCHEMA)?;
+        tx.commit()?;
         use rusqlite::functions::FunctionFlags;
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |c| Ok(mailcore::addr::addressed_to(c.get_raw(0).as_str()?, &[c.get_raw(1).as_str()?])))?;
-        Ok(Store { db: Mutex::new(db) })
+        Ok(Store { db: Mutex::new(db), _exclusive: exclusive })
     }
 
     /// A data directory belongs to one node and network. Keep the last accepted local revision across restarts.
@@ -625,6 +646,7 @@ mod tests {
                     key: mailcore::keys::fmt_key(&key), addrs: vec![] }] };
         let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let store = Store::open(&path).unwrap();
+        assert!(Store::open(&path).is_err(), "a second live node must not share the same store");
         store.bind_roster(&key, &list).unwrap();
         list.seq += 1;
         store.bind_roster(&key, &list).unwrap();
