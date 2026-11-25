@@ -139,6 +139,11 @@ impl Cert {
         check_signed(self.v, &self.name, &self.key, &self.node, &self.issued, &self.sig, &self.signing_bytes())
     }
 
+    /// The agent timestamps mail on its own clock. Allow the same skew as its enrollment proof.
+    pub fn issued_by(&self, at_ms: i64) -> bool {
+        parse_ts(&self.issued).is_some_and(|t| t <= at_ms.saturating_add(CERTIFY_SKEW_MS))
+    }
+
     pub fn agent_key(&self) -> Result<PublicKey> {
         parse_key(&self.key)
     }

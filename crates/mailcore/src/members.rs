@@ -156,7 +156,7 @@ impl MemberList {
         let mut seen = HashSet::new();
         let mut groups: BTreeMap<_, Vec<(PublicKey, Cert)>> = BTreeMap::new();
         for c in certs {
-            if !self.accepts(c) || revoked_at(c).is_some_and(|t| at_ms >= t) { continue; }
+            if !c.issued_by(at_ms) || revoked_at(c).is_some_and(|t| at_ms >= t) || !self.accepts(c) { continue; }
             let (Ok(node), Ok(key)) = (c.node_key(), c.agent_key()) else { continue };
             if seen.insert((node, key)) {
                 groups.entry((addr::norm(&c.name), key)).or_default().push((node, c.clone()));

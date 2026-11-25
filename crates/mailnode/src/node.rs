@@ -211,9 +211,9 @@ impl Node {
 
     /// A certificate to carry in the sender's envelopes (this node's own first), so receivers can check the sender
     /// before certificates replicate. None for an agent known here only by its pin.
-    fn carried(&self, a: &Agent) -> Option<Cert> {
+    fn carried(&self, a: &Agent, at_ms: i64) -> Option<Cert> {
         let me = fmt_key(&self.me());
-        a.certs.iter().find(|c| c.node == me).or(a.certs.first()).cloned()
+        a.certs.iter().filter(|c| c.issued_by(at_ms)).min_by_key(|c| c.node != me).cloned()
     }
 
     /* Certificates */
@@ -448,7 +448,7 @@ impl Node {
                     let reaches = self.reaches(&row.recipient, &who.sub);
                     return Ok(Posted { row, reaches, repeated: true });
                 }
-                (ts, Attest::Agent { key: fmt_key(&key), digest, sig, cert: self.carried(&me_agent) }, mailcore::b64u(&salt))
+                (ts, Attest::Agent { key: fmt_key(&key), digest, sig, cert: self.carried(&me_agent, t) }, mailcore::b64u(&salt))
             }
             // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
             // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
@@ -464,14 +464,15 @@ impl Node {
                     }
                 }
                 let salt = mailcore::random_bytes::<16>();
-                let ts = now_ts();
+                let t = now_millis();
+                let ts = ts_from_millis(t);
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
                 let st = PostStatement {
                     from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
                 }.signing_bytes(&members);
                 let sig = mailcore::b64u(&seed.sign(&st));
-                (ts, Attest::Agent { key, digest, sig, cert: self.carried(&me_agent) }, mailcore::b64u(&salt))
+                (ts, Attest::Agent { key, digest, sig, cert: self.carried(&me_agent, t) }, mailcore::b64u(&salt))
             }
         };
         let parents = self.store.heads(&thread)?;

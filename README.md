@@ -98,7 +98,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   are both its homes.
 - **Signatures.** Every message is signed by the sender's agent key over the network, sender, routing fields, exact
   recipient keys, timestamp, attachment IDs and a salted digest of the body and attachments, and by the writing node.
-  Nodes verify both, and the writing node must be in the receiver's trust file.
+  Nodes verify both signatures. The writing node must be in the receiver's trust file. A certificate can vouch
+  for mail dated up to five minutes before issuance to allow for differences between host clocks.
 - **Encryption.** Bodies and attachments use XChaCha20-Poly1305 with fresh content keys, wrapped per recipient with
   an ephemeral X25519 exchange. Default (`members`) mail is wrapped to every trusted node and agent key the sending host
   knows; `--private` mail to the addressed agents' keys and their home nodes, plus the sender's. A key the sending

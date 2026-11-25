@@ -297,6 +297,9 @@ impl Envelope {
                         bail!("signed by a key that is not {}'s key on the member list or in its certificates", self.from),
                     None => bail!("{} is not on the member list and has no certificate from a trusted node", self.from),
                 };
+                if !m.pinned && !m.certs.iter().any(|c| c.issued_by(ts)) {
+                    bail!("message predates the sender's certificates");
+                }
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
@@ -614,6 +617,15 @@ mod tests {
         let e = certified_env(&l, &agents, &mac, "hypha", &hypha, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
         assert_eq!(e.verify(&l, &agents, now).unwrap().sender_sub, "agent:hypha");
         assert!(e.verify(&l, &l.agents(&[], &none, now), now).unwrap_err().to_string().contains("no certificate"));
+
+        let boundary = now - 1000 - crate::cert::CERTIFY_SKEW_MS;
+        for (t, allowed) in [(boundary - 1, false), (boundary, true)] {
+            let mail = certified_env(&l, &agents, &mac, "hypha", &hypha, "all", Mode::Members,
+                                     crate::ts_from_millis(t), Some(mac_cert.clone()));
+            let dated = l.agents(std::slice::from_ref(&mac_cert), &none, t);
+            assert_eq!(mail.verify(&l, &dated, now).is_ok(), allowed);
+            assert_eq!(mail.verify(&l, &agents, now).is_ok(), allowed, "writer using its current roster");
+        }
 
         // Out of namespace: ops's node cannot vouch for sauersml.x, nor can an untrusted node.
         let rogue = Cert::issue(&ops, "sauersml.x", &bob.public(), &ts);
