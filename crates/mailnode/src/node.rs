@@ -600,24 +600,17 @@ impl Node {
         let revs = self.store.revocation_times()?;
         let at = members.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), env.ts_ms());
         let v = env.verify(&members, &at, now_millis())?;
+        let keys = std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s));
+        let body = env.open_for(keys)?;
+        if let Some(b) = &body {
+            env.check_body(b)?;
+            anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
+        }
         // Keep the carried certificate (best effort: a node at its certificate cap still delivers the mail).
         if let Some(c) = &carried {
             if self.store.put_cert(c).unwrap_or(false) {
                 self.refresh();
             }
-        }
-        let mut body = env.open(&self.seed).unwrap_or(None);
-        if body.is_none() {
-            for (_, s) in &self.opts.identities {
-                if let Ok(Some(b)) = env.open(s) {
-                    body = Some(b);
-                    break;
-                }
-            }
-        }
-        if let Some(b) = &body {
-            env.check_body(b)?;
-            anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
         }
         let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
         let text = body.map(|b| b.text);

@@ -220,11 +220,19 @@ impl Envelope {
 
     /// The body, if `me` is one of the keys it was wrapped to.
     pub fn open(&self, me: &Seed) -> Result<Option<Body>> {
+        self.open_for([me])
+    }
+
+    /// Try local keys against the same decoded wraps. A matching key must authenticate the body.
+    pub fn open_for<'a>(&self, local_keys: impl IntoIterator<Item = &'a Seed>) -> Result<Option<Body>> {
         let (ct, epk, ad) = self.parts()?;
-        match crypto::open(&ct, &ad, &epk, &self.wraps()?, me)? {
-            None => Ok(None),
-            Some(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
+        let wraps = self.wraps()?;
+        for key in local_keys {
+            if let Some(plain) = crypto::open(&ct, &ad, &epk, &wraps, key)? {
+                return Ok(Some(serde_json::from_slice(&plain)?));
+            }
         }
+        Ok(None)
     }
 
     fn parts(&self) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
@@ -395,6 +403,16 @@ mod tests {
             &w.node,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn opening_with_local_keys_distinguishes_unaddressed_mail_from_corruption() {
+        let w = world();
+        let mut mail = env(&w, "a.alice", "a.bob", Mode::Private);
+        assert!(mail.open_for([&w.node, &w.carol]).unwrap().is_none());
+        assert_eq!(mail.open_for([&w.node, &w.bob]).unwrap().unwrap().text, "hi from a.alice");
+        mail.ciphertext = crate::b64u(&[0; 40]);
+        assert!(mail.open_for([&w.node, &w.bob]).is_err());
     }
 
     /// An envelope signed by `signer` as `from` (the agent-key path), with the given body text.
