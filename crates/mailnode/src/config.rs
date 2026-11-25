@@ -78,14 +78,19 @@ impl Config {
     pub fn best_members(&self) -> Result<MemberList> {
         let file = self.members()?;
         let op = parse_key(&self.operator_key)?;
-        let adopted = std::fs::read_to_string(self.adopted_members_path())
-            .ok()
-            .and_then(|r| serde_json::from_str::<MemberList>(&r).ok())
-            .filter(|l| l.verify(&op).is_ok() && l.network == file.network);
-        Ok(match adopted {
-            Some(a) if a.seq > file.seq => a,
-            _ => file,
-        })
+        let raw = match std::fs::read_to_string(self.adopted_members_path()) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(file),
+            Err(e) => return Err(e.into()),
+        };
+        let adopted: MemberList = serde_json::from_str(&raw).context("invalid saved member list")?;
+        anyhow::ensure!(adopted.network == file.network, "data directory belongs to another network");
+        if file.seq > adopted.seq {
+            return Ok(file);
+        }
+        adopted.verify(&op).context("invalid saved member list signature")?;
+        anyhow::ensure!(adopted.seq != file.seq || adopted == file, "conflicting member lists at the same sequence");
+        Ok(adopted)
     }
 
     pub fn members(&self) -> Result<MemberList> {

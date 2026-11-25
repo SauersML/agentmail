@@ -135,15 +135,21 @@ impl Node {
         if list.network != cur.network || list.seq <= cur.seq {
             return Ok(false);
         }
+        if let Some(p) = &self.opts.members_path {
+            use std::io::Write;
+            let tmp = p.with_extension("tmp");
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(&serde_json::to_vec(list)?)?;
+            file.sync_all()?;
+            std::fs::rename(tmp, p)?;
+            if let Some(dir) = p.parent() {
+                std::fs::File::open(dir)?.sync_all()?;
+            }
+        }
         *cur = list.clone();
         drop(cur);
         for m in &list.members {
             let _ = self.store.seen(&m.name, &m.sub, 0);
-        }
-        if let Some(p) = &self.opts.members_path {
-            let tmp = p.with_extension("tmp");
-            std::fs::write(&tmp, serde_json::to_string_pretty(list)?)?;
-            std::fs::rename(&tmp, p)?;
         }
         tracing::info!("adopted member list seq {} ({} members, {} nodes)", list.seq, list.members.len(), list.nodes.len());
         Ok(true)
