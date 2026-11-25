@@ -31,6 +31,16 @@ jobs:
         run: cargo test --locked --target ${{ matrix.target }}
       - name: Build
         run: cargo build --locked --release -p mailnode --target ${{ matrix.target }}
+      - name: Exercise direct-peer mail and agent clients
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mail-test"
+          . "$RUNNER_TEMP/mail-test/bin/activate"
+          python -m pip install -r clients/requirements.txt 'websockets>=12,<17'
+          python tests/client_paseto.py
+          python tests/client_show.py
+          node_bin="target/${{ matrix.target }}/release/mailnode"
+          python tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
+          python tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
       - name: Package
         run: |
           mkdir -p out

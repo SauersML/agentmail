@@ -132,14 +132,14 @@ def main():
     pub = {n: run(bin_, "keygen", k(n)) for n in ["nodeA", "nodeB", "alice", "bob", "carol"]}
     agents = {"alice": "t.alice", "bob": "t.bob", "carol": "u.carol"}
     ports = {"apiA": free_port(), "apiB": free_port(), "udpA": free_port(socket.SOCK_DGRAM), "udpB": free_port(socket.SOCK_DGRAM)}
-    unsigned = {
+    roster = {
         "v": 2, "network": run(bin_, "network-id"), "seq": 1,
         "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents],
         "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % ports["udpA"]]},
                   {"name": "B", "key": pub["nodeB"], "addrs": ["127.0.0.1:%d" % ports["udpB"]]}],
     }
     with open(os.path.join(work, "members.json"), "w") as f:
-        json.dump(unsigned, f)
+        json.dump(roster, f)
 
 
     # islandmail.py-style identity folders: node A hosts alice, node B hosts bob (their keys open private mail).
@@ -177,7 +177,7 @@ def main():
 
         # Auth, exactly like the old server.
         st, me = req("GET", pa, "/api/me", token("A", "alice"))
-        check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == "test", json.dumps(me))
+        check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == roster["network"], json.dumps(me))
         st, e = req("GET", pa, "/api/me")
         check("no token -> 401", st == 401, json.dumps(e))
         # Post on A, read on B.
