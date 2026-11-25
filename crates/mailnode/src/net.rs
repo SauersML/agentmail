@@ -162,7 +162,9 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
         Req::Certs => {
             r.certs = node.store.certs()?;
+            r.certs.truncate(crate::store::MAX_SYNC_CERTS);
             r.revocations = node.store.revocations()?;
+            r.revocations.truncate(crate::store::MAX_SYNC_CERTS);
         }
     }
     Ok(serde_json::to_vec(&r)?)
@@ -246,7 +248,7 @@ impl Ctx {
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
-        anyhow::ensure!(trust.certs.len() <= 10_000 && trust.revocations.len() <= 10_000, "oversize certificate list");
+        anyhow::ensure!(trust.certs.len() <= crate::store::MAX_SYNC_CERTS && trust.revocations.len() <= crate::store::MAX_SYNC_CERTS, "oversize certificate list");
         let n2 = node.clone();
         tokio::task::spawn_blocking(move || {
             for r in &trust.revocations {

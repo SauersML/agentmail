@@ -591,8 +591,9 @@ impl Node {
         let revs = self.store.revocation_times()?;
         let at = members.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), env.ts_ms());
         let v = env.verify(&members, &at, now_millis())?;
+        // Keep the carried certificate (best effort: a node at its certificate cap still delivers the mail).
         if let Some(c) = &carried {
-            if self.store.put_cert(c)? {
+            if self.store.put_cert(c).unwrap_or(false) {
                 self.refresh();
             }
         }
@@ -1246,6 +1247,12 @@ mod tests {
         assert!(pod.take_cert(&Cert::issue(&will, "hypha", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "will.x", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.store.certs().unwrap().is_empty());
+        // No trusted node can crowd out the others: at most MAX_CERTS_PER_NODE from each.
+        for i in 0..crate::store::MAX_CERTS_PER_NODE {
+            pod.store.put_cert(&Cert::issue(&will, &format!("will.a{i}"), &Seed::generate().public(), &now_ts())).unwrap();
+        }
+        assert!(pod.take_cert(&Cert::issue(&will, "will.more", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&mac.seed, "hypha", &hypha.public(), &now_ts())).unwrap());
     }
 
     #[test]

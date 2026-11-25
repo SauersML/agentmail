@@ -17,6 +17,9 @@ use serde_json::json;
 pub const PAGE: i64 = 1000;
 pub const PAGE_CHARS: usize = 4_000_000;
 pub const MAX_TEXT: i64 = 100_000;
+pub const MAX_CERTS_PER_NODE: i64 = 1000;
+/// Most certificates (and revocations) one sync answer carries.
+pub const MAX_SYNC_CERTS: usize = 10_000;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS local_trust (id INTEGER PRIMARY KEY CHECK(id=1), node TEXT NOT NULL, roster TEXT NOT NULL);
@@ -533,16 +536,19 @@ impl Store {
 
     /* Certificates, keyed by (issuing node, agent key): one node's certificate never displaces another's. */
 
-    /// Ok(true) when new. A second certificate from the same node for the same key is ignored.
+    /// Ok(true) when new. A second certificate from the same node for the same key is ignored, and so is anything
+    /// past MAX_CERTS_PER_NODE from one node, so no node can crowd out the others'.
     pub fn put_cert(&self, c: &mailcore::Cert) -> Result<bool> {
         let db = self.db.lock().unwrap();
+        let held: i64 = db.query_row("SELECT count(*) FROM certs WHERE node = ?", [&c.node], |r| r.get(0))?;
+        anyhow::ensure!(held < MAX_CERTS_PER_NODE, "this node already holds {MAX_CERTS_PER_NODE} certificates from {}", c.node);
         Ok(db.execute("INSERT OR IGNORE INTO certs (node, key, lname, json) VALUES (?, ?, ?, ?)",
                       params![c.node, c.key, norm(&c.name), serde_json::to_string(c)?])? > 0)
     }
 
     fn certs_where(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<mailcore::Cert>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&format!("SELECT json FROM certs {clause} ORDER BY node, key LIMIT 10000"))?;
+        let mut st = db.prepare(&format!("SELECT json FROM certs {clause} ORDER BY node, key"))?;
         let rows = st.query_map(args, |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
     }
@@ -562,6 +568,8 @@ impl Store {
     /// Ok(true) when new or earlier than the one held (the earliest revocation of a (node, key) counts).
     pub fn put_revocation(&self, r: &mailcore::Revocation) -> Result<bool> {
         let db = self.db.lock().unwrap();
+        let held: i64 = db.query_row("SELECT count(*) FROM revocations WHERE node = ? AND key <> ?", [&r.node, &r.key], |x| x.get(0))?;
+        anyhow::ensure!(held < MAX_CERTS_PER_NODE, "this node already holds {MAX_CERTS_PER_NODE} revocations from {}", r.node);
         Ok(db.execute("INSERT INTO revocations (node, key, ts, json) VALUES (?, ?, ?, ?)
                        ON CONFLICT (node, key) DO UPDATE SET ts = excluded.ts, json = excluded.json
                        WHERE excluded.ts < revocations.ts",
