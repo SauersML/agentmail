@@ -47,6 +47,9 @@ CREATE INDEX IF NOT EXISTS messages_day ON messages (day, env_id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages (sender_sub, ts);
 CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, sub TEXT NOT NULL, seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cursors (sub TEXT PRIMARY KEY, last_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS used_tokens (name TEXT NOT NULL, jti TEXT NOT NULL, exp INTEGER NOT NULL,
+  PRIMARY KEY (name, jti));
+CREATE INDEX IF NOT EXISTS used_tokens_exp ON used_tokens (exp);
 ";
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
@@ -539,6 +542,20 @@ impl Store {
                 read_row,
             )
             .optional()?)
+    }
+
+    /// Records an agent token's jti as used. Ok(false): it was used before (a replay). Rows are kept until the token
+    /// expires (plus the clock skew), so the check survives a restart; expired rows are dropped as new ones come in.
+    pub fn use_token(&self, name: &str, jti: &str, exp_ms: i64, now_ms: i64) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let fresh = db.execute(
+            "INSERT OR IGNORE INTO used_tokens (name, jti, exp) VALUES (?, ?, ?)",
+            params![norm(name), jti, exp_ms + mailcore::agent_token::SKEW_S * 1000],
+        )? == 1;
+        if fresh && db.last_insert_rowid() % 256 == 0 {
+            db.execute("DELETE FROM used_tokens WHERE exp < ?", params![now_ms])?;
+        }
+        Ok(fresh)
     }
 
     pub fn seen(&self, name: &str, sub: &str, at_ms: i64) -> Result<()> {

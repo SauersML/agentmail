@@ -1,7 +1,9 @@
 //! The compat API on 127.0.0.1: the old server's routes and semantics (islandmail src/index.js) for /api/me,
-//! /api/messages, /api/threads, /api/names, /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket), with Bearer aid1
-//! auth checked offline the same way; POST/GET /api/files (encrypted, content-addressed blobs); POST
-//! /api/bridge/import for the history bridge. Not here: the web reader, /login + session cookies.
+//! /api/messages, /api/threads, /api/names, /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket); POST/GET
+//! /api/files (encrypted, content-addressed blobs); POST /api/bridge/import for the history bridge; GET /api/node
+//! (no auth: this node's key, which agent tokens name as their audience). Bearer auth is an agent token (PASETO
+//! v4.public signed by the member's own key) or, while a home is pinned, the old server's aid1 token, both checked
+//! offline. Not here: the web reader, /login + session cookies.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -54,6 +56,7 @@ pub fn json_resp(v: Value, status: u16) -> Response {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/api/node", get(node_info))
         .route("/api/me", get(me))
         .route("/api/messages", get(list).post(post))
         .route("/api/threads", get(threads))
@@ -119,13 +122,33 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
     })
 }
 
+/// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
+async fn node_info(State(s): State<AppState>) -> Response {
+    let mut auth = vec!["agent-token"];
+    if s.node.policy.is_some() {
+        auth.push("aid1");
+    }
+    let network = s.node.members.read().unwrap().network.clone();
+    json_resp(
+        json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": network,
+                "members_seq": s.node.members_seq(), "auth": auth,
+                "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",
+                                 "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
+        200,
+    )
+}
+
 async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let who = caller(&s, &headers)?;
+    let island = match &s.node.policy {
+        Some(p) => p.iss.clone(),
+        None => s.node.members.read().unwrap().network.clone(),
+    };
     Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "island": s.node.policy.iss,
+        json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "island": island, "auth": who.auth,
                 "last_id": s.node.store.last_id()?,
                 "node": mailcore::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
-                "features": ["signed-post", "private", "files"],
+                "features": ["signed-post", "private", "files", "agent-token"],
                 "refuse_token_only": s.node.opts.refuse_token_only }),
         200,
     ))

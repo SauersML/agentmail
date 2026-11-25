@@ -5,6 +5,7 @@
 //!   mailnode keygen SEED_FILE                       (prints the public key; the seed stays in the file, mode 600)
 //!   mailnode pubkey SEED_FILE
 //!   mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json
+//!   mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
 //!   mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS   (tests only: a throwaway home key, never Agaric's)
 
 mod api;
@@ -22,7 +23,8 @@ use mailcore::keys::fmt_key;
 use mailcore::MemberList;
 
 const USAGE: &str = "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
-     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS";
+     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  \
+     mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -55,6 +57,26 @@ async fn main() -> Result<()> {
             list.verify(&op.public())?;
             std::fs::write(&args[3], serde_json::to_string_pretty(&list)?)?;
             println!("signed member list seq {} by {}", list.seq, list.operator);
+            Ok(())
+        }
+        Some("agent-token") if args.len() == 3 || args.len() == 4 => {
+            // An islandmail.py identity file ({name, sub, seed}); refused if other users could read it.
+            let path = Path::new(&args[1]);
+            config::check_private(path)?;
+            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?).context("identity file is not JSON")?;
+            let (Some(name), Some(sub), Some(seed)) = (v["name"].as_str(), v["sub"].as_str(), v["seed"].as_str()) else {
+                bail!("identity file needs name, sub and seed");
+            };
+            let seed = mailcore::keys::Seed::from_hex(seed)?;
+            let node = mailcore::keys::parse_key(&args[2]).context("NODE_KEY (GET /api/node gives it)")?;
+            let ttl: i64 = match args.get(3) {
+                Some(t) => t.parse().context("TTL_SECS")?,
+                None => mailcore::agent_token::DEFAULT_LIFETIME_S,
+            };
+            if !(1..=mailcore::agent_token::MAX_LIFETIME_S).contains(&ttl) {
+                bail!("TTL_SECS must be 1 to {}", mailcore::agent_token::MAX_LIFETIME_S);
+            }
+            println!("{}", mailcore::agent_token::mint(&seed, name, sub, &node, mailcore::now_millis(), ttl));
             Ok(())
         }
         Some("mint-token") if args.len() == 6 => {
@@ -147,7 +169,7 @@ async fn run(path: &Path) -> Result<()> {
         streams: Arc::new(Mutex::new(Default::default())),
         sockets: Arc::new(Default::default()),
     };
-    // The API trusts any home token and serves decrypted mail: it is for this host's own processes only.
+    // The API serves decrypted mail to any member's valid token: it is for this host's own processes only.
     let loopback = match cfg.api_listen.parse::<std::net::SocketAddr>() {
         Ok(a) => a.ip().is_loopback(),
         Err(_) => cfg.api_listen.starts_with("localhost:"),

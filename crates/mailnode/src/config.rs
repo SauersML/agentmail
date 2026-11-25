@@ -50,7 +50,10 @@ pub struct Config {
     /// The operator key the member list must be signed by.
     pub operator_key: String,
     pub members_file: PathBuf,
-    pub home: HomeConfig,
+    /// The identity home whose aid1 tokens this node still accepts during the switch. Optional: without it the node
+    /// accepts only agent tokens (signed by each member's own key) and needs no server at all.
+    #[serde(default)]
+    pub home: Option<HomeConfig>,
     /// "disabled" (direct addresses only), "n0" (n0's public relays and address lookup), the URL of our own
     /// iroh-relay (e.g. "http://203.0.113.7:3340"), or a list mixing URLs and "n0" (our relays first, n0 as fallback).
     #[serde(default = "default_relay")]
@@ -155,13 +158,14 @@ impl Config {
         })
     }
 
-    pub fn policy(&self) -> Result<TokenPolicy> {
-        Ok(TokenPolicy {
-            home_key: parse_key(&self.home.key).context("home.key")?,
-            iss: self.home.iss.clone(),
-            aud: self.home.aud.clone(),
-            scope: self.home.scope.clone(),
-        })
+    pub fn policy(&self) -> Result<Option<TokenPolicy>> {
+        let Some(home) = &self.home else { return Ok(None) };
+        Ok(Some(TokenPolicy {
+            home_key: parse_key(&home.key).context("home.key")?,
+            iss: home.iss.clone(),
+            aud: home.aud.clone(),
+            scope: home.scope.clone(),
+        }))
     }
 
     pub fn members(&self) -> Result<MemberList> {
@@ -176,7 +180,8 @@ impl Config {
         read_or_create_seed(&self.node_key_file)
     }
 
-    /// (name, seed) of each local identity file. Files that do not parse are skipped.
+    /// (name, seed) of each local identity file. Files that do not parse, and files other users could read (group or
+    /// world bits set), are skipped with a warning.
     pub fn identities(&self) -> Vec<(String, Seed)> {
         let Some(dir) = &self.identities_dir else { return vec![] };
         let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
@@ -184,6 +189,10 @@ impl Config {
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Err(e) = check_private(&p) {
+                tracing::warn!("skipping identity file: {e:#}");
                 continue;
             }
             let Ok(raw) = std::fs::read_to_string(&p) else { continue };
@@ -197,7 +206,22 @@ impl Config {
     }
 }
 
+/// Refuses a key file other users could read or write: any group or world permission bit, or not a regular file.
+pub fn check_private(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    if !md.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    let mode = md.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!("{} holds a private key but has mode {mode:o}; run chmod 600 on it", path.display());
+    }
+    Ok(())
+}
+
 pub fn read_seed(path: &Path) -> Result<Seed> {
+    check_private(path)?;
     let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     Seed::from_hex(&raw)
 }
