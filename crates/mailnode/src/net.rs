@@ -356,16 +356,26 @@ pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) 
     let mut tick = tokio::time::interval(TRUST_POLL);
     loop {
         tick.tick().await;
-        let raw = std::fs::read(&cfg.members_file).ok();
-        if raw.is_some() && raw == last {
+        let raw = match std::fs::read(&cfg.members_file) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!("reading {}: {e}", cfg.members_file.display());
+                continue;
+            }
+        };
+        if last.as_ref() == Some(&raw) {
             continue;
         }
-        match cfg.members().and_then(|list| node.reload_members(&list)) {
+        match Config::parse_members(&raw).and_then(|list| node.reload_members(&list)) {
             Ok(true) => adopted(),
             Ok(false) => {}
-            Err(e) => tracing::warn!("local trust file refused: {e:#}"),
+            Err(e) => {
+                tracing::warn!("local trust file refused: {e:#}");
+                // A temporary database failure can clear while the file stays the same.
+                if e.downcast_ref::<rusqlite::Error>().is_some() { continue; }
+            }
         }
-        last = raw;
+        last = Some(raw);
     }
 }
 

@@ -61,9 +61,13 @@ impl Config {
     }
 
     pub fn members(&self) -> Result<MemberList> {
-        let raw = std::fs::read_to_string(&self.members_file)
+        let raw = std::fs::read(&self.members_file)
             .with_context(|| format!("reading {}", self.members_file.display()))?;
-        let list: MemberList = serde_json::from_str(&raw).context("member list is not valid JSON")?;
+        Self::parse_members(&raw)
+    }
+
+    pub fn parse_members(raw: &[u8]) -> Result<MemberList> {
+        let list: MemberList = serde_json::from_slice(raw).context("member list is not valid JSON")?;
         list.validate()?;
         Ok(list)
     }
