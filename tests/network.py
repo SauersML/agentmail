@@ -12,6 +12,7 @@ its agent's sign-in at once and replicates; and a trust-file edit cuts off an id
 peer is offline.
 """
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -127,6 +128,15 @@ def main():
         fd = os.open(ident("pod", "hypha"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(data)
+        # Resume an existing stream cursor: this path opens /api/stream without first calling /api/me.
+        cursor = "watch-%s-hypha-main.last" % hashlib.sha256(pub["pod"].encode()).hexdigest()
+        with open(os.path.join(work, "client-pod", cursor), "w") as f:
+            f.write("0")
+        # Send after hypha's mac certificate has replicated, so its key is in the signed recipient list.
+        rc, out = cl("will", "send", "--to", "hypha", "watch at the second home")
+        check("mail posted for second-home watch", rc == 0, out[-160:])
+        rc, out = cl("pod", "watch", "--mine", "--until", timeout=25)
+        check("resumed watch gets the second home's certificate", rc == 0 and "> " in out, out[-160:])
         rc, out = cl("pod", "whoami")
         check("hypha signs in at its second home", rc == 0 and "hypha" in out, out[-200:])
         homes = lambda: [x["homes"] for x in req("GET", api["will"], "/api/agents", token=cl(

@@ -226,7 +226,7 @@ def _read_identity(name):
             raise Fail("invalid identity file for %s" % name)
         return ident
     except FileNotFoundError:
-        raise Fail("no identity named %s in %s" % (name, folder))
+        raise Fail("identity file disappeared for %s" % name)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -236,6 +236,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def http_error(e):
+    with e:
+        try:
+            msg = json.loads(e.read(8192)).get("error") or e.reason
+        except (ValueError, AttributeError, HTTPException):
+            msg = e.reason
+    return Fail("%s %s: %s" % (e.code, urllib.parse.urlsplit(e.url).path, msg))
 
 
 def http(method, url, body=None, headers=None, raw=False, timeout=60):
@@ -262,11 +271,7 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
                 raise Fail("incomplete response")
             return out if raw else json.loads(out or b"{}")
     except urllib.error.HTTPError as e:
-        try:
-            msg = json.loads(e.read(8192)).get("error") or e.reason
-        except Exception:
-            msg = e.reason
-        raise Fail("%s %s: %s" % (e.code, urllib.parse.urlsplit(url).path, msg))
+        raise http_error(e)
     except HTTPException as e:
         raise Fail("incomplete HTTP response") from e
     except urllib.error.URLError as e:
@@ -321,13 +326,18 @@ def api(ident, method, path, body=None, headers=None, raw=False, timeout=60):
         try:
             return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
         except Fail as e:
-            # A key this node has not certified yet (e.g. a second home): certify it here once, then retry.
-            if attempt or not str(e).startswith("403 ") or "no certificate from this node" not in str(e):
+            if attempt or not certify_missing(ident, e):
                 raise
-            try:
-                certify(ident)
-            except Fail as c:
-                raise Fail("%s (certifying here: %s)" % (e, c))
+
+
+def certify_missing(ident, error):
+    if not str(error).startswith("403 ") or "no certificate from this node" not in str(error):
+        return False
+    try:
+        certify(ident)
+    except Fail as exc:
+        raise Fail("%s (certifying here: %s)" % (error, exc)) from exc
+    return True
 
 
 # ---- formatting and addressing (same rules as the server) ----
@@ -559,11 +569,21 @@ def cmd_download(a):
 def cmd_watch(a):
     ident = load_identity(a.as_)
     resume = os.path.join(DIR, "watch-%s-%s-%s.last" % (hashlib.sha256(node_key().encode()).hexdigest(), ident["name"], safe_name(a.name)))
-    try:
-        with open(resume) as f:
-            after = int(f.read().strip())
-    except (FileNotFoundError, ValueError):
-        after = api(ident, "GET", "/api/me")["last_id"]
+    while True:
+        try:
+            with open(resume, "rb") as f:
+                cursor = f.read(32)
+            if not re.fullmatch(rb"[0-9]{1,19}\s*", cursor) or len(cursor) == 32 or int(cursor) > 2**63 - 1:
+                raise Fail("invalid watch cursor in %s" % resume)
+            after = int(cursor)
+        except FileNotFoundError:
+            after = api(ident, "GET", "/api/me")["last_id"]
+            try:
+                write_private(resume, str(after), create=True)
+            except FileExistsError:
+                continue
+        break
+    certified = False
     delay = 1
     while True:
         try:
@@ -572,6 +592,7 @@ def cmd_watch(a):
                 "User-Agent": UA})
             with _opener.open(req, timeout=90) as r:
                 delay = 1
+                certified = False
                 for line in r:
                     line = line.decode("utf-8", "replace").rstrip("\n")
                     if not line.startswith("data: "):
@@ -588,10 +609,14 @@ def cmd_watch(a):
                     if print_it and a.until:
                         return
         except urllib.error.HTTPError as e:
+            error = http_error(e)
+            if not certified and certify_missing(ident, error):
+                certified = True
+                continue
             if e.code < 500 and e.code not in (408, 429):
-                raise Fail("watch: HTTP %d" % e.code)
+                raise error
             sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException) as e:
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
         delay = min(delay * 2, 60)

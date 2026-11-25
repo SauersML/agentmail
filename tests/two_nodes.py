@@ -266,16 +266,27 @@ def main():
                                   capture_output=True, text=True, timeout=10)
         check("an online command detects a mismatched public key before sign-in",
               mismatch.returncode == 1 and "does not match ISLANDMAIL_NODE_KEY" in mismatch.stderr)
-        watcher = subprocess.Popen([sys.executable, a.islandmail, "watch", "--mine", "--until", "--name", "it"],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)
-        time.sleep(1.5)
+        def watch():
+            return subprocess.Popen([sys.executable, a.islandmail, "watch", "--mine", "--until", "--name", "it"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)
+        watcher = watch()
+        try:
+            ready, _ = wait_for(lambda: any(f.endswith("-t.bob-it.last") for f in os.listdir(envb["ISLANDMAIL_DIR"])), timeout=5)
+            check("idle watcher checkpoints its starting cursor", bool(ready))
+        finally:
+            watcher.terminate()
+            watcher.communicate(timeout=5)
         rc, out = im(pa, "alice", "send", "--to", "t.bob", "--thread", "t2", "sent with islandmail.py")
         check("islandmail.py send (A)", rc == 0 and out.startswith("sent #") and "reaches t.bob" in out, out)
+        delivered, _ = wait_for(lambda: req("GET", pb, "/api/messages?thread=t2", token("B", "bob"))[1]["messages"])
+        check("message reached B while watcher was stopped", bool(delivered))
+        watcher = watch()
         try:
             wout, _ = watcher.communicate(timeout=20)
             check("islandmail.py watch --mine --until (B) gets it", "sent with islandmail.py" in wout, wout.splitlines()[0] if wout else "")
         except subprocess.TimeoutExpired:
             watcher.kill()
+            watcher.communicate()
             check("islandmail.py watch --mine --until (B) gets it", False, "timeout")
         rc, out = im(pa, "alice", "read", "--thread", "t2", "--latest", "5")
         check("islandmail.py read (A)", rc == 0 and "> sent with islandmail.py" in out, out.splitlines()[0] if out else "")
