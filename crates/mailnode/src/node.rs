@@ -259,20 +259,10 @@ impl Node {
             !s.chars().any(|c| c.is_control())
         })?;
         let text = clean_text(body.get("text"), !files.is_empty())?;
-        let mode = match body.get("mode").and_then(|m| m.as_str()) {
-            None | Some("members") => Mode::Members,
-            Some("private") => Mode::Private,
-            Some(_) => return Err(ApiError::new(400, "mode must be members or private")),
+        let mode = match body.get("mode") {
+            None => Mode::Members,
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| ApiError::new(400, "mode must be members or private"))?,
         };
-        let since = ts_from_millis(now_millis() - REPEAT_MS);
-        if files.is_empty() {
-            if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)? {
-                if row.mode == mode.as_str() && row.visible_to(who) {
-                    let reaches = self.reaches(&to, &who.sub)?;
-                    return Ok(Posted { row, reaches, repeated: true });
-                }
-            }
-        }
         self.rate(&who.sub, "message", 120)?;
         if is_broadcast(&to) {
             self.rate(&who.sub, "broadcast", 20)?;
@@ -292,7 +282,7 @@ impl Node {
             }
         };
         // Signed by the sender's own key (islandmail.py sends `signed: {ts, salt, sig}`), or token-attested.
-        let (ts, attest, salt) = match body.get("signed").filter(|s| s.is_object()) {
+        let (ts, attest, salt) = match body.get("signed") {
             Some(s) => {
                 let raw_thread = body.get("thread").and_then(|t| t.as_str()).unwrap_or("general");
                 if body["to"].as_str() != Some(to.as_str())
@@ -336,6 +326,14 @@ impl Node {
             None => {
                 let (key, seed) = self.local_key(&members, who).ok_or_else(|| ApiError::new(400,
                     "sign the post with your agent key or configure identities_dir on this node"))?;
+                if file_ids.is_empty() {
+                    let since = ts_from_millis(now_millis() - REPEAT_MS);
+                    if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)?
+                        .filter(|r| r.mode == mode.as_str() && r.visible_to(who)) {
+                        let reaches = self.reaches(&to, &who.sub)?;
+                        return Ok(Posted { row, reaches, repeated: true });
+                    }
+                }
                 let salt = mailcore::random_bytes::<16>();
                 let ts = now_ts();
                 let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
@@ -368,10 +366,16 @@ impl Node {
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
         let readers = (mode == Mode::Private).then(|| readers_for(&members, &to, &who.name));
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
-        let row = self
-            .store
-            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())?
-            .ok_or_else(|| ApiError::new(500, "envelope id collision"))?;
+        let row = match self.store.insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())? {
+            Some(row) => row,
+            None => {
+                let Attest::Agent { sig, .. } = &env.attest;
+                let row = self.store.by_agent_sig(sig)?.filter(|r| r.visible_to(who))
+                    .ok_or_else(|| ApiError::new(409, "signed message already stored"))?;
+                let reaches = self.reaches(&to, &who.sub)?;
+                return Ok(Posted { row, reaches, repeated: true });
+            }
+        };
         let _ = self.events.send(Arc::new(row.clone()));
         let _ = self.outbound.send(Outbound::Envelope(env));
         let reaches = self.reaches(&to, &who.sub)?;
@@ -472,7 +476,8 @@ impl Node {
         if !self.members.read().unwrap().is_node(to) {
             return Ok(out);
         }
-        for raw in self.store.envelopes(ids)? {
+        for id in ids {
+            let Some(raw) = self.store.envelopes(std::slice::from_ref(id))?.pop() else { continue };
             let env: Envelope = serde_json::from_str(&raw)?;
             if env.mode == Mode::Members {
                 if let Ok(Some(g)) = env.grant(&self.seed, to) {
@@ -487,6 +492,7 @@ impl Node {
     pub fn apply_grant(&self, id: &str, g: &Grant) -> Result<bool> {
         let Some(raw) = self.store.envelopes(&[id.to_string()])?.pop() else { return Ok(false) };
         let env: Envelope = serde_json::from_str(&raw)?;
+        anyhow::ensure!(env.mode == Mode::Members, "private mail does not accept grants");
         let body = env.open_grant(g, &self.seed)?;
         env.check_body(&body)?;
         let text: String = body.text.chars().take(MAX_TEXT as usize).collect();
@@ -981,6 +987,10 @@ mod tests {
         assert_eq!(p.row.attest, "agent");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
+        for invalid in [json!({"to":"all","thread":"t","text":"hi","signed":null}),
+                        json!({"to":"all","thread":"t","text":"hi","mode":false})] {
+            assert!(node.post(&who, &invalid).is_err());
+        }
         let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
         assert_eq!(env_of(rx.try_recv().unwrap()).parents, vec![p.row.env_id.clone()], "parents = thread heads");
         assert!(p3.row.id > p.row.id);
