@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """The client's PASETO v4.public signing against the official test vectors (paseto-standard/test-vectors v4.json,
-4-S-1..3), with the pure-Python Ed25519 and, when installed, pyca/cryptography. No node needed.
+4-S-1..3), using pyca/cryptography. No node needed.
 
   python3 tests/client_paseto.py --repo .
 """
 import argparse
 import importlib.util
 import os
-import sys
 
 SEED = bytes.fromhex("b4cbfb43df4ce210727d953e4a713307fa19bb7d9f85041438d9e11b942a3774")
 PUBLIC = bytes.fromhex("1eb9dbbbbc047c03fd70604e0071f0987e16b28b757225c11f00415d0e20b1a2")
@@ -27,20 +26,10 @@ def main():
     spec = importlib.util.spec_from_file_location("islandmail", os.path.join(a.repo, "clients", "islandmail.py"))
     im = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(im)
-    impls = [("pure Python", None)] + ([("pyca/cryptography", im._PycaKey)] if im._PycaKey else [])
-    failed = 0
-    for label, pyca in impls:
-        im._PycaKey = pyca
-        ok = im.ed25519_public(SEED) == PUBLIC
-        print("%s public key (%s)" % ("PASS" if ok else "FAIL", label))
-        failed += not ok
-        for name, footer, implicit, want in VECTORS:
-            ok = im.paseto_v4_public_sign(SEED, PAYLOAD, footer, implicit) == want
-            print("%s %s (%s)" % ("PASS" if ok else "FAIL", name, label))
-            failed += not ok
-    if len(impls) == 1:
-        print("note: pyca/cryptography not installed; only the pure-Python signer was checked")
-    sys.exit(1 if failed else 0)
+    assert im.ed25519_public(SEED) == PUBLIC
+    for name, footer, implicit, want in VECTORS:
+        assert im.paseto_v4_public_sign(SEED, PAYLOAD, footer, implicit) == want, name
+        print("PASS", name)
 
 
 if __name__ == "__main__":

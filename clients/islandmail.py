@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-"""Agent mail client for agent-mail nodes (and the old server, mail.gnome.science), standard library only.
+"""Peer-to-peer agent mail. Generate a local key and give its public entry to your network operator.
 
-Every agent has its own ed25519 key, which it generates and keeps. On an agent-mail node the client signs in with an
-agent token it mints from that key (PASETO v4.public, for that one node, used once), and signs every message with the
-same key: no identity home, no server but your own node. The node lets in the names on its signed member list.
-Against the old server (or with ISLANDMAIL_TOKEN=home) it gets an aid1 token from the identity home instead.
-
-  python3 islandmail.py newkey will.orchestrator    # once, no home: makes your key, prints your member-list entry
-  python3 islandmail.py enroll inv_XXXX will.orchestrator     # or once, with Agaric's home and an invite code
+  python3 islandmail.py newkey will.orchestrator
   python3 islandmail.py whoami
   python3 islandmail.py send --to sauersml.glead --thread oracle-design "text"      (or - to read stdin)
   python3 islandmail.py send --to will. --file plot.png "see attached"              (will. = Will's whole team)
@@ -25,9 +19,7 @@ Against the old server (or with ISLANDMAIL_TOKEN=home) it gets an aid1 token fro
 
 Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
 readable only by you (the client refuses identity files other users can read).
-Node: ISLANDMAIL_URL (e.g. http://127.0.0.1:8787). Tokens: ISLANDMAIL_TOKEN=auto (default: agent tokens, except
-against mail.gnome.science, which takes only home tokens), self, or home. ISLANDMAIL_NODE_KEY pins the node's key
-instead of asking the node (GET /api/node).
+Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). ISLANDMAIL_NODE_KEY pins the token audience.
 Addressing: names separated by commas, a team prefix ending in a dot (will.), or all.
 """
 import argparse
@@ -46,115 +38,32 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-MAIL = os.environ.get("ISLANDMAIL_URL", "https://mail.gnome.science")
-HOME = os.environ.get("ISLANDMAIL_HOME", "agaric.gnome.science")
+MAIL = os.environ.get("ISLANDMAIL_URL", "http://127.0.0.1:8787").rstrip("/")
 DIR = os.path.expanduser(os.environ.get("ISLANDMAIL_DIR", "~/.islandmail"))
-TOKEN_MODE = os.environ.get("ISLANDMAIL_TOKEN", "auto")
-OLD_SERVER = "mail.gnome.science"
 UA = "islandmail.py/2"
 # Agent tokens: single-use, so each request gets a fresh one; short-lived unless a stream needs longer.
 REQUEST_TTL = 300
 STREAM_TTL = 3600
 MAX_TTL = 86400
 
-# ---- ed25519 signing (RFC 8032): pyca/cryptography when installed, else the pure-Python version below ----
-
 try:
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey as _PycaKey
-except ImportError:  # standard library only
-    _PycaKey = None
-
-_p = 2**255 - 19
-_L = 2**252 + 27742317777372353535851937790883648493
-_d = -121665 * pow(121666, _p - 2, _p) % _p
-_I = pow(2, (_p - 1) // 4, _p)
-
-
-def _inv(x):
-    return pow(x, _p - 2, _p)
-
-
-def _xrecover(y):
-    xx = (y * y - 1) * _inv(_d * y * y + 1)
-    x = pow(xx, (_p + 3) // 8, _p)
-    if (x * x - xx) % _p:
-        x = x * _I % _p
-    return _p - x if x % 2 else x
-
-
-_By = 4 * _inv(5) % _p
-_Bx = _xrecover(_By)
-_B = (_Bx, _By, 1, _Bx * _By % _p)
-
-
-def _add(P, Q):
-    X1, Y1, Z1, T1 = P
-    X2, Y2, Z2, T2 = Q
-    A = (Y1 - X1) * (Y2 - X2) % _p
-    B = (Y1 + X1) * (Y2 + X2) % _p
-    C = T1 * 2 * _d * T2 % _p
-    D = Z1 * 2 * Z2 % _p
-    E, F, G, H = B - A, D - C, D + C, B + A
-    return (E * F % _p, G * H % _p, F * G % _p, E * H % _p)
-
-
-def _mul(s, P):
-    Q = (0, 1, 1, 0)
-    while s:
-        if s & 1:
-            Q = _add(Q, P)
-        P = _add(P, P)
-        s >>= 1
-    return Q
-
-
-def _encode(P):
-    X, Y, Z, _ = P
-    zi = _inv(Z)
-    x, y = X * zi % _p, Y * zi % _p
-    return (y | ((x & 1) << 255)).to_bytes(32, "little")
-
-
-def _expand(seed):
-    h = hashlib.sha512(seed).digest()
-    a = int.from_bytes(h[:32], "little")
-    a &= (1 << 254) - 8
-    a |= 1 << 254
-    return a, h[32:]
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+except ImportError:
+    sys.exit("Install the client dependency with: python3 -m pip install cryptography")
 
 
 def ed25519_public(seed):
-    if _PycaKey is not None:
-        from cryptography.hazmat.primitives import serialization
-        return _PycaKey.from_private_bytes(seed).public_key().public_bytes(
-            serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    a, _ = _expand(seed)
-    return _encode(_mul(a, _B))
+    return Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
 def ed25519_sign(seed, msg):
-    if _PycaKey is not None:
-        return _PycaKey.from_private_bytes(seed).sign(msg)
-    return _ed25519_sign_py(seed, msg)
-
-
-def _ed25519_sign_py(seed, msg):
-    # Deterministic RFC 8032 signing in plain Python (big-integer arithmetic, so not constant-time: for the agent's own
-    # machine, where the key already lives on disk; install `cryptography` to use the audited implementation instead).
-    a, prefix = _expand(seed)
-    A = _encode(_mul(a, _B))
-    r = int.from_bytes(hashlib.sha512(prefix + msg).digest(), "little") % _L
-    R = _encode(_mul(r, _B))
-    k = int.from_bytes(hashlib.sha512(R + A + msg).digest(), "little") % _L
-    return R + ((r + k * a) % _L).to_bytes(32, "little")
+    return Ed25519PrivateKey.from_private_bytes(seed).sign(msg)
 
 
 def b64u(b):
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def now_iso():
-    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ---- PASETO v4.public (https://github.com/paseto-standard/paseto-spec): Ed25519 over PAE(h, m, f, i) ----
@@ -245,7 +154,7 @@ def load_identity(name):
         if len(have) == 1:
             name = have[0]
         elif not have:
-            raise Fail("no identity yet: run `islandmail.py enroll <invite> <name>` with an invite from an operator")
+            raise Fail("no identity yet: run `islandmail.py newkey NAME` and give the printed entry to your operator")
         else:
             raise Fail("several identities here (%s): pick one with --as NAME" % ", ".join(have))
     try:
@@ -290,16 +199,6 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
         raise Fail("cannot reach %s (%s)" % (urllib.parse.urlsplit(url).netloc, e.reason))
 
 
-def token_mode(ident):
-    mode = TOKEN_MODE
-    if mode not in ("auto", "self", "home"):
-        raise Fail("ISLANDMAIL_TOKEN must be auto, self or home")
-    if mode == "auto":
-        old = urllib.parse.urlsplit(MAIL).hostname == OLD_SERVER
-        mode = "home" if old or not (ident.get("seed") and ident.get("sub")) else "self"
-    return mode
-
-
 _node_key = {}
 
 
@@ -309,63 +208,20 @@ def node_key():
     if os.environ.get("ISLANDMAIL_NODE_KEY"):
         return os.environ["ISLANDMAIL_NODE_KEY"].strip()
     if MAIL not in _node_key:
-        try:
-            info = http("GET", MAIL + "/api/node")
-        except Fail as e:
-            if str(e).startswith("404"):
-                raise Fail("%s has no /api/node, so it takes no agent tokens (the old server takes only home tokens: "
-                           "ISLANDMAIL_TOKEN=home)" % MAIL)
-            raise
+        info = http("GET", MAIL + "/api/node")
         if "agent-token" not in info.get("auth", []) or not str(info.get("node", "")).startswith("ed25519:"):
             raise Fail("%s does not take agent tokens" % MAIL)
         _node_key[MAIL] = info["node"]
     return _node_key[MAIL]
 
 
-def token_for(ident, audience="mail", fresh=False, ttl=REQUEST_TTL):
-    if token_mode(ident) == "self":
-        return agent_token(ident, node_key(), ttl)
-    return home_token(ident, audience, fresh)
-
-
-def home_token(ident, audience="mail", fresh=False):
-    # The legacy path: an aid1 token from the identity home (https://<home>/token), cached until near expiry.
-    if not ident.get("home"):
-        raise Fail("identity %s has no home, so it signs in only with agent tokens, which need an agent-mail node "
-                   "(ISLANDMAIL_URL); the old server takes only home tokens" % ident["name"])
-    cache = os.path.join(DIR, "tokens", "%s.%s.json" % (ident["name"], audience))
-    if not fresh:
-        try:
-            with open(cache) as f:
-                t = json.load(f)
-            if t.get("exp", 0) - 600 > time.time():
-                return t["token"]
-        except (FileNotFoundError, ValueError):
-            pass
-    seed = bytes.fromhex(ident["seed"])
-    ts = now_iso()
-    statement = "archipelago-token|v1|%s|%s|%s" % (ident["home"], audience, ts)
-    r = http("POST", "https://%s/token" % ident["home"], {
-        "id": ident["id"], "audience": audience, "timestamp": ts, "proof": b64u(ed25519_sign(seed, statement.encode())),
-        "ttl": "24h",
-    })
-    try:
-        write_private(cache, json.dumps({"token": r["token"], "exp": r.get("exp", time.time() + 3600)}))
-    except OSError:
-        pass  # a sandbox that cannot write here still sends; it just mints a token per run
-    return r["token"]
+def token_for(ident, ttl=REQUEST_TTL):
+    return agent_token(ident, node_key(), ttl)
 
 
 def api(ident, method, path, body=None, headers=None, raw=False, timeout=60):
-    for attempt in (0, 1):
-        h = {"Authorization": "Bearer " + token_for(ident, fresh=attempt == 1)}
-        h.update(headers or {})
-        try:
-            return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
-        except Fail as e:
-            if attempt == 0 and str(e).startswith("401"):
-                continue
-            raise
+    h = {"Authorization": "Bearer " + token_for(ident), **(headers or {})}
+    return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
 
 
 # ---- formatting and addressing (same rules as the server) ----
@@ -412,35 +268,6 @@ def show(m, out=sys.stdout):
 
 
 # ---- commands ----
-
-
-def cmd_enroll(a):
-    name = a.name
-    if os.path.exists(ident_path(name)):
-        raise Fail("%s already exists in %s" % (name, DIR))
-    # The key is on disk before the home learns it, so a lost reply never leaves an enrolled name with no key; a rerun
-    # after a failure reuses the same key.
-    pending = os.path.join(DIR, "identities", name + ".pending")
-    try:
-        with open(pending) as f:
-            seed = bytes.fromhex(json.load(f)["seed"])
-    except (FileNotFoundError, ValueError, KeyError):
-        seed = os.urandom(32)
-        write_private(pending, json.dumps({"name": name, "home": a.home, "seed": seed.hex()}))
-    kid = "ed25519:" + b64u(ed25519_public(seed))
-    ts = now_iso()
-    statement = "archipelago-enroll|v2|%s|%s|%s|%s" % (a.home, a.invite, name, ts)
-    try:
-        r = http("POST", "https://%s/enroll" % a.home, {
-            "v": 2, "invite": a.invite, "id": kid, "name": name, "timestamp": ts,
-            "proof": b64u(ed25519_sign(seed, statement.encode())),
-        })
-    except Fail as e:
-        raise Fail("%s (the key is kept in %s; rerun the same command to retry with it)" % (e, pending))
-    write_private(ident_path(name), json.dumps(
-        {"name": name, "sub": r["sub"], "home": a.home, "id": kid, "seed": seed.hex()}, indent=1))
-    os.unlink(pending)
-    print("enrolled as %s (%s) on %s; key saved in %s" % (name, r["sub"], a.home, ident_path(name)))
 
 
 def cmd_newkey(a):
@@ -494,8 +321,7 @@ def norm_text(s):
 
 
 def signed_block(ident, to, thread, text, ids, mode):
-    # agent-mail (p2p) nodes check this signature by the agent's own key against the member list; the old server
-    # ignores the field. digest = SHA-256(salt || text || 0x00 || file ids joined by ",").
+    # digest = SHA-256(salt || text || 0x00 || file ids joined by ",").
     seed = bytes.fromhex(ident["seed"])
     now = datetime.datetime.now(datetime.timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
@@ -509,8 +335,6 @@ def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
     to, thread = norm_field(a.to), norm_field(a.thread)
     mode = "private" if getattr(a, "private", False) else "members"
-    if mode == "private" and "private" not in api(ident, "GET", "/api/me").get("features", []):
-        raise Fail("--private needs an agent-mail node (on the old server every message is readable by all)")
     ids = []
     for path in a.file or []:
         with open(path, "rb") as f:
@@ -545,7 +369,7 @@ def cmd_ask(a):
     ident = load_identity(a.as_)
     a.file = None
     sent = send(ident, a)
-    # An agent renamed on Agaric's home answers under its new name, which the mailbox gives as the one name reached.
+    # Use the canonical recipient returned by the node.
     if len(sent.get("reaches") or []) == 1:
         to = _addr(sent["reaches"][0])
     deadline, delay = time.time() + a.wait, 3
@@ -647,10 +471,7 @@ def cmd_watch(a):
                     if a.until:
                         return
         except urllib.error.HTTPError as e:
-            if e.code == 401 and token_mode(ident) == "home":
-                token_for(ident, fresh=True)
-            else:  # agent tokens are fresh on every connect anyway
-                sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
+            sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
         except Exception as e:  # network drops, timeouts: resume from the last id
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
@@ -661,11 +482,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("enroll", help="register once with an invite code")
-    p.add_argument("invite")
-    p.add_argument("name", help="1-48 characters: letters, digits, . _ - (no spaces); e.g. will.orchestrator")
-    p.add_argument("--home", default=HOME)
-    p.set_defaults(fn=cmd_enroll)
     p = sub.add_parser("newkey", help="make your key with no home server; prints the member-list entry for the operator")
     p.add_argument("name")
     p.add_argument("--sub", help="durable id for the member list (default agent:NAME)")
