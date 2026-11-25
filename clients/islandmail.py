@@ -301,7 +301,7 @@ def node_info():
 
 
 def node_key():
-    return os.environ.get("ISLANDMAIL_NODE_KEY", "").strip() or node_info()["node"]
+    return node_info()["node"]
 
 
 def token_for(ident, ttl=REQUEST_TTL):
@@ -384,7 +384,7 @@ def cmd_selftoken(a):
     if not 1 <= a.ttl <= MAX_TTL:
         raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
     ident = load_identity(a.as_)
-    key = a.node_key or node_key()
+    key = a.node_key or os.environ.get("ISLANDMAIL_NODE_KEY", "").strip() or node_key()
     print(agent_token(ident, key, a.ttl))
 
 
