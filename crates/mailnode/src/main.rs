@@ -60,8 +60,7 @@ async fn main() -> Result<()> {
         Some("agent-token") if args.len() == 3 || args.len() == 4 => {
             // An islandmail.py identity file ({name, sub, seed}); refused if other users could read it.
             let path = Path::new(&args[1]);
-            config::check_private(path)?;
-            let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?).context("identity file is not JSON")?;
+            let v: serde_json::Value = serde_json::from_str(&config::read_private(path)?).context("identity file is not JSON")?;
             let (Some(name), Some(sub), Some(seed)) = (v["name"].as_str(), v["sub"].as_str(), v["seed"].as_str()) else {
                 bail!("identity file needs name, sub and seed");
             };
@@ -93,8 +92,16 @@ async fn run(path: &Path) -> Result<()> {
         )
         .init();
     let cfg = config::Config::load(path)?;
-    std::fs::create_dir_all(&cfg.data_dir)?;
-    private_data(&cfg.data_dir)?;
+    let listen: std::net::SocketAddr = match cfg.api_listen.strip_prefix("localhost:") {
+        Some(port) => ([127, 0, 0, 1], port.parse::<u16>().context("invalid api_listen port")?).into(),
+        None => cfg.api_listen.parse().context("api_listen needs a loopback socket address")?,
+    };
+    anyhow::ensure!(listen.ip().is_loopback(), "api_listen must be a loopback address");
+    let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&cfg.data_dir)?;
+    anyhow::ensure!(cfg.data_dir.symlink_metadata()?.is_dir(), "data_dir must be a directory");
+    std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))?;
     let seed = cfg.node_seed()?;
     let members = cfg.best_members()?;
     if !members.is_node(&seed.public()) {
@@ -110,7 +117,6 @@ async fn run(path: &Path) -> Result<()> {
         identities.len()
     );
     let store = store::Store::open(&cfg.data_dir.join("mail.sqlite"))?;
-    private_data(&cfg.data_dir)?; // again, for a database the open just created
     // Every member is a known name from the start (who / reaches), even before it has written anything here.
     for m in &members.members {
         store.seen(&m.name, &m.sub, 0)?;
@@ -133,35 +139,11 @@ async fn run(path: &Path) -> Result<()> {
         streams: Arc::new(Mutex::new(Default::default())),
         sockets: Arc::new(Default::default()),
     };
-    // The API serves decrypted mail to any member's valid token: it is for this host's own processes only.
-    let loopback = match cfg.api_listen.parse::<std::net::SocketAddr>() {
-        Ok(a) => a.ip().is_loopback(),
-        Err(_) => cfg.api_listen.starts_with("localhost:"),
-    };
-    if !loopback {
-        bail!("api_listen {} is not a loopback address; the compat API must not be reachable from other hosts", cfg.api_listen);
-    }
-    let listener = tokio::net::TcpListener::bind(&cfg.api_listen).await.with_context(|| format!("binding {}", cfg.api_listen))?;
     tracing::info!("compat API on http://{} ({} envelopes stored)", cfg.api_listen, node.store.count()?);
     axum::serve(listener, api::router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
-    Ok(())
-}
-
-/// The store holds decrypted mail (members mode, and private mail for the identities this node holds): only this
-/// user may read it. SQLite gives its -wal and -shm files the database file's mode.
-fn private_data(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("making {} private", dir.display()))?;
-    for f in ["mail.sqlite", "mail.sqlite-wal", "mail.sqlite-shm"] {
-        let p = dir.join(f);
-        if p.exists() {
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
     Ok(())
 }

@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 mailcore = { path = "../mailcore" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }

@@ -18,6 +18,7 @@ pub struct Renamed {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub data_dir: PathBuf,
     /// Compat API, e.g. "127.0.0.1:8787"
@@ -116,11 +117,13 @@ impl Config {
             if p.extension().and_then(|x| x.to_str()) != Some("json") {
                 continue;
             }
-            if let Err(e) = check_private(&p) {
-                tracing::warn!("skipping identity file: {e:#}");
-                continue;
-            }
-            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+            let raw = match read_private(&p) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::warn!("skipping identity file: {e:#}");
+                    continue;
+                }
+            };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
             let (Some(name), Some(seed)) = (v["name"].as_str(), v["seed"].as_str()) else { continue };
             if let Ok(s) = Seed::from_hex(seed) {
@@ -132,9 +135,12 @@ impl Config {
 }
 
 /// Refuses a key file other users could read or write: any group or world permission bit, or not a regular file.
-pub fn check_private(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let md = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+pub fn read_private(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path).with_context(|| format!("opening {}", path.display()))?;
+    let md = file.metadata()?;
     if !md.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());
     }
@@ -142,13 +148,14 @@ pub fn check_private(path: &Path) -> Result<()> {
     if mode & 0o077 != 0 {
         anyhow::bail!("{} holds a private key but has mode {mode:o}; run chmod 600 on it", path.display());
     }
-    Ok(())
+    let mut text = String::new();
+    file.take(16_385).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() <= 16_384, "private key file too large");
+    Ok(text)
 }
 
 pub fn read_seed(path: &Path) -> Result<Seed> {
-    check_private(path)?;
-    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    Seed::from_hex(&raw)
+    Seed::from_hex(&read_private(path)?)
 }
 
 pub fn write_seed(path: &Path, seed: &Seed) -> Result<()> {

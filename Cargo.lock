@@ -1730,6 +1730,7 @@ dependencies = [
  "futures",
  "iroh",
  "iroh-gossip",
+ "libc",
  "mailcore",
  "rusqlite",
  "serde",
