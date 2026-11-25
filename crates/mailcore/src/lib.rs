@@ -1,5 +1,5 @@
 //! Agent mail core: the wire envelope, its encryption and signatures, agent tokens (PASETO v4.public, signed by the
-//! agent's own key) and the legacy aid1 home tokens, the signed member list, addressing rules and the per-thread order. No I/O: `mailnode` does storage and networking.
+//! agent's own key) and the signed member list, addressing rules and the per-thread order. No I/O: `mailnode` does storage and networking.
 
 pub mod addr;
 pub mod agent_token;
@@ -9,11 +9,9 @@ pub mod keys;
 pub mod members;
 pub mod order;
 pub mod paseto;
-pub mod token;
 
 pub use envelope::{Attest, Body, Envelope, Mode, Verified};
 pub use members::{Member, MemberList, NodeEntry};
-pub use token::{Aid1Payload, TokenPolicy};
 
 use base64::engine::{general_purpose::GeneralPurpose, DecodePaddingMode, GeneralPurposeConfig};
 use base64::Engine;

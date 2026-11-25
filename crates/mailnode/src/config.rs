@@ -4,27 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mailcore::keys::{parse_key, Seed};
-use mailcore::{MemberList, TokenPolicy};
+use mailcore::MemberList;
 use serde::Deserialize;
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct HomeConfig {
-    /// The home's pinned token-signing key, e.g. "ed25519:2uXa…"
-    pub key: String,
-    /// The home's domain (the tokens' iss), e.g. agaric.gnome.science
-    pub iss: String,
-    #[serde(default = "default_aud")]
-    pub aud: String,
-    #[serde(default = "default_scope")]
-    pub scope: String,
-}
-
-fn default_aud() -> String {
-    "mail".into()
-}
-fn default_scope() -> String {
-    "mail:use".into()
-}
 
 /// Same shape as the old server's RENAMED var: mail to `name` reaches whoever now holds `now` under `now_sub`.
 #[derive(Debug, Deserialize, Clone)]
@@ -50,10 +31,6 @@ pub struct Config {
     /// The operator key the member list must be signed by.
     pub operator_key: String,
     pub members_file: PathBuf,
-    /// The identity home whose aid1 tokens this node still accepts during the switch. Optional: without it the node
-    /// accepts only agent tokens (signed by each member's own key) and needs no server at all.
-    #[serde(default)]
-    pub home: Option<HomeConfig>,
     /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
     /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
     #[serde(default)]
@@ -62,30 +39,9 @@ pub struct Config {
     pub sync_secs: u64,
     #[serde(default)]
     pub renamed: Vec<Renamed>,
-    /// Refuse token-only (unsigned) mail, once every client signs with its own key.
-    #[serde(default)]
-    pub refuse_token_only: bool,
-    /// New mail is numbered from here up, leaving the old server's numbers free for the bridge's imports.
-    #[serde(default = "default_floor")]
-    pub id_floor: i64,
-    /// Present on the one node the bridge talks to.
-    #[serde(default)]
-    pub bridge: Option<BridgeConfig>,
     /// Base URL for attachment links in formatted mail (default http://<api_listen>).
     #[serde(default)]
     pub public_url: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct BridgeConfig {
-    /// Hex seed of the bridge key (listed under `bridges` in the member list).
-    pub key_file: PathBuf,
-    /// The token sub of the bridge identity allowed to call POST /api/bridge/import.
-    pub sub: String,
-}
-
-fn default_floor() -> i64 {
-    1
 }
 
 fn default_api() -> String {
@@ -111,9 +67,6 @@ impl Config {
         if let Some(d) = c.identities_dir.as_mut() {
             fix(d);
         }
-        if let Some(b) = c.bridge.as_mut() {
-            fix(&mut b.key_file);
-        }
         Ok(c)
     }
 
@@ -133,16 +86,6 @@ impl Config {
             Some(a) if a.seq > file.seq => a,
             _ => file,
         })
-    }
-
-    pub fn policy(&self) -> Result<Option<TokenPolicy>> {
-        let Some(home) = &self.home else { return Ok(None) };
-        Ok(Some(TokenPolicy {
-            home_key: parse_key(&home.key).context("home.key")?,
-            iss: home.iss.clone(),
-            aud: home.aud.clone(),
-            scope: home.scope.clone(),
-        }))
     }
 
     pub fn members(&self) -> Result<MemberList> {

@@ -50,6 +50,8 @@ On each host, save this as `config.json`. Relative paths resolve from the config
 }
 ```
 
+When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain their local message history. Only agent-signed envelopes replicate.
+
 Run `mailnode run config.json`. To change membership, increment `seq`, sign again and place the new list on a running peer. It distributes the signed update. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
 
 ## Send and receive
@@ -87,4 +89,5 @@ python tests/client_show.py
 cargo build --locked -p mailnode
 python -m pip install websockets
 python tests/two_nodes.py --bin target/debug/mailnode --islandmail clients/islandmail.py
+python tests/phase2.py --bin target/debug/mailnode --repo .
 ```

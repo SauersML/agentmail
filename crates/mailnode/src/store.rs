@@ -235,48 +235,17 @@ impl Store {
         files: &str,
         readers: Option<&str>,
         received_ms: i64,
-        id_floor: i64,
     ) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
-        let max: i64 = db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?;
-        // Imported history keeps its old number when that number is still above every local number (the import runs
-        // in old-id order before the node takes new mail). Numbers only grow in arrival order, because clients' `after`
-        // cursors, SSE and MCPL push depend on it: old mail the bridge copies in after new mail exists gets a new number
-        // (its old one stays in `imported`).
-        // Only numbers in the range the old server can have used, and on a node with an id_floor only numbers below it
-        // (the floor reserves them for imports): an import can never move numbering past new mail or near i64::MAX.
-        let explicit = match v.imported {
-            Some(old)
-                if old > 0
-                    && old <= mailcore::envelope::MAX_OLD_ID
-                    && old as i64 > max
-                    && (id_floor <= 1 || (old as i64) < id_floor) =>
-            {
-                Some(old as i64)
-            }
-            _ => None,
-        };
-        let explicit = match explicit {
-            Some(x) => Some(x),
-            None if v.imported.is_none() && max < id_floor => Some(id_floor),
-            None => None, // AUTOINCREMENT: above the highest id ever used
-        };
-        let agent_sig = match &env.attest {
-            mailcore::Attest::Agent { sig, .. } => mailcore::b64u_decode(sig).map(|b| mailcore::b64u(&b)),
-            _ => None,
-        };
-        let replay = match &agent_sig {
-            Some(sig) => db.query_row("SELECT 1 FROM messages WHERE agent_sig = ?", [sig], |_| Ok(())).optional()?.is_some(),
-            None => false,
-        };
+        let mailcore::Attest::Agent { sig, .. } = &env.attest;
+        let replay = db.prepare("SELECT 1 FROM messages WHERE agent_sig = ?")?.exists([sig])?;
         let n = db.execute(
-            "INSERT OR IGNORE INTO messages (id, env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, verified, imported, parents, env, received, attest, blobs, files, agent_sig) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
+             readers, parents, env, received, attest, blobs, files, agent_sig) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
-                if replay { None } else { explicit },
                 env.id,
                 env.day(),
                 env.ts,
@@ -287,15 +256,13 @@ impl Store {
                 if replay { "dup" } else { env.mode.as_str() },
                 if replay { None } else { text },
                 if replay { None } else { readers },
-                v.verified as i64,
-                v.imported.map(|x| x as i64),
                 parents,
                 json,
                 received_ms,
-                v.attest,
+                "agent",
                 serde_json::to_string(&env.blobs)?,
                 if replay { "[]" } else { files },
-                if replay { None } else { agent_sig }
+                (!replay).then_some(sig)
             ],
         )?;
         if n == 0 || replay {
@@ -486,7 +453,7 @@ impl Store {
     /// Anti-entropy: BLAKE3 over the sorted envelope ids of each day (the day is the envelope's ts date).
     pub fn day_hashes(&self) -> Result<BTreeMap<String, String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT day, env_id FROM messages ORDER BY day, env_id")?;
+        let mut st = db.prepare("SELECT day, env_id FROM messages WHERE attest = 'agent' ORDER BY day, env_id")?;
         let mut out = BTreeMap::new();
         let mut cur: Option<(String, blake3::Hasher, u64)> = None;
         let mut rows = st.query([])?;
@@ -512,14 +479,14 @@ impl Store {
 
     pub fn ids_for_day(&self, day: &str) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? ORDER BY env_id")?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND attest = 'agent' ORDER BY env_id")?;
         let ids = st.query_map([day], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
 
     pub fn envelopes(&self, ids: &[String]) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ?")?;
+        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ? AND attest = 'agent'")?;
         let mut out = Vec::new();
         for id in ids {
             if let Some(e) = st.query_row([id], |r| r.get::<_, String>(0)).optional()? {
@@ -603,14 +570,6 @@ impl Store {
         Ok(())
     }
 
-    /// The row an old-server message was imported as, if any.
-    pub fn by_imported(&self, old_id: i64) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db
-            .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, old_id], read_row)
-            .optional()?)
-    }
-
     /* Attachments */
 
     pub fn put_blob(&self, id: &str, data: &[u8], now_ms: i64) -> Result<()> {
@@ -631,7 +590,7 @@ impl Store {
     /// Members-mode envelopes stored without a readable body (written before this node was on the member list).
     pub fn unreadable(&self, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' ORDER BY id LIMIT ?")?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' AND attest = 'agent' ORDER BY id LIMIT ?")?;
         let out = st.query_map([limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(out)
     }

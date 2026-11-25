@@ -1,6 +1,6 @@
 [package]
 name = "mailcore"
-description = "Envelope, crypto, agent and aid1 tokens, membership and thread order for agent mail"
+description = "Envelope, crypto, agent tokens, membership and thread order for agent mail"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

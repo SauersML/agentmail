@@ -1,9 +1,4 @@
-//! The compat API on 127.0.0.1: the old server's routes and semantics (islandmail src/index.js) for /api/me,
-//! /api/messages, /api/threads, /api/names, /api/stream (SSE) and /mcpl (MCP/MCPL over WebSocket); POST/GET
-//! /api/files (encrypted, content-addressed blobs); POST /api/bridge/import for the history bridge; GET /api/node
-//! (no auth: this node's key, which agent tokens name as their audience). Bearer auth is an agent token (PASETO
-//! v4.public signed by the member's own key) or, while a home is pinned, the old server's aid1 token, both checked
-//! offline. Not here: the web reader, /login + session cookies.
+//! Loopback HTTP API for agent mail and streams.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -67,7 +62,6 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(upload).layer(axum::extract::DefaultBodyLimit::max(crate::node::MAX_FILE + 1)),
         )
         .route("/api/files/{id}", get(download))
-        .route("/api/bridge/import", axum::routing::post(bridge_import))
         .route("/mcpl", get(mcpl::handler))
         .fallback(|| async { ApiError::new(404, "no such endpoint") })
         .with_state(state)
@@ -124,14 +118,10 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
 
 /// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
 async fn node_info(State(s): State<AppState>) -> Response {
-    let mut auth = vec!["agent-token"];
-    if s.node.policy.is_some() {
-        auth.push("aid1");
-    }
     let network = s.node.members.read().unwrap().network.clone();
     json_resp(
         json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": network,
-                "members_seq": s.node.members_seq(), "auth": auth,
+                "members_seq": s.node.members_seq(), "auth": ["agent-token"],
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",
                                  "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
         200,
@@ -140,16 +130,13 @@ async fn node_info(State(s): State<AppState>) -> Response {
 
 async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let who = caller(&s, &headers)?;
-    let island = match &s.node.policy {
-        Some(p) => p.iss.clone(),
-        None => s.node.members.read().unwrap().network.clone(),
-    };
+    let island = s.node.members.read().unwrap().network.clone();
     Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "kind": who.kind, "island": island, "auth": who.auth,
+        json!({ "name": who.name, "sub": who.sub, "kind": "agent", "island": island, "auth": "agent-token",
                 "last_id": s.node.store.last_id()?,
                 "node": mailcore::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
                 "features": ["signed-post", "private", "files", "agent-token"],
-                "refuse_token_only": s.node.opts.refuse_token_only }),
+                "refuse_token_only": true }),
         200,
     ))
 }
@@ -263,17 +250,6 @@ async fn download(
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400"));
     Ok(r)
-}
-
-/// The history bridge: one old-server message in, kept under its old number. Only the configured bridge identity.
-async fn bridge_import(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
-    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
-    let node = s.node.clone();
-    let (row, existed) = tokio::task::spawn_blocking(move || node.import_old(&who, &v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    Ok(json_resp(json!({ "message": row.to_message(), "existed": existed }), if existed { 200 } else { 201 }))
 }
 
 fn sse_event(m: &Value) -> String {

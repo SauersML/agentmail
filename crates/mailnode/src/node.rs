@@ -9,7 +9,7 @@ use anyhow::Result;
 use mailcore::addr::{self, addressed_to, is_broadcast, norm};
 use mailcore::envelope::{Draft, Grant};
 use mailcore::keys::Seed;
-use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode, TokenPolicy};
+use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use unicode_normalization::UnicodeNormalization;
@@ -54,13 +54,7 @@ impl From<rusqlite::Error> for ApiError {
 pub struct Caller {
     pub name: String,
     pub sub: String,
-    pub kind: String,
-    /// The bearer token, kept only for an aid1 caller (it becomes the attestation of an unsigned post). Empty for an
-    /// agent token, which never leaves this node.
-    pub token: String,
     pub exp_ms: i64,
-    /// How the caller signed in: "agent-token" (PASETO v4.public, the member's own key) or "aid1" (the home's token).
-    pub auth: &'static str,
 }
 
 pub struct Posted {
@@ -79,12 +73,6 @@ pub enum Outbound {
 pub struct Opts {
     pub identities: Vec<(String, Seed)>,
     pub renamed: Vec<Renamed>,
-    /// Refuse envelopes attested only by a replicated aid1 token (once clients sign with their own keys).
-    pub refuse_token_only: bool,
-    /// New (non-imported) mail is numbered from here up; old-server numbers below it stay free for imports.
-    pub id_floor: i64,
-    /// Bridge key and the token sub allowed to import through this node.
-    pub bridge: Option<(Seed, String)>,
     /// Where the latest adopted member list is kept.
     pub members_path: Option<std::path::PathBuf>,
     /// Base URL written into attachment links.
@@ -102,8 +90,6 @@ pub struct Node {
     pub store: Store,
     pub members: RwLock<MemberList>,
     pub operator: mailcore::keys::PublicKey,
-    /// The pinned home for aid1 tokens; None on a node that needs no home.
-    pub policy: Option<TokenPolicy>,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<Arc<Row>>,
@@ -118,7 +104,6 @@ impl Node {
         store: Store,
         members: MemberList,
         operator: mailcore::keys::PublicKey,
-        policy: Option<TokenPolicy>,
         seed: Seed,
         opts: Opts,
         outbound: mpsc::UnboundedSender<Outbound>,
@@ -128,7 +113,6 @@ impl Node {
             store,
             members: RwLock::new(members),
             operator,
-            policy,
             seed,
             opts,
             events,
@@ -167,50 +151,24 @@ impl Node {
 
     /* Identity */
 
-    /// A caller's bearer token. An agent token: PASETO v4.public signed by the member's own key on the member list,
-    /// for this node (aud), live now, used once. Or, during the switch and only with a pinned home, the old server's
-    /// verify(): an aid1 token for audience mail, live now, never a one-time sign-in token. Either way only names on
-    /// the member list (with the same sub) get in.
+    /// Verify a node-bound, single-use token against the current member key.
     pub fn verify(&self, token: &str) -> Result<Caller, ApiError> {
         let now = now_millis();
-        if mailcore::agent_token::is_agent_token(token) {
-            use mailcore::agent_token::Refusal;
-            let checked = {
-                let members = self.members.read().unwrap();
-                mailcore::agent_token::verify(token, &members, &self.seed.public(), now)
-            };
-            let c = checked.map_err(|r| match r {
-                Refusal::NotMember(s) => ApiError::new(403, format!("{s}; ask its operator to add you")),
-                Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
-            })?;
-            if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
-                return Err(ApiError::new(401, "token refused: already used (agent tokens are single-use; mint a fresh one)"));
-            }
-            self.note_auth(&c.name, "agent-token");
-            self.touch(&c.name, &c.sub);
-            return Ok(Caller { name: c.name, sub: c.sub, kind: "agent".into(), token: String::new(), exp_ms: c.exp_ms, auth: "agent-token" });
-        }
-        let Some(policy) = &self.policy else {
-            return Err(ApiError::new(
-                401,
-                "token refused: this node accepts only agent tokens signed by your own key (islandmail.py makes them; README: Running with no home server)",
-            ));
+        use mailcore::agent_token::Refusal;
+        let checked = {
+            let members = self.members.read().unwrap();
+            mailcore::agent_token::verify(token, &members, &self.seed.public(), now)
         };
-        let p = mailcore::token::verify_now(token, policy, now as f64 / 1000.0).map_err(|r| {
-            ApiError::new(401, format!("token refused: {r}. Get a fresh one from https://{}, or use an agent token signed by your own key", policy.iss))
+        let c = checked.map_err(|r| match r {
+            Refusal::NotMember(s) => ApiError::new(403, format!("{s}; ask its operator to add you")),
+            Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
         })?;
-        if p.jti.is_some() {
-            return Err(ApiError::new(401, "token refused: a one-time sign-in token works only to sign in"));
+        if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
+            return Err(ApiError::new(401, "token refused: already used (agent tokens are single-use; mint a fresh one)"));
         }
-        // Only names on the member list (with the same sub) may use this node: a token the home minted for anyone
-        // else reads nothing here (README.md, Security). Members are added by re-signing the list.
-        let listed = self.members.read().unwrap().member_by_name(&p.name).is_some_and(|m| m.sub == p.sub);
-        if !listed {
-            return Err(ApiError::new(403, format!("{} is not on this network's member list; ask its operator to add you", p.name)));
-        }
-        self.note_auth(&p.name, "aid1");
-        self.touch(&p.name, &p.sub);
-        Ok(Caller { name: p.name, sub: p.sub, kind: p.kind, token: token.to_string(), exp_ms: (p.exp * 1000.0) as i64, auth: "aid1" })
+        self.note_auth(&c.name, "agent-token");
+        self.touch(&c.name, &c.sub);
+        Ok(Caller { name: c.name, sub: c.sub, exp_ms: c.exp_ms })
     }
 
     /// Logs the first sign-in of each name with each kind of token (debug-level for every later one). Never the token.
@@ -336,8 +294,8 @@ impl Node {
                 let salt = s["salt"]
                     .as_str()
                     .and_then(mailcore::b64u_decode)
-                    .filter(|b| (16..=64).contains(&b.len()))
-                    .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16-64 bytes, base64url"))?;
+                    .filter(|b| b.len() == 16)
+                    .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16 bytes, base64url"))?;
                 let m = members
                     .member_by_name(&who.name)
                     .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
@@ -360,24 +318,15 @@ impl Node {
             }
             // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
             // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
-            None if self.local_key(&members, who).is_some() => {
-                let (key, seed) = self.local_key(&members, who).expect("checked");
+            None => {
+                let (key, seed) = self.local_key(&members, who).ok_or_else(|| ApiError::new(400,
+                    "sign the post with your agent key or configure identities_dir on this node"))?;
                 let salt = mailcore::random_bytes::<16>();
                 let ts = now_ts();
                 let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
                 let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
                 let sig = mailcore::b64u(&seed.sign(st.as_bytes()));
                 (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
-            }
-            None => {
-                // An agent token is never copied into an envelope: it would hand a bearer token to every node.
-                if who.auth != "aid1" {
-                    return Err(ApiError::new(400, "unsigned post: with an agent token, sign the post with your own key (islandmail.py does), or put your identity file in this node's identities_dir"));
-                }
-                if self.opts.refuse_token_only {
-                    return Err(ApiError::new(400, "this node accepts only mail signed with the sender's own key (islandmail.py signs it)"));
-                }
-                (now_ts(), Attest::Aid1 { token: who.token.clone() }, String::new())
             }
         };
         let parents = self.store.heads(&thread)?;
@@ -399,14 +348,14 @@ impl Node {
         )?;
         // Refuse to write what no other node would accept (e.g. this node is not on the member list).
         let v = env
-            .verify(&members, self.policy.as_ref(), now_millis())
+            .verify(&members, now_millis())
             .and_then(|v| env.check_body(&b).map(|_| v))
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
         let readers = (mode == Mode::Private).then(|| readers_for(&members, &to, &who.name));
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         let row = self
             .store
-            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
+            .insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())?
             .ok_or_else(|| ApiError::new(500, "envelope id collision"))?;
         let _ = self.events.send(Arc::new(row.clone()));
         let _ = self.outbound.send(Outbound::Envelope(env));
@@ -424,78 +373,6 @@ impl Node {
             .iter()
             .find(|(n, s)| mailcore::addr::same(n, &who.name) && s.public() == k)
             .map(|(_, s)| (m.key.clone(), s.clone()))
-    }
-
-    /// Bridge: one message from the old server, kept under its old number where free, signed by the bridge key, sealed
-    /// deterministically (the same old message imported twice is the same envelope). Returns (row, already there).
-    pub fn import_old(&self, who: &Caller, m: &Value) -> Result<(Row, bool), ApiError> {
-        let Some((bseed, bsub)) = &self.opts.bridge else { return Err(ApiError::new(404, "no such endpoint")) };
-        if &who.sub != bsub {
-            return Err(ApiError::new(403, "only the bridge identity may import"));
-        }
-        let old_id = m["id"]
-            .as_i64()
-            .filter(|&x| x > 0 && x as u64 <= mailcore::envelope::MAX_OLD_ID)
-            .ok_or_else(|| ApiError::new(400, "id must be a positive integer of at most 2^32"))?;
-        if let Some(row) = self.store.by_imported(old_id)? {
-            return Ok((row, true));
-        }
-        let s = |k: &str| -> Result<String, ApiError> {
-            m[k].as_str()
-                .filter(|v| !v.is_empty() && v.chars().count() <= MAX_FIELD && !v.chars().any(|c| c.is_control()))
-                .map(|v| v.to_string())
-                .ok_or_else(|| ApiError::new(400, format!("{k} must be 1-{MAX_FIELD} characters")))
-        };
-        let (ts, from, to, thread) = (s("ts")?, s("from")?, s("to")?, s("thread")?);
-        if mailcore::parse_ts(&ts).is_none() {
-            return Err(ApiError::new(400, "ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"));
-        }
-        let text = m["text"].as_str().ok_or_else(|| ApiError::new(400, "text must be a string"))?.to_string();
-        let files: Vec<Value> = m["files"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .take(MAX_FILES)
-                    .map(|f| json!({ "id": f["id"], "name": f["name"], "type": f["type"], "size": f["size"], "old": true }))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let sub = m["sub"].as_str().unwrap_or("").to_string();
-        let verified = m["verified"].as_bool().unwrap_or(false);
-        let members = self.members.read().unwrap().clone();
-        let b = Body { text: text.clone(), files: files.clone(), salt: String::new() };
-        let mut h = blake3::Hasher::new_derive_key("agent-mail v1 import det");
-        h.update(bseed.bytes());
-        h.update(&old_id.to_le_bytes());
-        let env = Envelope::seal_with(
-            Draft {
-                thread: &thread,
-                parents: self.store.heads(&thread)?,
-                ts,
-                from: &from,
-                to: &to,
-                mode: Mode::Members,
-                body: &b,
-                blobs: vec![],
-                attest: Attest::Import { old_id: old_id as u64, sub, verified },
-                recipients: &members.all_keys(),
-            },
-            bseed,
-            Some(*h.finalize().as_bytes()),
-        )?;
-        let v = env
-            .verify(&members, self.policy.as_ref(), now_millis())
-            .map_err(|e| ApiError::new(503, format!("this node cannot import: {e}")))?;
-        let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
-        match self.store.insert(&env, &v, Some(&text), &files_json, None, now_millis(), self.opts.id_floor)? {
-            Some(row) => {
-                let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
-                let _ = self.events.send(Arc::new(row.clone()));
-                let _ = self.outbound.send(Outbound::Envelope(env));
-                Ok((row, false))
-            }
-            None => Ok((self.store.by_imported(old_id)?.ok_or_else(|| ApiError::new(500, "import vanished"))?, true)),
-        }
     }
 
     /// POST /api/files: encrypt and keep the upload until a message attaches it.
@@ -546,10 +423,7 @@ impl Node {
             return Ok(None);
         }
         let members = self.members.read().unwrap().clone();
-        let v = env.verify(&members, self.policy.as_ref(), now_millis())?;
-        if v.attest == "token" && self.opts.refuse_token_only {
-            anyhow::bail!("token-attested envelopes are refused by this node");
-        }
+        let v = env.verify(&members, now_millis())?;
         let mut body = env.open(&self.seed).unwrap_or(None);
         if body.is_none() {
             for (_, s) in &self.opts.identities {
@@ -566,12 +440,10 @@ impl Node {
         let text: Option<String> = body.map(|b| b.text.chars().take(MAX_TEXT as usize).collect());
         let readers = (env.mode == Mode::Private).then(|| readers_for(&members, &env.to, &env.from));
         let Some(row) =
-            self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis(), self.opts.id_floor)?
+            self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis())?
         else {
             return Ok(None);
         };
-        // Imports too (11-22): people still on the old server are addressable through the bridge, so "reaches" and
-        // `who` must know them.
         let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
         let _ = self.events.send(row.clone());
@@ -840,11 +712,7 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
                 .iter()
                 .map(|f| {
                     let id = f["id"].as_str().unwrap_or("");
-                    let url = if f["old"] == json!(true) {
-                        format!("https://mail.gnome.science/api/files/{id}")
-                    } else {
-                        format!("{base}/api/files/{id}")
-                    };
+                    let url = format!("{base}/api/files/{id}");
                     format!("{} ({} bytes) {url}", f["name"].as_str().unwrap_or("file"), f["size"])
                 })
                 .collect();
@@ -880,17 +748,7 @@ mod tests {
     use mailcore::{Member, NodeEntry};
 
     fn setup() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>) {
-        let (n, home, b, l, rx, _) = setup_full();
-        (n, home, b, l, rx)
-    }
-
-    fn setup_full() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>, Seed) {
-        setup_home(true)
-    }
-
-    fn setup_home(with_home: bool) -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>, Seed) {
-        let (home, op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
-        let alice_copy = Seed::from_bytes(*alice.bytes());
+        let (op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
         let mut list = MemberList {
             v: 1,
             network: "t".into(),
@@ -903,17 +761,14 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![] })
                 .collect(),
-            bridges: vec![],
             sig: String::new(),
         };
         list.sign(&op);
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, rx) = mpsc::unbounded_channel();
-        let opts = Opts { id_floor: 1, public_url: "http://x".into(), ..Default::default() };
-        let policy = with_home.then_some(policy);
-        let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), policy, node_a, opts, tx);
-        (node, home, node_b, list, rx, alice_copy)
+        let opts = Opts { public_url: "http://x".into(), ..Default::default() };
+        let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), node_a, opts, tx);
+        (node, alice, node_b, list, rx)
     }
 
     fn env_of(o: Outbound) -> Envelope {
@@ -921,39 +776,24 @@ mod tests {
         e
     }
 
-    fn token(home: &Seed) -> String {
-        let now = now_millis() as f64 / 1000.0;
-        mailcore::token::mint(
-            home,
-            &mailcore::Aid1Payload {
-                v: 1,
-                iss: "h".into(),
-                sub: "agent:alice@t".into(),
-                kind: "agent".into(),
-                name: "a.alice".into(),
-                aud: "mail".into(),
-                scopes: vec!["mail:use".into()],
-                claims: None,
-                iat: now,
-                exp: now + 600.0,
-                jti: None,
-            },
-        )
-    }
-
-    fn envelope(writer: &Seed, list: &MemberList, home: &Seed, text: &str) -> Envelope {
-        let body = Body { text: text.into(), ..Default::default() };
+    fn envelope(writer: &Seed, list: &MemberList, agent: &Seed, text: &str) -> Envelope {
+        let ts = now_ts();
+        let salt = mailcore::random_bytes::<16>();
+        let digest = mailcore::envelope::post_digest(&salt, text, &[]);
+        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
+        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(st.as_bytes())) };
+        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
         Envelope::seal(
             Draft {
                 thread: "t",
                 parents: vec![],
-                ts: now_ts(),
+                ts,
                 from: "a.alice",
                 to: "all",
                 mode: Mode::Members,
                 body: &body,
                 blobs: vec![],
-                attest: Attest::Aid1 { token: token(home) },
+                attest,
                 recipients: &list.all_keys(),
             },
             writer,
@@ -963,8 +803,8 @@ mod tests {
 
     #[test]
     fn ingest_dedupes_by_envelope_id() {
-        let (node, home, node_b, list, _rx) = setup();
-        let e = envelope(&node_b, &list, &home, "once");
+        let (node, agent, node_b, list, _rx) = setup();
+        let e = envelope(&node_b, &list, &agent, "once");
         let first = node.ingest(e.clone()).unwrap().expect("stored");
         assert_eq!(first.text.as_deref(), Some("once"));
         assert!(node.ingest(e.clone()).unwrap().is_none(), "same envelope again is a no-op");
@@ -973,27 +813,6 @@ mod tests {
         let again: Envelope = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert!(node.ingest(again).unwrap().is_none());
         assert_eq!(node.store.count().unwrap(), 1);
-    }
-
-    #[test]
-    fn imports_cannot_push_local_numbering_up() {
-        let (node, home, node_b, list, _rx) = setup();
-        let v = |old: u64| mailcore::Verified {
-            sender_sub: "agent:x@t".into(),
-            sender_kind: String::new(),
-            imported: Some(old),
-            verified: true,
-            attest: "import",
-        };
-        let ins = |text: &str, old: u64, floor: i64| {
-            let e = envelope(&node_b, &list, &home, text);
-            node.store.insert(&e, &v(old), Some(text), "[]", None, 0, floor).unwrap().unwrap().id
-        };
-        assert_eq!(ins("a", 5, 1), 5, "an old id in range keeps its number");
-        assert_eq!(ins("b", 1 << 40, 1), 6, "an old id past the old server's range is renumbered");
-        assert_eq!(ins("c", i64::MAX as u64, 1), 7);
-        assert_eq!(ins("d", 2_000, 1_000), 8, "at or above id_floor: renumbered");
-        assert_eq!(ins("e", 900, 1_000), 900, "below id_floor: kept");
     }
 
     #[test]
@@ -1030,7 +849,7 @@ mod tests {
 
     #[test]
     fn a_replayed_agent_signed_message_stays_hidden() {
-        let (node, home, node_b, list, _rx, alice) = setup_full();
+        let (node, alice, node_b, list, _rx) = setup();
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]);
@@ -1063,7 +882,7 @@ mod tests {
         assert!(node.ingest(replay.clone()).unwrap().is_none(), "the replay is not shown");
         assert_eq!(node.store.count().unwrap(), 2, "but kept, so day hashes agree with peers that have it");
         assert!(node.ingest(replay).unwrap().is_none());
-        let who = node.verify(&token(&home)).unwrap();
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let (rows, _) = node.store.query(&crate::store::Query::default(), &who.name, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(node.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
@@ -1074,8 +893,8 @@ mod tests {
 
     #[test]
     fn resending_a_signed_post_returns_the_first_copy() {
-        let (node, home, _b, _l, _rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
+        let (node, alice, _b, _l, _rx) = setup();
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let f = node.upload(&who, "a.txt", "text/plain", b"bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         let ts = now_ts();
@@ -1090,56 +909,43 @@ mod tests {
 
     #[test]
     fn a_wrong_key_for_a_blob_does_not_shadow_the_real_one() {
-        let (node, home, node_b, list, _rx) = setup();
-        let alice = node.verify(&token(&home)).unwrap();
+        let (node, agent, node_b, list, _rx) = setup();
+        let alice = node.verify(&agent_token(&agent, &node.seed.public())).unwrap();
         let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         // An earlier members-mode row (as a member node could write) naming alice's blob with a wrong key.
-        let body = Body { text: "decoy".into(), ..Default::default() };
-        let decoy = Envelope::seal(
-            Draft {
-                thread: "t",
-                parents: vec![],
-                ts: now_ts(),
-                from: "a.alice",
-                to: "all",
-                mode: Mode::Members,
-                body: &body,
-                blobs: vec![id.clone()],
-                attest: Attest::Aid1 { token: token(&home) },
-                recipients: &list.all_keys(),
-            },
-            &node_b,
-        )
-        .unwrap();
-        let v = mailcore::Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let mut decoy = envelope(&node_b, &list, &agent, "decoy");
+        let v = mailcore::Verified { sender_sub: "agent:alice@t".into() };
+        decoy.blobs.push(id.clone());
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
-        node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis(), 1).unwrap().unwrap();
-        node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id] })).unwrap();
+        node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
+        node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
+            "signed": signed(&agent, "all", "t", "see file", std::slice::from_ref(&id), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
-        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), kind: "agent".into(), token: String::new(), exp_ms: i64::MAX, auth: "aid1" };
+        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }
 
     #[test]
     fn ingest_refuses_non_member_writer() {
-        let (node, home, _node_b, list, _rx) = setup();
+        let (node, agent, _node_b, list, _rx) = setup();
         let stranger = Seed::generate();
-        let e = envelope(&stranger, &list, &home, "spoof");
+        let e = envelope(&stranger, &list, &agent, "spoof");
         assert!(node.ingest(e).is_err());
         assert_eq!(node.store.count().unwrap(), 0);
     }
 
     #[test]
     fn post_signs_stores_and_announces() {
-        let (node, home, _node_b, _list, mut rx) = setup();
-        let who = node.verify(&token(&home)).unwrap();
+        let (mut node, alice, _node_b, _list, mut rx) = setup();
+        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(!p.repeated);
         let out = env_of(rx.try_recv().expect("gossiped"));
         assert_eq!(out.id, p.row.env_id);
-        assert_eq!(p.row.attest, "token");
+        assert_eq!(p.row.attest, "agent");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
         let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
@@ -1156,8 +962,8 @@ mod tests {
 
     #[test]
     fn signed_post_path() {
-        let (node, home, _b, _l, mut rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
+        let (node, alice, _b, _l, mut rx) = setup();
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let ts = now_ts();
         let p = node
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&alice, "all", "t", "signed", &[], &ts) }))
@@ -1179,66 +985,34 @@ mod tests {
     }
 
     #[test]
-    fn only_member_list_names_may_use_the_api() {
-        let (node, home, _b, _l, _rx, _alice) = setup_full();
-        assert!(node.verify(&token(&home)).is_ok());
-        let now = now_millis() as f64 / 1000.0;
-        let mint = |name: &str, sub: &str| {
-            mailcore::token::mint(
-                &home,
-                &mailcore::Aid1Payload {
-                    v: 1,
-                    iss: "h".into(),
-                    sub: sub.into(),
-                    kind: "agent".into(),
-                    name: name.into(),
-                    aud: "mail".into(),
-                    scopes: vec!["mail:use".into()],
-                    claims: None,
-                    iat: now,
-                    exp: now + 3600.0,
-                    jti: None,
-                },
-            )
-        };
-        assert_eq!(node.verify(&mint("a.mallory", "agent:mallory@t")).err().unwrap().status, 403, "not on the list");
-        assert_eq!(node.verify(&mint("a.alice", "agent:mallory@t")).err().unwrap().status, 403, "listed name, other sub");
-    }
-
-    #[test]
     fn node_signs_for_a_caller_whose_key_it_holds() {
-        let (_n, home, node_b, list, _rx, alice) = setup_full();
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
+        let (_n, alice, node_b, list, _rx) = setup();
         let op = mailcore::keys::parse_key(&list.operator).unwrap();
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
             let (tx, rx) = mpsc::unbounded_channel();
-            let opts = Opts { id_floor: 1, public_url: "http://x".into(), identities: ids, ..Default::default() };
+            let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
             let node_seed = Seed::from_bytes(*node_b.bytes());
-            (Node::new(Store::open(&path).unwrap(), list.clone(), op, Some(policy.clone()), node_seed, opts, tx), rx)
+            (Node::new(Store::open(&path).unwrap(), list.clone(), op, node_seed, opts, tx), rx)
         };
         // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
-        let who = node.verify(&token(&home)).unwrap();
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
         assert_eq!(p.row.attest, "agent");
         let e = env_of(rx.try_recv().unwrap());
         assert!(matches!(e.attest, Attest::Agent { .. }));
-        assert!(!serde_json::to_string(&e).unwrap().contains(&who.token), "the token never enters the envelope");
-        let v = e.verify(&list, Some(&policy), now_millis()).unwrap();
-        assert_eq!(v.attest, "agent");
+        e.verify(&list, now_millis()).unwrap();
         e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
-        // Holding a different key under alice's name: not hers on the member list, so the post stays token-attested.
-        let (node, mut rx) = mk(vec![("a.alice".into(), Seed::generate())]);
-        let who = node.verify(&token(&home)).unwrap();
-        assert_eq!(node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x" })).unwrap().row.attest, "token");
-        assert!(matches!(env_of(rx.try_recv().unwrap()).attest, Attest::Aid1 { .. }));
+        let (node, _) = mk(vec![("a.alice".into(), Seed::generate())]);
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
+        assert_eq!(node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x" })).err().unwrap().status, 400);
     }
 
     #[test]
     fn attachments_roundtrip_and_signed_digest_covers_them() {
-        let (node, home, _b, _l, mut rx, alice) = setup_full();
-        let who = node.verify(&token(&home)).unwrap();
+        let (node, alice, _b, _l, mut rx) = setup();
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let f = node.upload(&who, "a.txt", "text/plain", b"attached bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         let ts = now_ts();
@@ -1271,12 +1045,11 @@ mod tests {
 
     #[test]
     fn agent_tokens_work_once_and_only_on_their_node() {
-        let (node, _home, node_b, _list, mut rx, alice) = setup_full();
+        let (node, alice, node_b, _list, mut rx) = setup();
         let me = node.seed.public();
         let t = agent_token(&alice, &me);
         let who = node.verify(&t).unwrap();
-        assert_eq!((who.name.as_str(), who.sub.as_str(), who.auth), ("a.alice", "agent:alice@t", "agent-token"));
-        assert!(who.token.is_empty(), "an agent token is not kept for envelopes");
+        assert_eq!((who.name.as_str(), who.sub.as_str()), ("a.alice", "agent:alice@t"));
         let replay = node.verify(&t).err().unwrap();
         assert!(replay.status == 401 && replay.message.contains("already used"), "{}", replay.message);
         let other = node.verify(&agent_token(&alice, &node_b.public())).err().unwrap();
@@ -1301,17 +1074,4 @@ mod tests {
         mailcore::paseto::HEADER
     }
 
-    #[test]
-    fn node_without_home_takes_only_agent_tokens() {
-        let (node, home, _node_b, list, mut rx, alice) = setup_home(false);
-        let e = node.verify(&token(&home)).err().unwrap();
-        assert!(e.status == 401 && e.message.contains("only agent tokens"), "{}", e.message);
-        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let p = node.post(&who, &signed_body(&alice, "no home needed")).unwrap();
-        assert_eq!(p.row.attest, "agent");
-        let env = env_of(rx.try_recv().unwrap());
-        assert!(env.verify(&list, None, now_millis()).is_ok(), "agent-signed mail needs no home to check");
-        let (rows, _) = node.store.query(&crate::store::Query::default(), "a.alice", MAX_TEXT).unwrap();
-        assert!(rows.iter().any(|r| r.text.as_deref() == Some("no home needed")));
-    }
 }

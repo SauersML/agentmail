@@ -11,7 +11,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
@@ -304,13 +304,7 @@ impl Ctx {
                         }
                     }
                 }
-                envs.sort_by(|a, b| {
-                    let old = |e: &Envelope| match &e.attest {
-                        mailcore::Attest::Import { old_id, .. } => *old_id,
-                        _ => u64::MAX,
-                    };
-                    (old(a), &a.ts, &a.id).cmp(&(old(b), &b.ts, &b.id))
-                });
+                envs.sort_by(|a, b| (&a.ts, &a.id).cmp(&(&b.ts, &b.id)));
                 for e in envs {
                     match node.ingest(e) {
                         Ok(Some(_)) => added += 1,
@@ -493,11 +487,11 @@ mod tests {
     use crate::store::Store;
     use mailcore::envelope::Draft;
     use mailcore::keys::{fmt_key, Seed};
-    use mailcore::{Attest, Body, Mode, NodeEntry, TokenPolicy, Verified};
+    use mailcore::{Attest, Body, Mode, NodeEntry, Verified};
 
     #[test]
     fn get_answers_stay_within_the_byte_budget() {
-        let (op, home, me) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let (op, me) = (Seed::generate(), Seed::generate());
         let mut list = MemberList {
             v: 1,
             network: "t".into(),
@@ -506,16 +500,14 @@ mod tests {
             operator: String::new(),
             members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![] }],
-            bridges: vec![],
             sig: String::new(),
         };
         list.sign(&op);
-        let policy = TokenPolicy { home_key: home.public(), iss: "h".into(), aud: "mail".into(), scope: "mail:use".into() };
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, _rx) = mpsc::unbounded_channel();
         let recipients = list.all_keys();
-        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), Some(policy), me, Opts::default(), tx);
-        let v = Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
+        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), me, Opts::default(), tx);
+        let v = Verified { sender_sub: "s".into() };
         let mut ids = Vec::new();
         for i in 0..5 {
             let body = Body { text: format!("{i}").repeat(10_000), ..Default::default() };
@@ -529,13 +521,13 @@ mod tests {
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Aid1 { token: "aid1.x.y".into() },
+                    attest: Attest::Agent { key: fmt_key(&node.seed.public()), digest: String::new(), sig: i.to_string() },
                     recipients: &recipients,
                 },
                 &node.seed,
             )
             .unwrap();
-            node.store.insert(&e, &v, Some("x"), "[]", None, 0, 1).unwrap().unwrap();
+            node.store.insert(&e, &v, Some("x"), "[]", None, 0).unwrap().unwrap();
             ids.push(e.id);
         }
         ids.insert(2, "0".repeat(64)); // one id the peer does not have

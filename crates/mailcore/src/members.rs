@@ -1,6 +1,4 @@
-//! The member list: who may write (node keys), whom mail is encrypted to (agent keys), and which bridge keys may sign
-//! imported history. Signed by the operator key; nodes pin the operator key and accept the list with the highest `seq`.
-//! Phase 1 loads it from a local file; it has the same shape it will have when replicated like mail.
+//! Operator-signed membership for agent identities and direct peers.
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -42,8 +40,6 @@ pub struct MemberList {
     pub members: Vec<Member>,
     pub nodes: Vec<NodeEntry>,
     #[serde(default)]
-    pub bridges: Vec<String>,
-    #[serde(default)]
     pub sig: String,
 }
 
@@ -82,18 +78,11 @@ impl MemberList {
                 addr.parse::<std::net::SocketAddr>().map_err(|_| anyhow!("invalid peer socket address {addr:?}"))?;
             }
         }
-        for b in &self.bridges {
-            parse_key(b)?;
-        }
         Ok(())
     }
 
     pub fn is_node(&self, key: &PublicKey) -> bool {
         self.nodes.iter().any(|n| parse_key(&n.key).ok().as_ref() == Some(key))
-    }
-
-    pub fn is_bridge(&self, key: &PublicKey) -> bool {
-        self.bridges.iter().any(|b| parse_key(b).ok().as_ref() == Some(key))
     }
 
     pub fn node_keys(&self) -> Vec<PublicKey> {
@@ -156,7 +145,6 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![] })
                 .collect(),
-            bridges: vec![],
             sig: String::new(),
         };
         l.sign(&op);

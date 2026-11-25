@@ -40,38 +40,18 @@ fn wrap_key(epk: &[u8; 32], recipient_x: &[u8; 32], shared: &[u8; 32]) -> [u8; 3
 }
 
 pub fn seal(plain: &[u8], ad: &[u8], recipients: &[PublicKey]) -> Result<Sealed> {
-    seal_det(plain, ad, recipients, None)
-}
-
-/// With `det`, the content key, nonce and ephemeral key are derived from it and the input (same input, same output).
-pub fn seal_det(plain: &[u8], ad: &[u8], recipients: &[PublicKey], det: Option<[u8; 32]>) -> Result<Sealed> {
     if recipients.is_empty() {
         bail!("no recipient keys");
     }
-    let derive = |label: &str| -> [u8; 32] {
-        let d = det.expect("det");
-        let mut h = blake3::Hasher::new_derive_key(label);
-        h.update(&d);
-        h.update(ad);
-        h.update(plain);
-        for r in recipients {
-            h.update(r);
-        }
-        *h.finalize().as_bytes()
-    };
-    let mut ck: [u8; 32] = if det.is_some() { derive("agent-mail v1 det content key") } else { crate::random_bytes() };
-    let nonce: [u8; 24] = if det.is_some() {
-        derive("agent-mail v1 det nonce")[..24].try_into().unwrap()
-    } else {
-        crate::random_bytes()
-    };
+    let mut ck = crate::random_bytes::<32>();
+    let nonce = crate::random_bytes::<24>();
     let body = XChaCha20Poly1305::new((&ck).into())
         .encrypt((&nonce).into(), Payload { msg: plain, aad: ad })
         .map_err(|_| anyhow!("encrypt failed"))?;
     let mut ciphertext = nonce.to_vec();
     ciphertext.extend_from_slice(&body);
 
-    let esk = StaticSecret::from(if det.is_some() { derive("agent-mail v1 det ephemeral") } else { crate::random_bytes::<32>() });
+    let esk = StaticSecret::from(crate::random_bytes::<32>());
     let epk = XPublic::from(&esk).to_bytes();
     let mut keys = Vec::new();
     let mut seen = std::collections::BTreeSet::new();

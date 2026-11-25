@@ -54,21 +54,26 @@ def main():
     os.makedirs(os.path.join(work, "keys"))
     os.makedirs(os.path.join(work, "home"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    pub = {n: run(bin_, "keygen", k(n)) for n in ("home", "operator", "nodeA", "alice", "hostagent")}
-    iss = "home.test"
+    pub = {n: run(bin_, "keygen", k(n)) for n in ("operator", "nodeA", "alice", "hostagent")}
+    ids = os.path.join(work, "identities")
+    os.mkdir(ids, 0o700)
+    for name in ("alice", "hostagent"):
+        path = os.path.join(ids, name + ".json")
+        with open(path, "x") as f:
+            os.fchmod(f.fileno(), 0o600)
+            json.dump({"name": "t." + name, "sub": "agent:%s@test" % name, "seed": open(k(name)).read().strip()}, f)
     api, udp = free_port(), free_port(socket.SOCK_DGRAM)
     lst = {"v": 1, "network": "test", "seq": 1, "issued": "", "operator": "",
            "members": [{"name": "t.alice", "sub": "agent:alice@test", "key": pub["alice"]},
                        {"name": "t.hostagent", "sub": "agent:hostagent@test", "key": pub["hostagent"]}],
-           "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % udp]}], "bridges": [], "sig": ""}
+           "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % udp]}], "sig": ""}
     json.dump(lst, open(os.path.join(work, "members.unsigned.json"), "w"))
     run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
     A = Node(bin_, work, "A", {
         "data_dir": os.path.join(work, "dataA"), "api_listen": "127.0.0.1:%d" % api, "iroh_port": udp,
         "node_key_file": k("nodeA"), "operator_key": pub["operator"], "members_file": os.path.join(work, "members.json"),
-        "home": {"key": pub["home"], "iss": iss}, "relay": "disabled", "sync_secs": 5})
-    tok_agent = run(bin_, "mint-token", k("home"), iss, "t.hostagent", "agent:hostagent@test", "3600")
-    tok_alice = run(bin_, "mint-token", k("home"), iss, "t.alice", "agent:alice@test", "3600")
+        "identities_dir": ids, "sync_secs": 5})
+    tok_agent, tok_alice = [run(bin_, "agent-token", os.path.join(ids, n + ".json"), pub["nodeA"]) for n in ("hostagent", "alice")]
     recipe = {
         "name": "agent-mail host test",
         "description": "Throwaway: mock provider, one MCPL server (an agent-mail node).",

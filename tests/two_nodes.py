@@ -3,7 +3,7 @@
 
   python3 tests/two_nodes.py --bin target/debug/mailnode --islandmail /path/to/islandmail.py [--workdir DIR]
 
-Everything is throwaway: a fresh test home key (tokens), operator key, node keys and agent identities in --workdir.
+Everything is throwaway: an operator key, node keys and agent identities in --workdir.
 Needs `websockets` (pip) for the MCPL check; skipped if missing.
 """
 import argparse
@@ -128,9 +128,8 @@ def main():
     k = lambda n: os.path.join(work, "keys", n + ".seed")
     os.makedirs(os.path.join(work, "keys"))
 
-    # Throwaway keys: test home (token issuer), operator, two nodes, three agents.
-    pub = {n: run(bin_, "keygen", k(n)) for n in ["home", "operator", "nodeA", "nodeB", "alice", "bob", "carol"]}
-    iss = "home.test"
+    # Throwaway keys: operator, two nodes, three agents.
+    pub = {n: run(bin_, "keygen", k(n)) for n in ["operator", "nodeA", "nodeB", "alice", "bob", "carol"]}
     agents = {"alice": "t.alice", "bob": "t.bob", "carol": "u.carol"}
     ports = {"apiA": free_port(), "apiB": free_port(), "udpA": free_port(socket.SOCK_DGRAM), "udpB": free_port(socket.SOCK_DGRAM)}
     unsigned = {
@@ -138,19 +137,19 @@ def main():
         "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents],
         "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % ports["udpA"]]},
                   {"name": "B", "key": pub["nodeB"], "addrs": ["127.0.0.1:%d" % ports["udpB"]]}],
-        "bridges": [], "sig": "",
+        "sig": "",
     }
     with open(os.path.join(work, "members.unsigned.json"), "w") as f:
         json.dump(unsigned, f)
     run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
 
     # islandmail.py-style identity folders: node A hosts alice, node B hosts bob (their keys open private mail).
-    for host, who in (("A", "alice"), ("B", "bob")):
+    for host, who in (("A", "alice"), ("B", "bob"), ("B", "carol")):
         d = os.path.join(work, "ids" + host, "identities")
-        os.makedirs(d)
+        os.makedirs(d, exist_ok=True)
         seed = open(k(who)).read().strip()
         with open(os.path.join(d, agents[who] + ".json"), "w") as f:
-            json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "home": iss, "id": pub[who], "seed": seed}, f)
+            json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "id": pub[who], "seed": seed}, f)
         os.chmod(os.path.join(d, agents[who] + ".json"), 0o600)  # nodes skip identity files others can read
 
     def cfg(host):
@@ -161,13 +160,15 @@ def main():
             "node_key_file": k("node" + host),
             "operator_key": pub["operator"],
             "members_file": os.path.join(work, "members.json"),
-            "home": {"key": pub["home"], "iss": iss},
-            "relay": "disabled",
             "identities_dir": os.path.join(work, "ids" + host, "identities"),
             "sync_secs": 3,
         }
 
-    tok = {n: run(bin_, "mint-token", k("home"), iss, agents[n], "agent:%s@test" % n, "3600") for n in agents}
+    def token(host, agent):
+        folder = "idsA" if agent == "alice" else "idsB"
+        identity = os.path.join(work, folder, "identities", agents[agent] + ".json")
+        return run(bin_, "agent-token", identity, pub["node" + host])
+
     A = Node(bin_, work, "A", cfg("A"))
     B = Node(bin_, work, "B", cfg("B"))
     try:
@@ -176,48 +177,40 @@ def main():
         pa, pb = A.port, B.port
 
         # Auth, exactly like the old server.
-        st, me = req("GET", pa, "/api/me", tok["alice"])
-        check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == iss, json.dumps(me))
+        st, me = req("GET", pa, "/api/me", token("A", "alice"))
+        check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == "test", json.dumps(me))
         st, e = req("GET", pa, "/api/me")
         check("no token -> 401", st == 401, json.dumps(e))
-        evil = run(bin_, "keygen", k("evilhome"))
-        forged = run(bin_, "mint-token", k("evilhome"), iss, "t.alice", "agent:alice@test", "3600")
-        st, e = req("GET", pa, "/api/me", forged)
-        check("forged token -> 401", st == 401 and "signature" in e.get("error", ""), e.get("error", ""))
-        expired = run(bin_, "mint-token", k("home"), iss, "t.alice", "agent:alice@test", "-10")
-        st, e = req("GET", pa, "/api/me", expired)
-        check("expired token -> 401", st == 401 and "expired" in e.get("error", ""), e.get("error", ""))
-
         # Post on A, read on B.
-        st, r = req("POST", pa, "/api/messages", tok["alice"], {"to": "t.bob", "thread": "t1", "text": "hello from A"})
+        st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "t1", "text": "hello from A"})
         check("POST /api/messages on A -> 201", st == 201 and r["message"]["text"] == "hello from A", "id #%s" % r.get("message", {}).get("id"))
         env1 = r["message"]["env"]
-        got, dt = wait_for(lambda: [m for m in req("GET", pb, "/api/messages?thread=t1", tok["bob"])[1]["messages"] if m["env"] == env1])
+        got, dt = wait_for(lambda: [m for m in req("GET", pb, "/api/messages?thread=t1", token("B", "bob"))[1]["messages"] if m["env"] == env1])
         check("message replicated to B (gossip)", got and got[0]["text"] == "hello from A" and got[0]["from"] == "t.alice", "%.2fs" % dt)
-        st, r2 = req("POST", pa, "/api/messages", tok["alice"], {"to": "t.bob", "thread": "t1", "text": "hello from A"})
+        st, r2 = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "t1", "text": "hello from A"})
         check("identical resend within 10 min -> 200 repeated", st == 200 and r2.get("repeated") is True)
 
         # SSE on B sees a message posted on A.
         stop = threading.Event()
         events = []
-        last_b = req("GET", pb, "/api/me", tok["bob"])[1]["last_id"]
-        th = threading.Thread(target=sse_reader, args=(pb, tok["bob"], last_b, events, stop), daemon=True)
+        last_b = req("GET", pb, "/api/me", token("B", "bob"))[1]["last_id"]
+        th = threading.Thread(target=sse_reader, args=(pb, token("B", "bob"), last_b, events, stop), daemon=True)
         th.start()
         time.sleep(0.5)
-        st, r = req("POST", pa, "/api/messages", tok["alice"], {"to": "t.", "thread": "t1", "text": "stream me"})
+        st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.", "thread": "t1", "text": "stream me"})
         got, dt = wait_for(lambda: [e for e in events if e[0] == "data" and e[1]["text"] == "stream me"])
         check("SSE on B delivers mail posted on A", got and events[0][1] == 200, "%.2fs" % dt)
         stop.set()
 
         # Private mode: only the sender and the recipients can read it, and only on nodes holding their keys.
-        st, r = req("POST", pa, "/api/messages", tok["alice"], {"to": "t.bob", "thread": "secret", "text": "for bob only", "mode": "private"})
+        st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "secret", "text": "for bob only", "mode": "private"})
         check("private POST on A", st == 201 and r["message"]["mode"] == "private")
-        got, dt = wait_for(lambda: req("GET", pb, "/api/messages?thread=secret", tok["bob"])[1]["messages"])
+        got, dt = wait_for(lambda: req("GET", pb, "/api/messages?thread=secret", token("B", "bob"))[1]["messages"])
         check("private: bob reads it on B (B holds bob's key)", got and got[0]["text"] == "for bob only", "%.2fs" % dt)
-        check("private: carol cannot see it on B", req("GET", pb, "/api/messages?thread=secret", tok["carol"])[1]["messages"] == [])
-        check("private: carol cannot see it on A", req("GET", pa, "/api/messages?thread=secret", tok["carol"])[1]["messages"] == [])
-        check("private: alice (sender) sees it on A", len(req("GET", pa, "/api/messages?thread=secret", tok["alice"])[1]["messages"]) == 1)
-        st, raw = req("GET", pb, "/api/messages?thread=secret", tok["bob"])
+        check("private: carol cannot see it on B", req("GET", pb, "/api/messages?thread=secret", token("B", "carol"))[1]["messages"] == [])
+        check("private: carol cannot see it on A", req("GET", pa, "/api/messages?thread=secret", token("A", "carol"))[1]["messages"] == [])
+        check("private: alice (sender) sees it on A", len(req("GET", pa, "/api/messages?thread=secret", token("A", "alice"))[1]["messages"]) == 1)
+        st, raw = req("GET", pb, "/api/messages?thread=secret", token("B", "bob"))
         check("private: replicated row on B is marked mode private",
               raw["messages"] and raw["messages"][0]["mode"] == "private")
 
@@ -225,49 +218,35 @@ def main():
         B.stop()
         sent = []
         for i in range(3):
-            st, r = req("POST", pa, "/api/messages", tok["carol"], {"to": "all", "thread": "t1", "text": "while B was down %d" % i})
+            st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "all", "thread": "t1", "text": "while B was down %d" % i})
             sent.append(r["message"]["env"])
         check("posted 3 while B down", len(sent) == 3)
         check("node B restarts", B.start())
         def caught_up():
-            envs = {m["env"] for m in req("GET", pb, "/api/messages?thread=t1", tok["bob"])[1]["messages"]}
+            envs = {m["env"] for m in req("GET", pb, "/api/messages?thread=t1", token("B", "bob"))[1]["messages"]}
             return all(s in envs for s in sent)
         got, dt = wait_for(caught_up, timeout=40)
         check("B caught up after restart (anti-entropy)", got, "%.2fs" % dt)
         # Both nodes now hold the same envelopes and agree on the thread's order.
-        oa = [m["env"] for m in req("GET", pa, "/api/messages?thread=t1&order=causal", tok["alice"])[1]["messages"]]
-        ob = [m["env"] for m in req("GET", pb, "/api/messages?thread=t1&order=causal", tok["bob"])[1]["messages"]]
+        oa = [m["env"] for m in req("GET", pa, "/api/messages?thread=t1&order=causal", token("A", "alice"))[1]["messages"]]
+        ob = [m["env"] for m in req("GET", pb, "/api/messages?thread=t1&order=causal", token("B", "bob"))[1]["messages"]]
         check("same causal thread order on A and B", oa == ob and len(oa) == 5, "%d messages" % len(oa))
-        st, th_ = req("GET", pb, "/api/threads", tok["bob"])
+        st, th_ = req("GET", pb, "/api/threads", token("B", "bob"))
         check("GET /api/threads on B", st == 200 and any(t["thread"] == "t1" and t["n"] == 5 for t in th_["threads"]))
-        st, nm = req("GET", pb, "/api/names?prefix=t.", tok["bob"])
+        st, nm = req("GET", pb, "/api/names?prefix=t.", token("B", "bob"))
         check("GET /api/names on B lists replicated senders", st == 200 and "t.alice" in [n["name"] for n in nm["names"]],
               ",".join(n["name"] for n in nm["names"]))
 
         # islandmail.py against node A, unchanged, only ISLANDMAIL_URL/ISLANDMAIL_DIR set.
-        im_dir = os.path.join(work, "islandmail")
-        for who in ("alice", "bob"):
-            os.makedirs(os.path.join(im_dir, "identities"), exist_ok=True)
-            os.makedirs(os.path.join(im_dir, "tokens"), exist_ok=True)
-            seed = open(k(who)).read().strip()
-            with open(os.path.join(im_dir, "identities", agents[who] + ".json"), "w") as f:
-                json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "home": iss, "id": pub[who], "seed": seed}, f)
-            os.chmod(os.path.join(im_dir, "identities", agents[who] + ".json"), 0o600)
-            # Pre-minted token in islandmail.py's cache, so it never calls a home. ISLANDMAIL_TOKEN=home below keeps this
-            # test on the home-token (aid1) path; phase2.py covers agent tokens and a node with no home.
-            with open(os.path.join(im_dir, "tokens", "%s.mail.json" % agents[who]), "w") as f:
-                json.dump({"token": tok[who], "exp": time.time() + 3600}, f)
-
         def im(port, who, *args, timeout=30):
-            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir, ISLANDMAIL_AS=agents[who],
-                       ISLANDMAIL_TOKEN="home")
+            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=os.path.join(work, "idsA" if who == "alice" else "idsB"), ISLANDMAIL_AS=agents[who])
             p = subprocess.run([sys.executable, a.islandmail, *args], capture_output=True, text=True, env=env, timeout=timeout)
             return p.returncode, (p.stdout + p.stderr).strip()
 
         rc, out = im(pa, "alice", "whoami")
         check("islandmail.py whoami (A)", rc == 0 and "t.alice" in out, out)
         # bob waits on B for his next mail; alice sends it with islandmail.py on A.
-        envb = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % pb, ISLANDMAIL_DIR=im_dir, ISLANDMAIL_AS="t.bob")
+        envb = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % pb, ISLANDMAIL_DIR=os.path.join(work, "idsB"), ISLANDMAIL_AS="t.bob")
         watcher = subprocess.Popen([sys.executable, a.islandmail, "watch", "--mine", "--until", "--name", "it"],
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)
         time.sleep(1.5)
@@ -305,15 +284,15 @@ def main():
                 init = json.loads(ws.recv(timeout=5))
                 ws.send(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}))
                 return ws, init
-            ws, init = rpc_session(tok["bob"])
-            check("MCPL initialize", init["result"]["serverInfo"]["name"] == "agaric-mail" and "mcpl" in init["result"]["capabilities"]["experimental"])
+            ws, init = rpc_session(token("B", "bob"))
+            check("MCPL initialize", init["result"]["serverInfo"]["name"] == "agentmail" and "mcpl" in init["result"]["capabilities"]["experimental"])
             ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             tl = json.loads(ws.recv(timeout=5))
             check("MCPL tools/list", [t["name"] for t in tl["result"]["tools"]] == ["send", "inbox", "thread", "threads", "who", "search", "get"])
             ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "thread", "arguments": {"thread": "t1"}}}))
             tc = json.loads(ws.recv(timeout=5))
             check("MCPL tools/call thread", "hello from A" in tc["result"]["content"][0]["text"])
-            req("POST", pa, "/api/messages", tok["alice"], {"to": "t.bob", "thread": "t3", "text": "push me"})
+            req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "t3", "text": "push me"})
             push = None
             t0 = time.time()
             while time.time() - t0 < 15:
@@ -328,9 +307,9 @@ def main():
                 time.sleep(0.5)
             ws.close()
             # Reconnect: the accepted push is not sent again; a new one sent while away is.
-            req("POST", pa, "/api/messages", tok["alice"], {"to": "t.bob", "thread": "t3", "text": "while you were away"})
+            req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "t3", "text": "while you were away"})
             time.sleep(2)
-            ws, _ = rpc_session(tok["bob"])
+            ws, _ = rpc_session(token("B", "bob"))
             texts = []
             t0 = time.time()
             while time.time() - t0 < 4:
@@ -359,7 +338,7 @@ def main():
             ws.close()
             check("MCPL with an agent token: initialize and send", init.get("result") and sent and not sent["result"].get("isError"),
                   sent["result"]["content"][0]["text"] if sent else "no answer")
-            got, dt = wait_for(lambda: [m for m in req("GET", pa, "/api/messages?thread=t4", tok["alice"])[1]["messages"]])
+            got, dt = wait_for(lambda: [m for m in req("GET", pa, "/api/messages?thread=t4", token("A", "alice"))[1]["messages"]])
             check("its mail reaches A, signed by bob's key", got and got[0]["attest"] == "agent", "%.2fs" % dt)
     finally:
         A.stop()

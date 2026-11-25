@@ -6,7 +6,6 @@
 //!   mailnode pubkey SEED_FILE
 //!   mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json
 //!   mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
-//!   mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS   (tests only: a throwaway home key, never Agaric's)
 
 mod api;
 mod config;
@@ -23,8 +22,7 @@ use mailcore::keys::fmt_key;
 use mailcore::MemberList;
 
 const USAGE: &str = "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
-     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  \
-     mailnode mint-token HOME_SEED_FILE ISS NAME SUB TTL_SECS";
+     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -79,26 +77,6 @@ async fn main() -> Result<()> {
             println!("{}", mailcore::agent_token::mint(&seed, name, sub, &node, mailcore::now_millis(), ttl));
             Ok(())
         }
-        Some("mint-token") if args.len() == 6 => {
-            let home = config::read_seed(Path::new(&args[1]))?;
-            let ttl: f64 = args[5].parse().context("TTL_SECS")?;
-            let now = mailcore::now_millis() as f64 / 1000.0;
-            let p = mailcore::Aid1Payload {
-                v: 1,
-                iss: args[2].clone(),
-                sub: args[4].clone(),
-                kind: "agent".into(),
-                name: args[3].clone(),
-                aud: "mail".into(),
-                scopes: vec!["mail:use".into()],
-                claims: None,
-                iat: now.floor(),
-                exp: (now + ttl).floor(),
-                jti: None,
-            };
-            println!("{}", mailcore::token::mint(&home, &p));
-            Ok(())
-        }
         Some("--help" | "-h" | "help") => {
             println!("mailnode {}: peer-to-peer agent mail node (see README.md)\n{USAGE}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -122,18 +100,7 @@ async fn run(path: &Path) -> Result<()> {
     if !members.is_node(&seed.public()) {
         bail!("this node's key {} is not on the member list; add it and re-sign", fmt_key(&seed.public()));
     }
-    let policy = cfg.policy()?;
     let identities = cfg.identities();
-    let bridge = match &cfg.bridge {
-        Some(b) => {
-            let s = config::read_seed(&b.key_file)?;
-            if !members.is_bridge(&s.public()) {
-                bail!("bridge key {} is not under bridges in the member list", fmt_key(&s.public()));
-            }
-            Some((s, b.sub.clone()))
-        }
-        None => None,
-    };
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),
@@ -154,14 +121,11 @@ async fn run(path: &Path) -> Result<()> {
     let opts = node::Opts {
         identities,
         renamed: cfg.renamed.clone(),
-        refuse_token_only: cfg.refuse_token_only,
-        id_floor: cfg.id_floor,
-        bridge,
         members_path: Some(cfg.adopted_members_path()),
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
     };
     let operator = mailcore::keys::parse_key(&cfg.operator_key)?;
-    let node = Arc::new(node::Node::new(store, members, operator, policy, seed, opts, out_tx));
+    let node = Arc::new(node::Node::new(store, members, operator, seed, opts, out_tx));
     let _net = net::start(&cfg, node.clone(), out_rx).await?;
 
     let state = api::AppState {
