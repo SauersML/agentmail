@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::node::{Node, Outbound};
+use crate::node::Node;
 
 pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/2";
 const MAX_GOSSIP: usize = 1 << 20;
@@ -341,7 +341,7 @@ impl Ctx {
     }
 }
 
-pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedReceiver<Outbound>) -> Result<Net> {
+pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
     let endpoint = Endpoint::builder(presets::Minimal)
@@ -414,9 +414,8 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::UnboundedR
     // Gossip out: every envelope this node writes, and member lists it adopts.
     let c = ctx.clone();
     tokio::spawn(async move {
-        while let Some(out) = outbound.recv().await {
-            let Outbound::Envelope(env) = &out;
-            let Ok(bytes) = serde_json::to_vec(env) else { continue };
+        while let Some(env) = outbound.recv().await {
+            let Ok(bytes) = serde_json::to_vec(&env) else { continue };
             if bytes.len() > MAX_GOSSIP {
                 continue; // anti-entropy carries it
             }
@@ -484,7 +483,7 @@ mod tests {
         };
         list.sign(&op);
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::channel(32);
         let recipients = list.all_keys();
         let node = Node::new(Store::open(&path).unwrap(), list, op.public(), me, Opts::default(), tx);
         let v = Verified { sender_sub: "s".into() };

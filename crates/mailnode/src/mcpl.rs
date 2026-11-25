@@ -1,7 +1,7 @@
 //! /mcpl: MCP over WebSocket (newline-delimited JSON-RPC) with the old server's tools, plus MCPL push/event for hosts
 //! that declare MCPL: mail addressed to the agent is pushed as it arrives; a push the host answers {accepted:true}
 //! (or reason "duplicate") moves the agent's cursor, and on (re)connect the mail past the cursor is pushed (20 at a
-//! time). A connection that leaves 50 pushes unanswered past a 120 s grace is closed (4008); one whose token expires is
+//! time). A connection that leaves 50 pushes unanswered is closed (4008); one whose token expires is
 //! closed (4001); a fifth connection of the same agent replaces its oldest (4000).
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{RawQuery, State};
+use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
@@ -19,14 +19,13 @@ use mailcore::{now_millis, now_ts};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::api::{bearer, params, AppState};
+use crate::api::{bearer, AppState};
 use crate::node::{ApiError, Caller, Node};
 use crate::store::{Query, Row};
 
 const PUSH_BACKLOG: usize = 20;
 const PUSH_TEXT: usize = 20_000;
 const MAX_PENDING_PUSHES: usize = 50;
-const PUSH_GRACE_MS: i64 = 120_000;
 const MAX_WS_FRAME: usize = 1_000_000;
 const MAX_RPCS_PER_FRAME: usize = 20;
 const MAX_SOCKETS_PER_SUB: usize = 4;
@@ -113,14 +112,13 @@ impl Sockets {
 pub async fn handler(
     State(s): State<AppState>,
     headers: HeaderMap,
-    RawQuery(raw): RawQuery,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let Ok(ws) = ws else {
         return ApiError::new(426, "this is a WebSocket endpoint (MCP over WebSocket, newline-delimited JSON-RPC)")
             .into_response();
     };
-    let token = bearer(&headers).or_else(|| params(&raw).get("token").cloned()).unwrap_or_default();
+    let token = bearer(&headers).unwrap_or_default();
     let who = match s.node.verify(&token) {
         Ok(w) => w,
         Err(e) => return e.into_response(),
@@ -141,33 +139,23 @@ pub async fn handler(
 struct Conn {
     node: Arc<Node>,
     who: Caller,
-    out: mpsc::UnboundedSender<Message>,
+    out: Vec<Message>,
     mcpl: bool,
     version: Option<String>,
     grant: Option<Vec<String>>,
     ready: bool,
     /// rpc id -> (message number, sent at ms)
-    pending: HashMap<String, (i64, i64)>,
+    pending: HashMap<String, i64>,
     closed: bool,
 }
 
 async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::UnboundedReceiver<(u16, String)>) {
     let (mut sink, mut stream) = socket.split();
-    let (out, mut out_rx) = mpsc::unbounded_channel::<Message>();
-    let writer = tokio::spawn(async move {
-        while let Some(m) = out_rx.recv().await {
-            let close = matches!(m, Message::Close(_));
-            if sink.send(m).await.is_err() || close {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
     let mut events = node.events.subscribe();
     let mut c = Conn {
         node,
         who,
-        out,
+        out: Vec::new(),
         mcpl: false,
         version: None,
         grant: None,
@@ -194,18 +182,24 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
             k = kill.recv() => { if let Some((code, reason)) = k { c.close(code, &reason) } else { break } },
             _ = tick.tick() => if !c.node.active(&c.who) { c.close(4001, "token expired; dial again with a fresh one") },
         }
+        for frame in c.out.drain(..) {
+            if !matches!(frame, Message::Close(_)) && !c.node.active(&c.who) {
+                return;
+            }
+            if !matches!(tokio::time::timeout(Duration::from_secs(15), sink.send(frame)).await, Ok(Ok(()))) {
+                return;
+            }
+        }
     }
-    drop(c);
-    let _ = writer.await;
 }
 
 impl Conn {
-    fn send(&self, v: Value) {
-        let _ = self.out.send(Message::Text(v.to_string().into()));
+    fn send(&mut self, v: Value) {
+        self.out.push(Message::Text(v.to_string().into()));
     }
 
     fn close(&mut self, code: u16, reason: &str) {
-        let _ = self.out.send(Message::Close(Some(CloseFrame { code, reason: reason.to_string().into() })));
+        self.out.push(Message::Close(Some(CloseFrame { code, reason: reason.to_string().into() })));
         self.closed = true;
     }
 
@@ -246,7 +240,7 @@ impl Conn {
             // A response to one of our push/event requests: the cursor moves only on an accepted push.
             let Some(id) = id else { return };
             let key = id.as_str().map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
-            if let Some((m, _)) = self.pending.remove(&key) {
+            if let Some(m) = self.pending.remove(&key) {
                 let r = &msg["result"];
                 if r["accepted"] == json!(true) || r["reason"] == json!("duplicate") {
                     let _ = self.node.store.advance_cursor(&self.who.sub, m);
@@ -257,12 +251,12 @@ impl Conn {
             }
             return;
         };
-        let reply = |c: &Conn, result: Value| {
+        let reply = |c: &mut Conn, result: Value| {
             if let Some(id) = &id {
                 c.send(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
             }
         };
-        let fail = |c: &Conn, code: i64, message: String| {
+        let fail = |c: &mut Conn, code: i64, message: String| {
             if let Some(id) = &id {
                 c.send(json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } }));
             }
@@ -526,9 +520,7 @@ impl Conn {
     }
 
     fn push_text(&mut self, msg_id: Option<i64>, event_id: &str, text: &str, origin: Value) {
-        let now = now_millis();
-        let unanswered = self.pending.values().filter(|(_, t)| *t < now - PUSH_GRACE_MS).count();
-        if unanswered >= MAX_PENDING_PUSHES {
+        if self.pending.len() >= MAX_PENDING_PUSHES {
             // The agent is not reading. Its cursor stays where it was, so it gets the mail on its next connection.
             self.pending.clear();
             return self.close(4008, &format!("{MAX_PENDING_PUSHES} pushes unanswered; reconnect to receive the rest"));
@@ -547,7 +539,7 @@ impl Conn {
         }));
         tracing::info!("mcpl {}: push/event {event_id}", self.who.name);
         if let Some(m) = msg_id {
-            self.pending.insert(rpc, (m, now));
+            self.pending.insert(rpc, m);
         }
     }
 }

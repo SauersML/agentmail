@@ -117,7 +117,7 @@ async fn run(path: &Path) -> Result<()> {
     }
     // ...and everyone who has written, including through the old server (reachable via the bridge).
     store.names_from_messages()?;
-    let (out_tx, out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities,
         renamed: cfg.renamed.clone(),

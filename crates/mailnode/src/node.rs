@@ -64,11 +64,6 @@ pub struct Posted {
     pub repeated: bool,
 }
 
-/// What goes out on the gossip topic from the API side (member lists are announced by the network task).
-pub enum Outbound {
-    Envelope(Envelope),
-}
-
 /// Node settings beyond the store and keys.
 #[derive(Default)]
 pub struct Opts {
@@ -94,7 +89,7 @@ pub struct Node {
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<Arc<Row>>,
-    pub outbound: mpsc::UnboundedSender<Outbound>,
+    pub outbound: mpsc::Sender<Envelope>,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
     auth_seen: Mutex<HashSet<(String, &'static str)>>,
@@ -107,7 +102,7 @@ impl Node {
         operator: mailcore::keys::PublicKey,
         seed: Seed,
         opts: Opts,
-        outbound: mpsc::UnboundedSender<Outbound>,
+        outbound: mpsc::Sender<Envelope>,
     ) -> Node {
         let (events, _) = broadcast::channel(4096);
         Node {
@@ -377,7 +372,7 @@ impl Node {
             }
         };
         let _ = self.events.send(Arc::new(row.clone()));
-        let _ = self.outbound.send(Outbound::Envelope(env));
+        let _ = self.outbound.try_send(env);
         let reaches = self.reaches(&to, &who.sub)?;
         Ok(Posted { row, reaches, repeated: false })
     }
@@ -767,7 +762,7 @@ mod tests {
     use mailcore::keys::fmt_key;
     use mailcore::{Member, NodeEntry};
 
-    fn setup() -> (Node, Seed, Seed, MemberList, mpsc::UnboundedReceiver<Outbound>) {
+    fn setup() -> (Node, Seed, Seed, MemberList, mpsc::Receiver<Envelope>) {
         let (op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
         let mut list = MemberList {
             v: 1,
@@ -785,15 +780,10 @@ mod tests {
         };
         list.sign(&op);
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(32);
         let opts = Opts { public_url: "http://x".into(), ..Default::default() };
         let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), node_a, opts, tx);
         (node, alice, node_b, list, rx)
-    }
-
-    fn env_of(o: Outbound) -> Envelope {
-        let Outbound::Envelope(e) = o;
-        e
     }
 
     fn envelope(writer: &Seed, list: &MemberList, agent: &Seed, text: &str) -> Envelope {
@@ -982,7 +972,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(!p.repeated);
-        let out = env_of(rx.try_recv().expect("gossiped"));
+        let out = rx.try_recv().expect("gossiped");
         assert_eq!(out.id, p.row.env_id);
         assert_eq!(p.row.attest, "agent");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
@@ -992,7 +982,7 @@ mod tests {
             assert!(node.post(&who, &invalid).is_err());
         }
         let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
-        assert_eq!(env_of(rx.try_recv().unwrap()).parents, vec![p.row.env_id.clone()], "parents = thread heads");
+        assert_eq!(rx.try_recv().unwrap().parents, vec![p.row.env_id.clone()], "parents = thread heads");
         assert!(p3.row.id > p.row.id);
     }
 
@@ -1012,7 +1002,7 @@ mod tests {
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
         assert_eq!(p.row.attest, "agent");
-        let e = env_of(rx.try_recv().unwrap());
+        let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
         assert_eq!(e.ts, ts);
         // A signature over other text, or by another key, is refused.
@@ -1033,7 +1023,7 @@ mod tests {
         let op = mailcore::keys::parse_key(&list.operator).unwrap();
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
-            let (tx, rx) = mpsc::unbounded_channel();
+            let (tx, rx) = mpsc::channel(32);
             let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
             let node_seed = Seed::from_bytes(*node_b.bytes());
             (Node::new(Store::open(&path).unwrap(), list.clone(), op, node_seed, opts, tx), rx)
@@ -1043,7 +1033,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
         assert_eq!(p.row.attest, "agent");
-        let e = env_of(rx.try_recv().unwrap());
+        let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
         e.verify(&list, now_millis()).unwrap();
         e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
@@ -1063,7 +1053,7 @@ mod tests {
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
                                  "signed": signed(&alice, "all", "t", "see file", &[id.clone()], &ts) }))
             .unwrap();
-        let e = env_of(rx.try_recv().unwrap());
+        let e = rx.try_recv().unwrap();
         assert_eq!(e.blobs, vec![id.clone()]);
         let m = p.row.to_message();
         assert_eq!(m["files"][0]["id"], json!(id));
@@ -1109,7 +1099,7 @@ mod tests {
         assert_eq!(e.status, 400, "{}", e.message);
         let p = node.post(&who, &signed_body(&alice, "signed")).unwrap();
         assert_eq!(p.row.attest, "agent");
-        let env = env_of(rx.try_recv().unwrap());
+        let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }
 

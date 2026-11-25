@@ -278,7 +278,7 @@ def main():
             check("MCPL (websockets not installed: skipped)", True)
         if connect:
             def rpc_session(token):
-                ws = connect("ws://127.0.0.1:%d/mcpl?token=%s" % (pb, token), max_size=None)
+                ws = connect("ws://127.0.0.1:%d/mcpl" % pb, additional_headers={"Authorization": "Bearer " + token})
                 ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                     "protocolVersion": "2024-11-05", "capabilities": {"experimental": {"mcpl": {"version": "0.4"}}}}}))
                 init = json.loads(ws.recv(timeout=5))
