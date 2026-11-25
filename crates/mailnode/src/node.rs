@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
-use mailcore::addr::{self, addressed_to, is_broadcast, norm};
+use mailcore::addr::{addressed_to, is_broadcast, norm};
 use mailcore::envelope::{Draft, Grant};
 use mailcore::keys::Seed;
 use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode};
@@ -14,13 +14,11 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::config::Renamed;
 use crate::store::{Row, Store, MAX_TEXT};
 
 pub const MAX_FIELD: usize = 120;
 const REPEAT_MS: i64 = 10 * 60 * 1000;
 const RATE_WINDOW_MS: i64 = 3_600_000;
-const SCAN_ROWS: usize = 50_000;
 
 /// An HTTP-style error: status and message, as the old server's HttpError.
 #[derive(Debug, Clone)]
@@ -68,7 +66,6 @@ pub struct Posted {
 #[derive(Default)]
 pub struct Opts {
     pub identities: Vec<(String, Seed)>,
-    pub renamed: Vec<Renamed>,
     /// Where the latest adopted member list is kept.
     pub members_path: Option<std::path::PathBuf>,
     /// Base URL written into attachment links.
@@ -311,7 +308,7 @@ impl Node {
                 // the first copy back instead of a second envelope.
                 let sig = mailcore::b64u_decode(&sig).map(|b| mailcore::b64u(&b)).unwrap_or(sig);
                 if let Some(row) = self.store.by_agent_sig(&sig)?.filter(|row| row.visible_to(who)) {
-                    let reaches = self.reaches(&row.recipient, &who.sub)?;
+                    let reaches = self.reaches(&row.recipient, &who.sub);
                     return Ok(Posted { row, reaches, repeated: true });
                 }
                 (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
@@ -325,7 +322,7 @@ impl Node {
                     let since = ts_from_millis(now_millis() - REPEAT_MS);
                     if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)?
                         .filter(|r| r.mode == mode.as_str() && r.visible_to(who)) {
-                        let reaches = self.reaches(&to, &who.sub)?;
+                        let reaches = self.reaches(&to, &who.sub);
                         return Ok(Posted { row, reaches, repeated: true });
                     }
                 }
@@ -367,13 +364,13 @@ impl Node {
                 let Attest::Agent { sig, .. } = &env.attest;
                 let row = self.store.by_agent_sig(sig)?.filter(|r| r.visible_to(who))
                     .ok_or_else(|| ApiError::new(409, "signed message already stored"))?;
-                let reaches = self.reaches(&to, &who.sub)?;
+                let reaches = self.reaches(&to, &who.sub);
                 return Ok(Posted { row, reaches, repeated: true });
             }
         };
         let _ = self.events.send(Arc::new(row.clone()));
         let _ = self.outbound.try_send(env);
-        let reaches = self.reaches(&to, &who.sub)?;
+        let reaches = self.reaches(&to, &who.sub);
         Ok(Posted { row, reaches, repeated: false })
     }
 
@@ -496,108 +493,25 @@ impl Node {
 
     /* Names */
 
-    fn renames(&self) -> impl Iterator<Item = &Renamed> {
-        self.opts.renamed.iter().filter(|r| !r.name.is_empty() && !r.sub.is_empty() && !r.now.is_empty())
-    }
-
-    /// The names mail to this agent may be addressed to: its own, and the names it had before a rename.
-    pub fn names_of(&self, name: &str, sub: &str) -> Vec<String> {
-        let mut v = vec![name.to_string()];
-        v.extend(self.renames().filter(|r| r.now_sub == sub && addr::same(&r.now, name)).map(|r| r.name.clone()));
-        v
-    }
-
-    pub fn subs_of(&self, sub: &str) -> Vec<String> {
-        let mut v = vec![sub.to_string()];
-        v.extend(self.renames().filter(|r| r.now_sub == sub).map(|r| r.sub.clone()));
-        v
-    }
-
-    pub fn known_names(&self, limit: i64) -> Result<Vec<(String, String, i64)>> {
-        let rows = self.store.names(limit)?;
-        let present: std::collections::HashSet<&str> = rows.iter().map(|r| r.1.as_str()).collect();
-        let gone: std::collections::HashSet<String> = self
-            .renames()
-            .filter(|r| present.contains(r.now_sub.as_str()))
-            .map(|r| format!("{}\u{0}{}", norm(&r.name), r.sub))
-            .collect();
-        Ok(rows.iter().filter(|r| !gone.contains(&format!("{}\u{0}{}", norm(&r.0), r.1))).cloned().collect())
-    }
-
     pub fn names_list(&self, prefix: &str) -> Result<Vec<Value>> {
         let p = norm(prefix);
         Ok(self
-            .known_names(1000)?
+            .store.names(&self.members.read().unwrap().members)?
             .into_iter()
             .filter(|r| p.is_empty() || norm(&r.0).starts_with(&p))
             .map(|r| json!({ "name": r.0, "sub": r.1, "last_active": ts_from_millis(r.2) }))
             .collect())
     }
 
-    pub fn reaches(&self, to: &str, sender_sub: &str) -> Result<Vec<String>> {
-        let mut out: Vec<String> = self
-            .known_names(5000)?
-            .into_iter()
-            .filter(|r| {
-                let names = self.names_of(&r.0, &r.1);
-                let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-                r.1 != sender_sub && addressed_to(to, &refs)
-            })
-            .map(|r| r.0)
-            .collect();
+    pub fn reaches(&self, to: &str, sender_sub: &str) -> Vec<String> {
+        let members = self.members.read().unwrap();
+        let mut out: Vec<_> = members.members.iter()
+            .filter(|m| m.sub != sender_sub && addressed_to(to, &[&m.name]))
+            .map(|m| m.name.clone()).collect();
         out.sort();
-        Ok(out)
+        out
     }
 
-    /// Mail addressed to `name` with ids in (after, before), not sent by it; newest first unless `ascending`.
-    pub fn addressed_rows(
-        &self,
-        who: &Caller,
-        after: i64,
-        before: i64,
-        limit: usize,
-        text_cap: i64,
-        ascending: bool,
-    ) -> Result<Vec<Row>> {
-        let names = self.names_of(&who.name, &who.sub);
-        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let subs = self.subs_of(&who.sub);
-        let mut needles = vec!["all".to_string(), "*".to_string()];
-        for n in &names {
-            let n = norm(n);
-            for (i, c) in n.char_indices() {
-                if c == '.' {
-                    needles.push(n[..=i].to_string());
-                }
-            }
-            needles.push(n);
-        }
-        needles.sort();
-        needles.dedup();
-        let (mut lo, mut hi) = (after, before);
-        let mut rows = Vec::new();
-        let mut scanned = 0;
-        loop {
-            let page = self.store.addressed_page(who, lo, hi, &subs, &needles, ascending, text_cap)?;
-            if page.is_empty() {
-                break;
-            }
-            let n = page.len();
-            let last = page[n - 1].id;
-            rows.extend(page.into_iter().filter(|r| addressed_to(&r.recipient, &refs)));
-            scanned += n;
-            if ascending {
-                lo = last;
-            } else {
-                hi = last;
-            }
-            if rows.len() >= limit || scanned >= SCAN_ROWS || n < 500 {
-                break;
-            }
-        }
-        rows.truncate(limit);
-        Ok(rows)
-    }
 }
 
 /// ",name1,name2," of the member names a private envelope is for: the sender and every member `to` addresses.

@@ -195,6 +195,9 @@ impl Store {
         }
         db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
         db.execute_batch(SCHEMA)?;
+        use rusqlite::functions::FunctionFlags;
+        db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |c| Ok(mailcore::addr::addressed_to(c.get_raw(0).as_str()?, &[c.get_raw(1).as_str()?])))?;
         // agent_sig: the sender's signature of an agent-signed message, on the first copy this node stored. A member
         // node can read members-mode mail, so it can re-encrypt someone's signed message into a new envelope (new id,
         // same signature): such a replay is kept hidden (mode 'dup', no text) so day hashes still agree between nodes.
@@ -351,41 +354,18 @@ impl Store {
         Ok((rows, more))
     }
 
-    /// A page of rows in (lo, hi) whose recipient contains one of `needles` (a prefilter for addressedTo), not sent by
-    /// any of `subs`. Used by the inbox tool and MCPL backlog.
-    pub fn addressed_page(
-        &self,
-        viewer: &Caller,
-        lo: i64,
-        hi: i64,
-        subs: &[String],
-        needles: &[String],
-        ascending: bool,
-        text_cap: i64,
+    pub fn addressed_rows(
+        &self, viewer: &Caller, after: i64, before: i64, limit: usize, text_cap: i64, ascending: bool,
     ) -> Result<Vec<Row>> {
-        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))), Value::Text(viewer.key.clone())];
-        args.push(Value::Integer(lo));
-        args.push(Value::Integer(hi));
-        let subs_sql = vec!["?"; subs.len().max(1)].join(", ");
-        if subs.is_empty() {
-            args.push(Value::Text(String::new()));
-        }
-        args.extend(subs.iter().map(|s| Value::Text(s.clone())));
-        let needle_sql = needles
-            .iter()
-            .map(|_| "instr(replace(lower(recipient), '/', '.'), ?) > 0")
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        args.extend(needles.iter().map(|s| Value::Text(s.clone())));
-        let sql = format!(
-            "SELECT {COLS} FROM messages WHERE {} AND id > ? AND id < ? AND sender_sub NOT IN ({subs_sql}) AND ({needle_sql}) \
-             ORDER BY id {} LIMIT 500",
-            visible_sql(),
-            if ascending { "ASC" } else { "DESC" }
-        );
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&sql)?;
-        let rows = st.query_map(params_from_iter(args), read_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let order = if ascending { "ASC" } else { "DESC" };
+        let mut st = db.prepare(&format!(
+            "SELECT {COLS} FROM messages WHERE {} AND id > ? AND id < ? AND sender_sub != ?
+             AND addressed_to(recipient, ?) ORDER BY id {order} LIMIT ?", visible_sql()
+        ))?;
+        let args = params![text_cap, format!(",{},", norm(&viewer.name)), viewer.key, after, before,
+                           viewer.sub, viewer.name, limit as i64];
+        let rows = st.query_map(args, read_row)?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
@@ -532,23 +512,14 @@ impl Store {
         Ok(())
     }
 
-    /// Every sender already in the store becomes a known name (imports included), for stores written before imports
-    /// were recorded. Members keep their sub; only `seen` moves forward.
-    pub fn names_from_messages(&self) -> Result<usize> {
+    pub fn names(&self, members: &[mailcore::Member]) -> Result<Vec<(String, String, i64)>> {
         let db = self.db.lock().unwrap();
-        Ok(db.execute(
-            "INSERT INTO names (name, sub, seen) SELECT sender, sender_sub, MAX(received) FROM messages \
-             WHERE sender != '' AND sender_sub != '' GROUP BY sender \
-             ON CONFLICT(name) DO UPDATE SET seen = MAX(seen, excluded.seen)",
-            [],
-        )?)
-    }
-
-    /// (name, sub, seen ms), most recently active first.
-    pub fn names(&self, limit: i64) -> Result<Vec<(String, String, i64)>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT name, sub, seen FROM names ORDER BY seen DESC LIMIT ?")?;
-        let rows = st.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = db.prepare(
+            "SELECT m.value->>'name', m.value->>'sub', COALESCE(n.seen, 0)
+             FROM json_each(?) m LEFT JOIN names n ON n.name = m.value->>'name' AND n.sub = m.value->>'sub'
+             ORDER BY COALESCE(n.seen, 0) DESC, m.value->>'name'")?;
+        let rows = st.query_map([serde_json::to_string(members)?], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 

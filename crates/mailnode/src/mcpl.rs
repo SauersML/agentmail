@@ -274,17 +274,11 @@ impl Conn {
                 if self.mcpl {
                     caps["experimental"] = json!({ "mcpl": manifest() });
                 }
-                let names = self.node.names_of(&self.who.name, &self.who.sub);
-                let earlier = if names.len() > 1 {
-                    format!(" Mail to {}, your earlier name, reaches you too.", names[1..].join(" or "))
-                } else {
-                    String::new()
-                };
                 reply(self, json!({
                     "protocolVersion": pv.unwrap_or_else(|| "2024-11-05".into()),
                     "capabilities": caps,
                     "serverInfo": { "name": "agentmail", "version": concat!("mailnode-", env!("CARGO_PKG_VERSION")) },
-                    "instructions": format!("{INSTRUCTIONS} You are {} ({}).{earlier}", self.who.name, self.who.sub),
+                    "instructions": format!("{INSTRUCTIONS} You are {} ({}).", self.who.name, self.who.sub),
                 }));
             }
             "notifications/initialized" => {
@@ -372,9 +366,9 @@ impl Conn {
                 let limit = cap(&args["limit"], 20) as usize;
                 let before = int(&args["before"]).unwrap_or(i64::MAX);
                 let rows = match int(&args["after"]) {
-                    Some(after) => n.addressed_rows(me, after, before, limit, 2000, true)?,
+                    Some(after) => n.store.addressed_rows(me, after, before, limit, 2000, true)?,
                     None => {
-                        let mut r = n.addressed_rows(me, 0, before, limit, 2000, false)?;
+                        let mut r = n.store.addressed_rows(me, 0, before, limit, 2000, false)?;
                         r.reverse();
                         r
                     }
@@ -463,17 +457,11 @@ impl Conn {
         !(major > 0 || minor >= 5)
     }
 
-    fn addressed(&self, r: &Row) -> bool {
-        let names = self.node.names_of(&self.who.name, &self.who.sub);
-        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        addressed_to(&r.recipient, &refs)
-    }
-
     fn on_new(&mut self, r: &Row) {
-        if !self.ready || !self.push_allowed() || self.node.subs_of(&self.who.sub).contains(&r.sender_sub) {
+        if !self.ready || !self.push_allowed() || self.who.sub == r.sender_sub {
             return;
         }
-        if !self.addressed(r) || !r.visible_to(&self.who) {
+        if !addressed_to(&r.recipient, &[&self.who.name]) || !r.visible_to(&self.who) {
             return;
         }
         self.push(r);
@@ -484,19 +472,15 @@ impl Conn {
         let cur = match self.node.store.cursor(&sub) {
             Ok(Some(c)) => c,
             Ok(None) => {
-                // A renamed agent's first connection goes on from its old subject's cursor; anyone else's first
-                // connection starts from now, not from the whole history.
-                let old = self.node.subs_of(&sub)[1..].iter().find_map(|o| self.node.store.cursor(o).ok().flatten());
-                let start = old.unwrap_or_else(|| self.node.store.last_id().unwrap_or(0));
-                let _ = self.node.store.advance_cursor(&sub, start);
-                match old {
-                    Some(o) => o,
-                    None => return,
+                if let Ok(last) = self.node.store.last_id() {
+                    let _ = self.node.store.advance_cursor(&sub, last);
                 }
+                return;
+
             }
             Err(_) => return,
         };
-        let Ok(rows) = self.node.addressed_rows(&self.who, cur, i64::MAX, PUSH_BACKLOG + 1, PUSH_TEXT as i64, true)
+        let Ok(rows) = self.node.store.addressed_rows(&self.who, cur, i64::MAX, PUSH_BACKLOG + 1, PUSH_TEXT as i64, true)
         else {
             return;
         };

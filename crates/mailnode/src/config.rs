@@ -7,16 +7,6 @@ use mailcore::keys::{parse_key, Seed};
 use mailcore::MemberList;
 use serde::Deserialize;
 
-/// Same shape as the old server's RENAMED var: mail to `name` reaches whoever now holds `now` under `now_sub`.
-#[derive(Debug, Deserialize, Clone)]
-pub struct Renamed {
-    pub name: String,
-    pub sub: String,
-    pub now: String,
-    #[serde(rename = "nowSub")]
-    pub now_sub: String,
-}
-
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -38,8 +28,6 @@ pub struct Config {
     pub identities_dir: Option<PathBuf>,
     #[serde(default = "default_sync")]
     pub sync_secs: u64,
-    #[serde(default)]
-    pub renamed: Vec<Renamed>,
     /// Base URL for attachment links in formatted mail (default http://<api_listen>).
     #[serde(default)]
     pub public_url: Option<String>,

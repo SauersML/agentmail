@@ -117,16 +117,9 @@ async fn run(path: &Path) -> Result<()> {
         identities.len()
     );
     let store = store::Store::open(&cfg.data_dir.join("mail.sqlite"))?;
-    // Every member is a known name from the start (who / reaches), even before it has written anything here.
-    for m in &members.members {
-        store.seen(&m.name, &m.sub, 0)?;
-    }
-    // ...and everyone who has written, including through the old server (reachable via the bridge).
-    store.names_from_messages()?;
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities,
-        renamed: cfg.renamed.clone(),
         members_path: Some(cfg.adopted_members_path()),
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
     };
