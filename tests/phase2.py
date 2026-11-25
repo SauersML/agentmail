@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for  # noqa: E402
+from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory  # noqa: E402
 
 
 def main():
@@ -27,9 +27,7 @@ def main():
     bin_ = os.path.abspath(a.bin)
     repo = os.path.abspath(a.repo)
     client = os.path.join(repo, "clients", "islandmail.py")
-    work = os.path.abspath(a.workdir or "p2-%d" % int(time.time()))
-    if os.path.exists(work):
-        shutil.move(work, work + ".old-%d" % int(time.time()))
+    work = work_directory(a.workdir)
     os.makedirs(os.path.join(work, "keys"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
     names = ["nodeA", "nodeB", "nodeC", "alice", "bob", "carol", "dave"]

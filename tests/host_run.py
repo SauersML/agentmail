@@ -10,14 +10,12 @@ HOST_PKG is node_modules/@animalabs/connectome-host of an installed host. HOME a
 import argparse
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for  # noqa: E402
+from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory  # noqa: E402
 
 
 def grep(path, needle):
@@ -48,9 +46,7 @@ def main():
     ap.add_argument("--workdir", default=None)
     a = ap.parse_args()
     bin_ = os.path.abspath(a.bin)
-    work = os.path.abspath(a.workdir or "host-%d" % int(time.time()))
-    if os.path.exists(work):
-        shutil.move(work, work + ".old-%d" % int(time.time()))
+    work = work_directory(a.workdir)
     os.makedirs(os.path.join(work, "keys"))
     os.makedirs(os.path.join(work, "home"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")

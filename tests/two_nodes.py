@@ -10,10 +10,10 @@ import argparse
 import http.client
 import json
 import os
-import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -26,6 +26,14 @@ def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
     print("%s %s %s" % ("PASS" if ok else "FAIL", name, detail), flush=True)
     return ok
+
+
+def work_directory(path):
+    if not path:
+        return tempfile.mkdtemp(prefix="agentmail-")
+    path = os.path.abspath(path)
+    os.makedirs(path, mode=0o700, exist_ok=False)
+    return path
 
 
 def free_port(kind=socket.SOCK_STREAM):
@@ -121,10 +129,7 @@ def main():
     ap.add_argument("--workdir", default=None)
     a = ap.parse_args()
     bin_ = os.path.abspath(a.bin)
-    work = os.path.abspath(a.workdir or "run-%d" % int(time.time()))
-    if os.path.exists(work):
-        shutil.move(work, work + ".old-%d" % int(time.time()))
-    os.makedirs(work)
+    work = work_directory(a.workdir)
     k = lambda n: os.path.join(work, "keys", n + ".seed")
     os.makedirs(os.path.join(work, "keys"))
 
