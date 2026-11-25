@@ -3,6 +3,7 @@
 
 pub mod addr;
 pub mod agent_token;
+pub mod cert;
 pub mod crypto;
 pub mod envelope;
 pub mod keys;
@@ -11,7 +12,8 @@ pub mod order;
 pub mod paseto;
 
 pub use envelope::{Attest, Body, Envelope, Mode, Verified};
-pub use members::{Member, MemberList, NodeEntry};
+pub use cert::{Cert, Revocation};
+pub use members::{Agent, Member, MemberList, NodeEntry};
 
 use base64::engine::{general_purpose::GeneralPurpose, DecodePaddingMode, GeneralPurposeConfig};
 use base64::Engine;

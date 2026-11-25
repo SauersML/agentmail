@@ -8,10 +8,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use anyhow::Result;
 use mailcore::addr::{addressed_to, is_broadcast, norm};
 use mailcore::envelope::{Draft, PostStatement};
-use mailcore::keys::Seed;
-use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode};
+use mailcore::keys::{fmt_key, parse_key, PublicKey, Seed};
+use mailcore::members::{self, Agent};
+use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Cert, Envelope, MemberList, Mode, Revocation};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::store::{Row, Store, MAX_TEXT};
@@ -80,6 +81,13 @@ const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
 pub struct Node {
     pub store: Store,
     pub members: RwLock<MemberList>,
+    /// Who this host accepts now: pinned agents and live certificates (`MemberList::agents`). Kept current by
+    /// `refresh` whenever the trust file, a certificate or a revocation changes.
+    roster: RwLock<Vec<Agent>>,
+    /// Bumped on every trust change, so open sessions re-check their caller at once.
+    pub trust: watch::Sender<u64>,
+    /// Certificates and revocations to gossip (JSON, tagged {"cert": …} or {"revocation": …}).
+    pub trust_out: broadcast::Sender<String>,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<i64>,
@@ -98,8 +106,12 @@ impl Node {
         outbound: mpsc::Sender<Envelope>,
     ) -> Node {
         let (events, _) = broadcast::channel(4096);
-        Node {
+        let (trust_out, _) = broadcast::channel(256);
+        let node = Node {
             store,
+            roster: RwLock::new(Vec::new()),
+            trust: watch::channel(0).0,
+            trust_out,
             members: RwLock::new(members),
             seed,
             opts,
@@ -108,9 +120,28 @@ impl Node {
             rates: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
             auth_seen: Mutex::new(HashSet::new()),
-        }
+        };
+        node.refresh();
+        node
     }
 
+    /// Recompute who this host accepts (now: any known revocation counts) and wake open sessions.
+    pub fn refresh(&self) {
+        let list = self.members.read().unwrap().clone();
+        let certs = self.store.certs().unwrap_or_else(|e| { tracing::warn!("reading certificates: {e:#}"); vec![] });
+        let revs = self.store.revocation_times().unwrap_or_default();
+        let roster = list.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), i64::MAX);
+        *self.roster.write().unwrap() = roster;
+        self.trust.send_modify(|g| *g += 1);
+    }
+
+    pub fn agents(&self) -> Vec<Agent> {
+        self.roster.read().unwrap().clone()
+    }
+
+    fn me(&self) -> PublicKey {
+        self.seed.public()
+    }
     pub fn members_seq(&self) -> u64 {
         self.members.read().unwrap().seq
     }
@@ -124,6 +155,7 @@ impl Node {
         self.store.bind_roster(&self.seed.public(), list)?;
         *cur = list.clone();
         drop(cur);
+        self.refresh();
         for m in &list.members {
             let _ = self.store.seen(&m.name, &m.sub, 0);
         }
@@ -138,11 +170,12 @@ impl Node {
         let now = now_millis();
         use mailcore::agent_token::Refusal;
         let checked = {
-            let members = self.members.read().unwrap();
-            mailcore::agent_token::verify(token, &members, &self.seed.public(), now)
+            let roster = self.roster.read().unwrap();
+            mailcore::agent_token::verify(token, &roster, &self.seed.public(), now)
         };
         let c = checked.map_err(|r| match r {
-            Refusal::NotMember(s) => ApiError::new(403, format!("{s}; have this peer pin your public entry")),
+            Refusal::NotMember(s) => ApiError::new(403, format!(
+                "{s}; islandmail.py gets a certificate from this node on first use (POST /api/agents), or pin the agent in this host's trust file")),
             Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
         })?;
         if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
@@ -154,8 +187,129 @@ impl Node {
     }
 
     pub fn active(&self, who: &Caller) -> bool {
-        who.exp_ms > now_millis() && self.members.read().unwrap().member_by_name(&who.name)
-            .is_some_and(|m| m.sub == who.sub && m.key == who.key)
+        let me = self.me();
+        who.exp_ms > now_millis() && self.roster.read().unwrap().iter().any(|a| {
+            mailcore::addr::same(&a.name, &who.name) && fmt_key(&a.key) == who.key && a.sub == who.sub
+                && (a.pinned || a.homes.contains(&me))
+        })
+    }
+
+    /// The caller's entry in the roster.
+    fn agent_of(&self, agents: &[Agent], who: &Caller) -> Result<Agent, ApiError> {
+        parse_key(&who.key).ok().and_then(|k| members::find(agents, &who.name, &k)).filter(|a| a.sub == who.sub).cloned()
+            .ok_or_else(|| ApiError::new(401, "session expired or membership changed"))
+    }
+
+    /// A certificate to carry in the sender's envelopes (this node's own first), so receivers can check the sender
+    /// before certificates replicate. None for an agent known here only by its pin.
+    fn carried(&self, a: &Agent) -> Option<Cert> {
+        let me = fmt_key(&self.me());
+        a.certs.iter().find(|c| c.node == me).or(a.certs.first()).cloned()
+    }
+
+    /* Certificates */
+
+    /// POST /api/agents (loopback API): certify an agent of this host. Ok((status, {"cert": …})).
+    pub fn certify(&self, body: &Value) -> Result<(u16, Value), ApiError> {
+        let f = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let (name, key) = (f("name"), f("key"));
+        let me = self.me();
+        let k = mailcore::cert::check_issuance(name, key, f("ts"), f("sig"), &me, now_millis())
+            .map_err(|e| ApiError::new(400, format!("certificate request refused: {e}")))?;
+        let list = self.members.read().unwrap().clone();
+        let mine = list.node_by_key(&me).ok_or_else(|| ApiError::new(503, "this node is not in its own trust file"))?;
+        if !mine.covers(name) {
+            let ns = if mine.names.is_empty() { "none".to_string() } else { mine.names.join(", ") };
+            return Err(ApiError::new(403, format!(
+                "{name} is not in this host's names ({ns}); add it to this node's \"names\" in the trust file")));
+        }
+        if self.store.revoked_at(&fmt_key(&me), key)?.is_some() {
+            return Err(ApiError::new(403, "this node revoked that key; make a new one"));
+        }
+        if let Some(m) = list.member_by_name(name).filter(|m| m.key != key) {
+            return Err(ApiError::new(409, format!("{} is pinned in this host's trust file with another key", m.name)));
+        }
+        if let Some(c) = self.store.cert(&fmt_key(&me), key)? {
+            if !mailcore::addr::same(&c.name, name) {
+                return Err(ApiError::new(409, format!("this key is already certified here as {}", c.name)));
+            }
+            return Ok((200, json!({ "cert": c })));
+        }
+        let agents = self.agents();
+        if let Some(a) = members::named(&agents, name).find(|a| a.key != k) {
+            let by = if a.homes.contains(&me) { "this node".to_string() } else {
+                a.homes.iter().filter_map(|h| list.node_by_key(h)).map(|n| n.name.clone()).collect::<Vec<_>>().join(", ")
+            };
+            return Err(ApiError::new(409, format!(
+                "{name} is already certified by {by} with another key; use that key (copy its identity file) or pick another name")));
+        }
+        self.rate("node", "certificate", 60)?;
+        let cert = Cert::issue(&self.seed, name, &k, &now_ts());
+        self.store.put_cert(&cert)?;
+        self.refresh();
+        let _ = self.trust_out.send(json!({ "cert": cert }).to_string());
+        tracing::info!("certified {name} {}", fmt_key(&k));
+        Ok((201, json!({ "cert": cert })))
+    }
+
+    /// POST /api/revocations: the host owner (holding the node key) revokes this node's certificates for a name.
+    /// Body {name, ts, sig}: sig is the node key's signature over `revoke_statement`.
+    pub fn revoke(&self, body: &Value) -> Result<Vec<Revocation>, ApiError> {
+        let f = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
+        let (name, ts) = (f("name"), f("ts"));
+        let me = self.me();
+        let t = mailcore::parse_ts(ts).ok_or_else(|| ApiError::new(400, "ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
+        let sig = mailcore::b64u_decode(f("sig")).unwrap_or_default();
+        if (t - now_millis()).abs() > 300_000
+            || !mailcore::keys::verify(&me, revoke_statement(name, &fmt_key(&me), ts).as_bytes(), &sig) {
+            return Err(ApiError::new(401, "revocation requests are signed by this node's key (mailnode revoke CONFIG NAME)"));
+        }
+        let mut out = Vec::new();
+        for c in self.store.certs_named(name)?.into_iter().filter(|c| c.node == fmt_key(&me)) {
+            if self.store.revoked_at(&c.node, &c.key)?.is_some() { continue; }
+            let r = Revocation::sign(&self.seed, &c.name, &c.agent_key()?, &now_ts());
+            self.store.put_revocation(&r)?;
+            let _ = self.trust_out.send(json!({ "revocation": r }).to_string());
+            tracing::info!("revoked {} {}", r.name, r.key);
+            out.push(r);
+        }
+        self.refresh();
+        Ok(out)
+    }
+
+    /// A certificate from a peer: kept if this host trusts its node for the name. Ok(true) when new here.
+    pub fn take_cert(&self, c: &Cert) -> Result<bool> {
+        anyhow::ensure!(self.members.read().unwrap().accepts(c), "certificate for {:?} from a node not trusted for that name", c.name);
+        let new = self.store.put_cert(c)?;
+        if new { self.refresh(); }
+        Ok(new)
+    }
+
+    /// A revocation from a peer: kept if signed by a node on the trust file. Ok(true) when new here.
+    pub fn take_revocation(&self, r: &Revocation) -> Result<bool> {
+        r.check()?;
+        anyhow::ensure!(self.members.read().unwrap().is_node(&parse_key(&r.node)?), "revocation from a node that is not trusted");
+        let new = self.store.put_revocation(r)?;
+        if new { self.refresh(); }
+        Ok(new)
+    }
+
+    /// Held identities (identities_dir) in this node's names get a certificate at startup, so the node can sign for
+    /// them.
+    pub fn certify_identities(&self) {
+        let me = self.me();
+        let Some(mine) = self.members.read().unwrap().node_by_key(&me).cloned() else { return };
+        for (name, seed) in &self.opts.identities {
+            if !mine.covers(name) || !mailcore::cert::valid_name(name) { continue; }
+            let key = fmt_key(&seed.public());
+            let ts = now_ts();
+            let sig = mailcore::b64u(&seed.sign(mailcore::cert::certify_statement(name, &key, &fmt_key(&me), &ts).as_bytes()));
+            match self.certify(&json!({ "name": name, "key": key, "ts": ts, "sig": sig })) {
+                Ok((201, _)) => tracing::info!("certified held identity {name}"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("held identity {name}: {}", e.message),
+            }
+        }
     }
 
     /// Logs the first sign-in of each name with each kind of token (debug-level for every later one). Never the token.
@@ -245,7 +399,9 @@ impl Node {
         let _ = self.store.seen(&who.name, &who.sub, now_millis());
 
         let members = self.members.read().unwrap().clone();
-        let recipients = Self::recipients(&members, &to, &who.name, mode)?;
+        let agents = self.agents();
+        let me_agent = self.agent_of(&agents, who)?;
+        let recipients = Self::recipients(&members, &agents, &to, &who.name, mode)?;
         // Accept the client signature or sign with the caller's enrolled local key.
         let (ts, attest, salt) = match body.get("signed") {
             Some(s) => {
@@ -266,19 +422,16 @@ impl Node {
                     .and_then(mailcore::b64u_decode)
                     .filter(|b| b.len() == 16)
                     .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16 bytes, base64url"))?;
-                let m = members
-                    .member_by_name(&who.name)
-                    .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
-                let key = mailcore::keys::parse_key(&m.key)?;
+                let key = me_agent.key;
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
                 let st = PostStatement {
-                    from: &who.name, to: &to, thread: &thread, mode,
+                    from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
                 }.signing_bytes(&members);
                 let sig = s["sig"].as_str().unwrap_or("").to_string();
                 let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, &st, &b));
                 if !ok {
-                    return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key on the member list", who.name)));
+                    return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key", who.name)));
                 }
                 // Canonical encoding (the one every node dedupes by); a client resending the same signed post gets
                 // the first copy back instead of a second envelope.
@@ -287,12 +440,12 @@ impl Node {
                     let reaches = self.reaches(&row.recipient, &who.sub);
                     return Ok(Posted { row, reaches, repeated: true });
                 }
-                (ts, Attest::Agent { key: m.key.clone(), digest, sig }, mailcore::b64u(&salt))
+                (ts, Attest::Agent { key: fmt_key(&key), digest, sig, cert: self.carried(&me_agent) }, mailcore::b64u(&salt))
             }
             // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
             // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
             None => {
-                let (key, seed) = self.local_key(&members, who).ok_or_else(|| ApiError::new(400,
+                let (key, seed) = self.local_key(who).ok_or_else(|| ApiError::new(400,
                     "sign the post with your agent key or configure identities_dir on this node"))?;
                 if file_ids.is_empty() {
                     let since = ts_from_millis(now_millis() - REPEAT_MS);
@@ -306,11 +459,11 @@ impl Node {
                 let ts = now_ts();
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
                 let st = PostStatement {
-                    from: &who.name, to: &to, thread: &thread, mode,
+                    from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
                 }.signing_bytes(&members);
                 let sig = mailcore::b64u(&seed.sign(&st));
-                (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
+                (ts, Attest::Agent { key, digest, sig, cert: self.carried(&me_agent) }, mailcore::b64u(&salt))
             }
         };
         let parents = self.store.heads(&thread)?;
@@ -332,10 +485,10 @@ impl Node {
         )?;
         // Refuse to write what no other node would accept (e.g. this node is not on the member list).
         let v = env
-            .verify(&members, now_millis())
+            .verify(&members, &agents, now_millis())
             .and_then(|v| env.check_body(&b).map(|_| v))
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
-        let readers = (mode == Mode::Private).then(|| readers_for(&members, &to, &who.name));
+        let readers = (mode == Mode::Private).then(|| readers_for(&agents, &to, &who.name));
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         let row = match self.store.insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())? {
             Some(row) => row,
@@ -353,24 +506,34 @@ impl Node {
         Ok(Posted { row, reaches, repeated: false })
     }
 
-    /// The caller's agent key, if this node holds it: an identity named like the caller whose public key is the one
-    /// the member list gives that name, with the same sub as the caller's token. (member-list key string, seed)
-    fn local_key(&self, members: &MemberList, who: &Caller) -> Option<(String, Seed)> {
-        let m = members.member_by_name(&who.name).filter(|m| m.sub == who.sub && m.key == who.key)?;
-        let k = mailcore::keys::parse_key(&m.key).ok()?;
+    /// The caller's agent key, if this node holds it: an identity named like the caller with the caller's key
+    /// (which the token check already tied to the pin or certificate). (key string, seed)
+    fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
         self.opts
             .identities
             .iter()
-            .find(|(n, s)| mailcore::addr::same(n, &who.name) && s.public() == k)
-            .map(|(_, s)| (m.key.clone(), s.clone()))
+            .find(|(n, s)| mailcore::addr::same(n, &who.name) && fmt_key(&s.public()) == who.key)
+            .map(|(_, s)| (who.key.clone(), s.clone()))
     }
 
-    pub fn recipients(members: &MemberList, to: &str, from: &str, mode: Mode) -> Result<Vec<mailcore::keys::PublicKey>, ApiError> {
-        if mode == Mode::Members { return Ok(members.all_keys()); }
-        if !members.members.iter().any(|m| addressed_to(to, &[&m.name])) {
+    /// The exact keys a post is sealed to. Members mode: every pinned agent and node key and every certified agent
+    /// key. Private: each addressed agent's and the sender's key and home nodes.
+    pub fn recipients(members: &MemberList, agents: &[Agent], to: &str, from: &str, mode: Mode)
+                      -> Result<Vec<PublicKey>, ApiError> {
+        if mode == Mode::Members {
+            let mut keys = members.all_keys();
+            keys.extend(agents.iter().map(|a| a.key));
+            keys.sort();
+            keys.dedup();
+            if keys.len() > mailcore::envelope::MAX_KEYS {
+                return Err(ApiError::new(503, "more recipient keys than an envelope holds"));
+            }
+            return Ok(keys);
+        }
+        if !agents.iter().any(|a| addressed_to(to, &[&a.name])) {
             return Err(ApiError::new(400, "no trusted agent matches the private recipient"));
         }
-        Ok(members.private_keys(to, from))
+        Ok(members::private_keys(agents, to, from))
     }
 
     /// POST /api/files: encrypt and keep the upload until a message attaches it.
@@ -420,7 +583,19 @@ impl Node {
             return Ok(None);
         }
         let members = self.members.read().unwrap().clone();
-        let v = env.verify(&members, now_millis())?;
+        // Who this host accepted as the sender at the envelope's time: pins, stored certificates and the one the
+        // envelope carries. A revocation counts against mail dated at or after it.
+        let carried = env.carried_cert().filter(|c| members.accepts(c)).cloned();
+        let mut certs = self.store.certs_named(&env.from)?;
+        certs.extend(carried.iter().cloned());
+        let revs = self.store.revocation_times()?;
+        let at = members.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), env.ts_ms());
+        let v = env.verify(&members, &at, now_millis())?;
+        if let Some(c) = &carried {
+            if self.store.put_cert(c)? {
+                self.refresh();
+            }
+        }
         let mut body = env.open(&self.seed).unwrap_or(None);
         if body.is_none() {
             for (_, s) in &self.opts.identities {
@@ -436,7 +611,7 @@ impl Node {
         }
         let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
         let text = body.map(|b| b.text);
-        let readers = (env.mode == Mode::Private).then(|| readers_for(&members, &env.to, &env.from));
+        let readers = (env.mode == Mode::Private).then(|| readers_for(&self.agents(), &env.to, &env.from));
         let Some(row) =
             self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis())?
         else {
@@ -453,7 +628,9 @@ impl Node {
     pub fn names_list(&self, prefix: &str) -> Result<Vec<Value>> {
         let p = norm(prefix);
         Ok(self
-            .store.names(&self.members.read().unwrap().members)?
+            .store.names(&self.agents().iter()
+                .map(|a| mailcore::Member { name: a.name.clone(), sub: a.sub.clone(), key: fmt_key(&a.key) })
+                .collect::<Vec<_>>())?
             .into_iter()
             .filter(|r| p.is_empty() || norm(&r.0).starts_with(&p))
             .map(|r| json!({ "name": r.0, "sub": r.1, "last_active": ts_from_millis(r.2) }))
@@ -461,20 +638,20 @@ impl Node {
     }
 
     pub fn reaches(&self, to: &str, sender_sub: &str) -> Vec<String> {
-        let members = self.members.read().unwrap();
-        let mut out: Vec<_> = members.members.iter()
+        let agents = self.roster.read().unwrap();
+        let mut out: Vec<_> = agents.iter()
             .filter(|m| m.sub != sender_sub && addressed_to(to, &[&m.name]))
             .map(|m| m.name.clone()).collect();
         out.sort();
+        out.dedup();
         out
     }
 
 }
 
 /// ",name1,name2," of the member names a private envelope is for: the sender and every member `to` addresses.
-pub fn readers_for(members: &MemberList, to: &str, from: &str) -> String {
-    let mut names: Vec<String> = members
-        .members
+pub fn readers_for(agents: &[Agent], to: &str, from: &str) -> String {
+    let mut names: Vec<String> = agents
         .iter()
         .filter(|m| addressed_to(to, &[m.name.as_str()]))
         .map(|m| norm(&m.name))
@@ -483,6 +660,11 @@ pub fn readers_for(members: &MemberList, to: &str, from: &str) -> String {
     names.sort();
     names.dedup();
     format!(",{},", names.join(","))
+}
+
+/// What the host owner signs with the node key to revoke this node's certificates for `name`.
+pub fn revoke_statement(name: &str, node: &str, ts: &str) -> String {
+    format!("agent-mail-revoke-request|v1|{name}|{node}|{ts}")
 }
 
 /* Input validation */
@@ -636,7 +818,7 @@ mod tests {
             nodes: [&node_a, &node_b]
                 .iter()
                 .enumerate()
-                .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![] })
+                .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
         };
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
@@ -651,10 +833,10 @@ mod tests {
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, text, &[]).unwrap();
         let st = PostStatement {
-            from: "a.alice", to: "all", thread: "t", mode: Mode::Members,
+            from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(list);
-        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)) };
+        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)), cert: None };
         let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
         Envelope::seal(
             Draft {
@@ -721,7 +903,7 @@ mod tests {
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]).unwrap();
         let st = PostStatement {
-            from: "a.alice", to: "all", thread: "t", mode: Mode::Members,
+            from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(&list);
         let sig = mailcore::b64u(&alice.sign(&st));
@@ -737,7 +919,7 @@ mod tests {
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Agent { key: fmt_key(&alice.public()), digest: digest.clone(), sig },
+                    attest: Attest::Agent { key: fmt_key(&alice.public()), digest: digest.clone(), sig, cert: None },
                     recipients: &list.all_keys(),
                 },
                 &node_b,
@@ -782,6 +964,7 @@ mod tests {
         let bob_key = fmt_key(&Seed::generate().public());
         list.members.push(Member { name:"a.bob".into(), sub:"agent:bob@t".into(), key:bob_key.clone() });
         *node.members.write().unwrap() = list.clone();
+        node.refresh();
         let alice = node.verify(&agent_token(&agent, &node.seed.public())).unwrap();
         let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
@@ -819,6 +1002,7 @@ mod tests {
         assert!(node.store.get(private.id, &who).unwrap().is_some());
         let replacement = Seed::generate();
         node.members.write().unwrap().members[0].key = fmt_key(&replacement.public());
+        node.refresh();
         assert!(!node.active(&who));
         let fresh = node.verify(&agent_token(&replacement, &node.seed.public())).unwrap();
         assert!(node.store.get(private.id, &fresh).unwrap().is_none());
@@ -852,7 +1036,7 @@ mod tests {
         let digest = mailcore::envelope::post_digest(&salt, text, files).unwrap();
         let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
         let st = PostStatement {
-            from: "a.alice", to, thread, mode: Mode::Members,
+            from: "a.alice", sub: "agent:alice@t", to, thread, mode: Mode::Members,
             ts, digest: &digest, blobs: &ids, recipients: &list.all_keys(),
         }.signing_bytes(list);
         json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(&st)) })
@@ -899,7 +1083,7 @@ mod tests {
         assert_eq!(p.row.to_message()["attest"], "agent");
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
-        e.verify(&list, now_millis()).unwrap();
+        e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis()).unwrap();
         e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
         let (node, _) = mk(vec![("a.alice".into(), Seed::generate())]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
@@ -968,4 +1152,181 @@ mod tests {
         mailcore::paseto::HEADER
     }
 
+
+    /* Node-certified agents */
+
+    /// Nodes "mac" (names hypha, h.) and "pod" (names hypha), a third node "will" (names will.); one network.
+    fn homes() -> (Node, Node, Seed, MemberList) {
+        let (mac, pod, will) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let names = [vec!["hypha".to_string(), "h.".into()], vec!["hypha".into()], vec!["will.".into()]];
+        let list = MemberList {
+            v: 2,
+            network: mailcore::b64u(&mailcore::random_bytes::<32>()),
+            seq: 1,
+            members: vec![],
+            nodes: [&mac, &pod, &will].iter().zip(names).enumerate()
+                .map(|(i, (s, names))| NodeEntry { name: ["mac", "pod", "will"][i].into(), key: fmt_key(&s.public()), addrs: vec![], names })
+                .collect(),
+        };
+        list.validate().unwrap();
+        let mk = |seed: Seed| {
+            let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+            let (tx, _rx) = mpsc::channel(32);
+            Node::new(Store::open(&path).unwrap(), list.clone(), seed, Opts { public_url: "http://x".into(), ..Default::default() }, tx)
+        };
+        (mk(mac), mk(pod), will, list)
+    }
+
+    fn proof(agent: &Seed, name: &str, node: &Node) -> Value {
+        let (key, ts) = (fmt_key(&agent.public()), now_ts());
+        let st = mailcore::cert::certify_statement(name, &key, &fmt_key(&node.seed.public()), &ts);
+        json!({ "name": name, "key": key, "ts": ts, "sig": mailcore::b64u(&agent.sign(st.as_bytes())) })
+    }
+
+    fn token(agent: &Seed, name: &str, node: &Node) -> String {
+        mailcore::agent_token::mint(agent, name, &format!("agent:{name}"), &node.seed.public(), now_millis(), 600)
+    }
+
+    fn revoke_request(node: &Node, name: &str) -> Value {
+        let ts = now_ts();
+        let st = revoke_statement(name, &fmt_key(&node.seed.public()), &ts);
+        json!({ "name": name, "ts": ts, "sig": mailcore::b64u(&node.seed.sign(st.as_bytes())) })
+    }
+
+    fn status<T>(r: Result<T, ApiError>) -> u16 {
+        r.err().map_or(0, |e| e.status)
+    }
+
+    #[test]
+    fn issuance_checks_in_order() {
+        let (mac, pod, _, _) = homes();
+        let (hypha, other) = (Seed::generate(), Seed::generate());
+        let mut bad = proof(&hypha, "hypha", &mac);
+        bad["name"] = json!("h.x");
+        assert_eq!(status(mac.certify(&bad)), 400, "proof signed for another name");
+        assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &pod))), 400, "proof for another node");
+        let e = mac.certify(&proof(&hypha, "will.x", &mac)).unwrap_err();
+        assert_eq!(e.status, 403);
+        assert!(e.message.contains("hypha, h."), "{}", e.message);
+        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
+        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 200, "idempotent");
+        assert_eq!(status(mac.certify(&proof(&other, "hypha", &mac))), 409, "name taken by another key");
+        assert_eq!(status(mac.certify(&proof(&hypha, "h.alias", &mac))), 409, "key already certified as another name");
+        // The certified agent signs in at once.
+        let who = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
+        assert_eq!(who.sub, "agent:hypha");
+        // A second home must use the same key: the mac's cert reached the pod, and another key is refused there.
+        let c: Cert = serde_json::from_value(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().1["cert"].clone()).unwrap();
+        assert!(pod.take_cert(&c).unwrap());
+        assert_eq!(status(pod.certify(&proof(&other, "hypha", &pod))), 409);
+        assert_eq!(pod.certify(&proof(&hypha, "hypha", &pod)).unwrap().0, 201);
+        for i in 0..70 {
+            let r = mac.certify(&proof(&Seed::generate(), &format!("h.a{i}"), &mac));
+            if let Err(e) = r {
+                assert_eq!(e.status, 429);
+                assert!(i >= 55, "limit is 60 an hour, hit after {i}");
+                return;
+            }
+        }
+        panic!("no rate limit");
+    }
+
+    #[test]
+    fn certs_are_keyed_by_node_and_key() {
+        let (mac, pod, will, list) = homes();
+        let hypha = Seed::generate();
+        // A trusted node squatting on hypha's key under a name of its own does not block the mac's cert.
+        let squat = Cert::issue(&will, "will.hypha", &hypha.public(), &now_ts());
+        assert!(list.accepts(&squat));
+        assert!(mac.take_cert(&squat).unwrap());
+        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
+        assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
+        assert_eq!(mac.store.certs().unwrap().len(), 2);
+        // Out of namespace, or from an untrusted node: refused, never stored.
+        assert!(pod.take_cert(&Cert::issue(&will, "hypha", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "will.x", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.store.certs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revocation_is_scoped_to_its_node_and_its_time() {
+        let (mut mac, pod, will, _) = homes();
+        let hypha = Seed::generate();
+        mac.opts.identities.push(("hypha".into(), hypha.clone()));
+        let (_, c) = mac.certify(&proof(&hypha, "hypha", &mac)).unwrap();
+        let cert: Cert = serde_json::from_value(c["cert"].clone()).unwrap();
+        let who = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
+        let before = mac.post(&who, &json!({"to": "all", "text": "before"})).unwrap();
+        let env_before: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&before.row.env_id)).unwrap()[0]).unwrap();
+        // Another node's revocation of the same key does not touch the mac's cert.
+        let foreign = Revocation::sign(&will, "hypha", &hypha.public(), &now_ts());
+        assert!(mac.take_revocation(&foreign).unwrap());
+        assert!(mac.active(&who));
+        assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
+        // The mac's own revocation: sign-in and open sessions end at once, the pod refuses new mail, old mail stays.
+        let mut trust = mac.trust.subscribe();
+        trust.mark_unchanged();
+        let revoked = mac.revoke(&revoke_request(&mac, "hypha")).unwrap();
+        assert_eq!(revoked.len(), 1);
+        assert!(trust.has_changed().unwrap(), "sessions are woken");
+        assert!(!mac.active(&who));
+        assert_eq!(status(mac.verify(&token(&hypha, "hypha", &mac))), 403);
+        assert!(pod.take_cert(&cert).unwrap());
+        assert!(pod.take_revocation(&revoked[0]).unwrap());
+        assert!(pod.ingest(env_before).unwrap().is_some(), "mail dated before the revocation is still accepted");
+        let late = envelope_from(&mac, &hypha, "hypha", "after", Some(cert));
+        assert!(pod.ingest(late).is_err(), "mail dated after it is refused");
+        assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &mac))), 403, "a revoked key stays revoked");
+        let fresh = Seed::generate();
+        assert_eq!(mac.certify(&proof(&fresh, "hypha", &mac)).unwrap().0, 201, "the name takes a new key");
+        assert!(mac.revoke(&json!({"name": "hypha", "ts": now_ts(), "sig": "AAAA"})).is_err(), "needs the node key");
+    }
+
+    /// An envelope `writer` writes for a certified agent, signed by the agent, carrying `cert`.
+    fn envelope_from(writer: &Node, agent: &Seed, name: &str, text: &str, cert: Option<Cert>) -> Envelope {
+        let list = writer.members.read().unwrap().clone();
+        let (ts, salt) = (now_ts(), mailcore::random_bytes::<16>());
+        let digest = mailcore::envelope::post_digest(&salt, text, &[]).unwrap();
+        let keys = list.all_keys();
+        let st = PostStatement { from: name, sub: &format!("agent:{name}"), to: "all", thread: "t", mode: Mode::Members,
+                                 ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&list);
+        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)), cert };
+        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
+        Envelope::seal(Draft { thread: "t", parents: vec![], ts, from: name, to: "all", mode: Mode::Members, body: &body,
+                               blobs: vec![], attest, recipients: &keys }, &writer.seed).unwrap()
+    }
+
+    #[test]
+    fn one_agent_two_homes() {
+        let (mut mac, mut pod, _, _) = homes();
+        let (hypha, h_bob) = (Seed::generate(), Seed::generate());
+        mac.opts.identities.push(("hypha".into(), hypha.clone()));
+        pod.opts.identities.push(("hypha".into(), hypha.clone()));
+        mac.opts.identities.push(("h.bob".into(), h_bob.clone()));
+        mac.certify_identities();
+        pod.certify_identities();
+        // Certificates replicate both ways; both nodes certify the same name and key without conflict.
+        for c in mac.store.certs().unwrap() { pod.take_cert(&c).unwrap(); }
+        for c in pod.store.certs().unwrap() { mac.take_cert(&c).unwrap(); }
+        let a: Vec<_> = mac.agents().into_iter().filter(|a| a.name == "hypha").collect();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].homes.len(), 2);
+        // bob writes private mail to hypha at the mac; hypha signs in at the pod and reads it there.
+        let bob = mac.verify(&token(&h_bob, "h.bob", &mac)).unwrap();
+        let p = mac.post(&bob, &json!({"to": "hypha", "mode": "private", "text": "for hypha only"})).unwrap();
+        let env: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0]).unwrap();
+        assert!(env.open(&pod.seed).unwrap().is_some(), "wrapped to the pod's node key");
+        let row = pod.ingest(env).unwrap().expect("stored at the pod");
+        let at_pod = pod.verify(&token(&hypha, "hypha", &pod)).unwrap();
+        let got = pod.store.get(row.id, &at_pod).unwrap().expect("hypha reads it at the pod");
+        assert_eq!(got.text.as_deref(), Some("for hypha only"));
+        let at_mac = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
+        assert!(mac.store.get(p.row.id, &at_mac).unwrap().is_some(), "and at the mac");
+        // hypha writes from the pod; the mac accepts it (pod's cert travels in the envelope) and can read the reply.
+        let r = pod.post(&at_pod, &json!({"to": "h.bob", "mode": "private", "text": "reply"})).unwrap();
+        let env: Envelope = serde_json::from_str(&pod.store.envelopes(std::slice::from_ref(&r.row.env_id)).unwrap()[0]).unwrap();
+        assert!(env.carried_cert().is_some_and(|c| c.node == fmt_key(&pod.seed.public())));
+        let row = mac.ingest(env).unwrap().unwrap();
+        assert!(mac.store.get(row.id, &bob).unwrap().is_some());
+    }
 }

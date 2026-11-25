@@ -45,6 +45,11 @@ CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, na
   size INTEGER NOT NULL, key TEXT NOT NULL, created INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_day ON messages (day, env_id);
 CREATE INDEX IF NOT EXISTS messages_sender ON messages (sender_sub, ts);
+CREATE TABLE IF NOT EXISTS certs (node TEXT NOT NULL, key TEXT NOT NULL, lname TEXT NOT NULL, json TEXT NOT NULL,
+  PRIMARY KEY (node, key));
+CREATE INDEX IF NOT EXISTS certs_lname ON certs (lname);
+CREATE TABLE IF NOT EXISTS revocations (node TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL, json TEXT NOT NULL,
+  PRIMARY KEY (node, key));
 CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, sub TEXT NOT NULL, seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cursors (sub TEXT PRIMARY KEY, last_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS used_tokens (name TEXT NOT NULL, jti TEXT NOT NULL, exp INTEGER NOT NULL,
@@ -535,6 +540,63 @@ impl Store {
         Ok(())
     }
 
+    /* Certificates, keyed by (issuing node, agent key): one node's certificate never displaces another's. */
+
+    /// Ok(true) when new. A second certificate from the same node for the same key is ignored.
+    pub fn put_cert(&self, c: &mailcore::Cert) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute("INSERT OR IGNORE INTO certs (node, key, lname, json) VALUES (?, ?, ?, ?)",
+                      params![c.node, c.key, norm(&c.name), serde_json::to_string(c)?])? > 0)
+    }
+
+    fn certs_where(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<mailcore::Cert>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(&format!("SELECT json FROM certs {clause} ORDER BY node, key LIMIT 10000"))?;
+        let rows = st.query_map(args, |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+    }
+
+    pub fn certs(&self) -> Result<Vec<mailcore::Cert>> {
+        self.certs_where("", &[])
+    }
+
+    pub fn certs_named(&self, name: &str) -> Result<Vec<mailcore::Cert>> {
+        self.certs_where("WHERE lname = ?", &[&norm(name)])
+    }
+
+    pub fn cert(&self, node: &str, key: &str) -> Result<Option<mailcore::Cert>> {
+        Ok(self.certs_where("WHERE node = ? AND key = ?", &[&node, &key])?.pop())
+    }
+
+    /// Ok(true) when new or earlier than the one held (the earliest revocation of a (node, key) counts).
+    pub fn put_revocation(&self, r: &mailcore::Revocation) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute("INSERT INTO revocations (node, key, ts, json) VALUES (?, ?, ?, ?)
+                       ON CONFLICT (node, key) DO UPDATE SET ts = excluded.ts, json = excluded.json
+                       WHERE excluded.ts < revocations.ts",
+                      params![r.node, r.key, r.ts_ms(), serde_json::to_string(r)?])? > 0)
+    }
+
+    pub fn revoked_at(&self, node: &str, key: &str) -> Result<Option<i64>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row("SELECT ts FROM revocations WHERE node = ? AND key = ?", params![node, key], |r| r.get(0)).optional()?)
+    }
+
+    /// (node, key) → when that node revoked that key.
+    pub fn revocation_times(&self) -> Result<std::collections::HashMap<(String, String), i64>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT node, key, ts FROM revocations")?;
+        let rows = st.query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn revocations(&self) -> Result<Vec<mailcore::Revocation>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT json FROM revocations ORDER BY node, key LIMIT 10000")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+    }
+
     pub fn names(&self, members: &[mailcore::Member]) -> Result<Vec<(String, String, i64)>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(
@@ -643,7 +705,7 @@ mod tests {
         let key = mailcore::keys::Seed::generate().public();
         let mut list = mailcore::MemberList { v: 2, network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1, members: vec![], nodes: vec![mailcore::NodeEntry { name: "me".into(),
-                    key: mailcore::keys::fmt_key(&key), addrs: vec![] }] };
+                    key: mailcore::keys::fmt_key(&key), addrs: vec![], names: vec![] }] };
         let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let store = Store::open(&path).unwrap();
         assert!(Store::open(&path).is_err(), "a second live node must not share the same store");

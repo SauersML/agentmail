@@ -53,6 +53,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/node", get(node_info))
         .route("/api/me", get(me))
         .route("/api/recipients", get(recipients))
+        .route("/api/agents", get(agents).post(certify))
+        .route("/api/revocations", axum::routing::post(revoke))
         .route("/api/messages", get(list).post(post))
         .route("/api/threads", get(threads))
         .route("/api/names", get(names))
@@ -123,6 +125,7 @@ async fn node_info(State(s): State<AppState>) -> Response {
         json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": mailcore::b64u(&members.topic()),
                 "envelope_version": mailcore::envelope::VERSION,
                 "members_seq": members.seq, "auth": ["agent-token"],
+                "names": members.node_by_key(&s.node.seed.public()).map(|n| n.names.clone()).unwrap_or_default(),
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",
                                  "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
         200,
@@ -139,9 +142,60 @@ async fn recipients(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw)
         Some("members") => mailcore::Mode::Members,
         _ => return Err(ApiError::new(400, "specify members or private mode")),
     };
-    let members = s.node.members.read().unwrap();
-    let keys = Node::recipients(&members, to, &who.name, mode)?;
+    let members = s.node.members.read().unwrap().clone();
+    let keys = Node::recipients(&members, &s.node.agents(), to, &who.name, mode)?;
     Ok(json_resp(json!({ "keys": keys.iter().map(|k| mailcore::b64u(k)).collect::<Vec<_>>() }), 200))
+}
+
+/// The unauthenticated POSTs take JSON only (no simple cross-site form posts) and a loopback Host (no DNS rebinding).
+fn local_json(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let bare = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
+    if !["127.0.0.1", "localhost", "[::1]"].contains(&bare) {
+        return Err(ApiError::new(403, "this endpoint answers loopback requests only"));
+    }
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    if !ct.starts_with("application/json") {
+        return Err(ApiError::new(415, "send Content-Type: application/json"));
+    }
+    if body.len() > 16 * 1024 {
+        return Err(ApiError::new(413, "body is over 16384 bytes"));
+    }
+    serde_json::from_slice::<Value>(body).ok().filter(|v| v.is_object())
+        .ok_or_else(|| ApiError::new(400, "body must be a JSON object"))
+}
+
+/// POST /api/agents {name, key, ts, sig}: certify an agent of this host (proof of key; no token, since the agent
+/// has no certificate yet). 201 new, 200 already certified with this key.
+async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let v = local_json(&headers, &body)?;
+    let node = s.node.clone();
+    let (status, out) = tokio::task::spawn_blocking(move || node.certify(&v))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(out, status))
+}
+
+/// GET /api/agents: every agent this host accepts now, with its homes.
+async fn agents(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    caller(&s, &headers)?;
+    let list = s.node.members.read().unwrap().clone();
+    let out: Vec<Value> = s.node.agents().iter().map(|a| json!({
+        "name": a.name, "sub": a.sub, "key": mailcore::keys::fmt_key(&a.key), "pinned": a.pinned,
+        "homes": a.homes.iter().map(|h| list.node_by_key(h).map_or_else(|| mailcore::keys::fmt_key(h), |n| n.name.clone()))
+            .collect::<Vec<_>>(),
+    })).collect();
+    Ok(json_resp(json!({ "agents": out }), 200))
+}
+
+/// POST /api/revocations {name, ts, sig}, signed with the node key (`mailnode revoke`).
+async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let v = local_json(&headers, &body)?;
+    let node = s.node.clone();
+    let revoked = tokio::task::spawn_blocking(move || node.revoke(&v))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "revoked": revoked }), 200))
 }
 
 async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
@@ -151,7 +205,7 @@ async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, A
         json!({ "name": who.name, "sub": who.sub, "kind": "agent", "island": island, "auth": "agent-token",
                 "last_id": s.node.store.last_id()?,
                 "node": mailcore::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
-                "features": ["signed-post", "private", "files", "agent-token"],
+                "features": ["signed-post", "private", "files", "agent-token", "certs"],
                 "refuse_token_only": true }),
         200,
     ))

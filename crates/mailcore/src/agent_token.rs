@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use crate::keys::{fmt_key, parse_key, PublicKey, Seed};
-use crate::members::MemberList;
+use crate::members::{self, Agent};
 use crate::paseto;
 
 pub const IMPLICIT: &[u8] = b"agentmail-auth-v1";
@@ -100,7 +100,7 @@ pub fn mint_claims(seed: &Seed, c: &Claims) -> String {
 
 /// Checks a token presented to the node whose key is `node`, now: format, the signer is the member's key on the list
 /// (name and sub both match), audience is this node, times, jti shape. The caller still has to check the jti is new.
-pub fn verify(token: &str, members: &MemberList, node: &PublicKey, now_ms: i64) -> Result<Checked, Refusal> {
+pub fn verify(token: &str, agents: &[Agent], node: &PublicKey, now_ms: i64) -> Result<Checked, Refusal> {
     if token.len() > MAX_TOKEN {
         return Err(bad("token too long"));
     }
@@ -108,16 +108,30 @@ pub fn verify(token: &str, members: &MemberList, node: &PublicKey, now_ms: i64) 
     // verifies.
     let raw = paseto::peek(token).map_err(bad)?;
     let unverified: Claims = serde_json::from_slice(&raw).map_err(|_| bad("claims are not the expected JSON"))?;
-    let m = members
-        .member_by_name(&unverified.name)
-        .ok_or_else(|| Refusal::NotMember(format!("{} is not on this network's member list", trunc(&unverified.name, 80))))?;
-    let key = parse_key(&m.key).map_err(|_| bad("the member list has no usable key for this name"))?;
-    let msg = paseto::verify(token, &key, b"", IMPLICIT)
-        .map_err(|e| bad(format!("{e} (agent tokens are signed by the member's key on the member list)")))?;
+    // A pinned agent, or a certified one whose certificate is from this node (its home).
+    let candidates: Vec<&Agent> = members::named(agents, &unverified.name)
+        .filter(|a| a.pinned || a.homes.contains(node))
+        .collect();
+    if candidates.is_empty() {
+        return Err(Refusal::NotMember(format!(
+            "{} is not pinned in this host's trust file and has no certificate from this node",
+            trunc(&unverified.name, 80))));
+    }
+    let mut verified = None;
+    let mut last = String::new();
+    for a in candidates {
+        match paseto::verify(token, &a.key, b"", IMPLICIT) {
+            Ok(msg) => { verified = Some((a, msg)); break; }
+            Err(e) => last = e.to_string(),
+        }
+    }
+    let (m, msg) = verified
+        .ok_or_else(|| bad(format!("{last} (agent tokens are signed by the agent's pinned or certified key)")))?;
+    let key = m.key;
     let c: Claims = serde_json::from_slice(&msg).map_err(|_| bad("claims are not the expected JSON"))?;
-    // The member list's sub for this name, exactly: a renamed or re-enrolled agent's old token is not this member's.
+    // The agent's sub, exactly: a renamed or re-enrolled agent's old token is not this agent's.
     if !bool::from(c.sub.as_bytes().ct_eq(m.sub.as_bytes())) {
-        return Err(Refusal::NotMember(format!("{} is listed with another sub", trunc(&c.name, 80))));
+        return Err(Refusal::NotMember(format!("{} is known here with another sub", trunc(&c.name, 80))));
     }
     let aud = parse_key(&c.aud).map_err(|_| bad("aud must be a node key (ed25519:…)"))?;
     if !bool::from(aud.ct_eq(node)) {
@@ -177,7 +191,7 @@ mod tests {
     #[test]
     fn valid_token_is_accepted() {
         let (alice, node) = (Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice)], &[&node]);
+        let l = list(&[("a.alice", &alice)], &[&node]).agents(&[], &|_| None, 0);
         let t = mint(&alice, "a.alice", "agent:a.alice@test", &node.public(), NOW, DEFAULT_LIFETIME_S);
         let c = verify(&t, &l, &node.public(), NOW).unwrap();
         assert_eq!((c.name.as_str(), c.sub.as_str(), c.exp_ms), ("a.alice", "agent:a.alice@test", NOW + 3_600_000));
@@ -193,7 +207,7 @@ mod tests {
     #[test]
     fn wrong_key_is_refused() {
         let (alice, mallory, node) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice), ("a.mallory", &mallory)], &[&node]);
+        let l = list(&[("a.alice", &alice), ("a.mallory", &mallory)], &[&node]).agents(&[], &|_| None, 0);
         // Mallory (a member) signs a token claiming alice's name.
         let t = mint(&mallory, "a.alice", "agent:a.alice@test", &node.public(), NOW, 60);
         assert!(matches!(verify(&t, &l, &node.public(), NOW), Err(Refusal::Bad(e)) if e.contains("signature")));
@@ -202,7 +216,7 @@ mod tests {
     #[test]
     fn name_not_on_list_or_other_sub_is_refused() {
         let (alice, eve, node) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice)], &[&node]);
+        let l = list(&[("a.alice", &alice)], &[&node]).agents(&[], &|_| None, 0);
         let t = mint(&eve, "a.eve", "agent:a.eve@test", &node.public(), NOW, 60);
         assert!(matches!(verify(&t, &l, &node.public(), NOW), Err(Refusal::NotMember(_))));
         let t = mint(&alice, "a.alice", "agent:someone-else@test", &node.public(), NOW, 60);
@@ -212,7 +226,7 @@ mod tests {
     #[test]
     fn times_are_enforced() {
         let (alice, node) = (Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice)], &[&node]);
+        let l = list(&[("a.alice", &alice)], &[&node]).agents(&[], &|_| None, 0);
         let v = |c: Claims| verify(&mint_claims(&alice, &c), &l, &node.public(), NOW);
         let err = |c: Claims| match v(c) {
             Err(Refusal::Bad(e)) => e,
@@ -238,7 +252,7 @@ mod tests {
     #[test]
     fn wrong_audience_is_refused() {
         let (alice, node, other_node) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice)], &[&node, &other_node]);
+        let l = list(&[("a.alice", &alice)], &[&node, &other_node]).agents(&[], &|_| None, 0);
         let t = mint(&alice, "a.alice", "agent:a.alice@test", &other_node.public(), NOW, 60);
         assert!(matches!(verify(&t, &l, &node.public(), NOW), Err(Refusal::Bad(e)) if e.contains("another node")));
         let mut c = claims("a.alice", &node, NOW, NOW + 60_000);
@@ -249,7 +263,7 @@ mod tests {
     #[test]
     fn tampered_or_foreign_tokens_are_refused() {
         let (alice, node) = (Seed::generate(), Seed::generate());
-        let l = list(&[("a.alice", &alice)], &[&node]);
+        let l = list(&[("a.alice", &alice)], &[&node]).agents(&[], &|_| None, 0);
         let good = mint(&alice, "a.alice", "agent:a.alice@test", &node.public(), NOW, 60);
         // Re-encode different claims under the real signature.
         let raw = crate::b64u_decode(good.strip_prefix(paseto::HEADER).unwrap()).unwrap();
@@ -275,5 +289,31 @@ mod tests {
         if let Err(e) = verify(&tampered, &l, &node.public(), NOW) {
             assert!(!e.to_string().contains(&tampered[10..40]));
         }
+    }
+
+    #[test]
+    fn certified_agents_sign_in_at_their_home_nodes_only() {
+        let (home, second, other, bob) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
+        let mut l = list(&[], &[&home, &second, &other]);
+        l.nodes[0].names = vec!["a.".into()];
+        l.nodes[1].names = vec!["a.bob".into()];
+        let ts = crate::ts_from_millis(NOW);
+        let certs = [crate::Cert::issue(&home, "a.bob", &bob.public(), &ts),
+                     crate::Cert::issue(&second, "a.bob", &bob.public(), &ts)];
+        let agents = l.agents(&certs, &|_| None, NOW);
+        assert_eq!(agents.len(), 1, "one agent with two homes");
+        assert_eq!(agents[0].homes.len(), 2);
+        let tok = |n: &Seed| mint(&bob, "a.bob", "agent:a.bob", &n.public(), NOW, 60);
+        assert_eq!(verify(&tok(&home), &agents, &home.public(), NOW).unwrap().name, "a.bob");
+        assert_eq!(verify(&tok(&second), &agents, &second.public(), NOW).unwrap().name, "a.bob");
+        assert!(matches!(verify(&tok(&other), &agents, &other.public(), NOW), Err(Refusal::NotMember(_))),
+                "a trusted node that did not certify the agent does not sign it in");
+        // Revoked by its home: no longer signs in there; the second home still vouches.
+        let revoked = |c: &crate::Cert| (c.node == fmt_key(&home.public())).then_some(NOW - 1);
+        let agents = l.agents(&certs, &revoked, NOW);
+        assert!(matches!(verify(&tok(&home), &agents, &home.public(), NOW), Err(Refusal::NotMember(_))));
+        assert!(verify(&tok(&second), &agents, &second.public(), NOW).is_ok());
+        let wrong_sub = mint(&bob, "a.bob", "agent:a.bob@x", &second.public(), NOW, 60);
+        assert!(matches!(verify(&wrong_sub, &agents, &second.public(), NOW), Err(Refusal::NotMember(_))));
     }
 }

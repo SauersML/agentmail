@@ -19,7 +19,7 @@ use iroh_gossip::proto::TopicId;
 use mailcore::keys::parse_key;
 use mailcore::Envelope;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::Config;
 use crate::node::Node;
@@ -39,6 +39,8 @@ enum Req {
     Ids { day: String, after: String },
     Get { ids: Vec<String> },
     Blob { id: String },
+    /// Every certificate and revocation the peer holds (synced before envelopes, which may need them).
+    Certs,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -51,6 +53,10 @@ struct Resp {
     envelopes: Vec<String>,
     #[serde(default)]
     blob: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    certs: Vec<mailcore::Cert>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    revocations: Vec<mailcore::Revocation>,
     /// For `get`: how many of the requested ids this answer covers (the rest did not fit; ask again for them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taken: Option<usize>,
@@ -154,6 +160,10 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             r.taken = Some(taken);
         }
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
+        Req::Certs => {
+            r.certs = node.store.certs()?;
+            r.revocations = node.store.revocations()?;
+        }
     }
     Ok(serde_json::to_vec(&r)?)
 }
@@ -235,6 +245,17 @@ impl Ctx {
         let node = &self.node;
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
         let network = node.members.read().unwrap().network.clone();
+        let trust = call(&conn, &network, &Req::Certs).await?;
+        anyhow::ensure!(trust.certs.len() <= 10_000 && trust.revocations.len() <= 10_000, "oversize certificate list");
+        let n2 = node.clone();
+        tokio::task::spawn_blocking(move || {
+            for r in &trust.revocations {
+                if let Err(e) = n2.take_revocation(r) { tracing::debug!("sync: refused a revocation: {e:#}"); }
+            }
+            for c in &trust.certs {
+                if let Err(e) = n2.take_cert(c) { tracing::debug!("sync: refused a certificate: {e:#}"); }
+            }
+        }).await?;
         let theirs = call(&conn, &network, &Req::Days).await?.days;
         let n2 = node.clone();
         let mine = tokio::task::spawn_blocking(move || n2.store.day_hashes()).await??;
@@ -292,6 +313,19 @@ impl Ctx {
     }
 }
 
+/// A gossiped certificate ({"cert": …}) or revocation ({"revocation": …}); None for anything else (an envelope).
+fn trust_message(node: &Node, raw: &[u8]) -> Option<Result<bool>> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Msg { cert: Option<mailcore::Cert>, revocation: Option<mailcore::Revocation> }
+    let m: Msg = serde_json::from_slice(raw).ok()?;
+    match (m.cert, m.revocation) {
+        (Some(c), None) => Some(node.take_cert(&c)),
+        (None, Some(r)) => Some(node.take_revocation(&r)),
+        _ => None,
+    }
+}
+
 pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
@@ -322,6 +356,14 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<E
         while let Some(ev) = receiver.next().await {
             match ev {
                 Ok(Event::Received(msg)) => {
+                    if let Some(r) = trust_message(&c.node, &msg.content) {
+                        match r {
+                            Ok(true) => tracing::info!("gossip: new certificate or revocation"),
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!("gossip: refused a certificate or revocation: {e:#}"),
+                        }
+                        continue;
+                    }
                     match serde_json::from_slice::<Envelope>(&msg.content).map_err(anyhow::Error::from).and_then(|e| c.node.ingest(e)) {
                         Ok(Some(r)) => {
                             tracing::info!("gossip: stored #{} {}", r.id, &r.env_id[..12]);
@@ -354,6 +396,23 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<E
             }
             if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
                 tracing::warn!("gossip broadcast failed (anti-entropy will carry it): {e}");
+            }
+        }
+    });
+
+    // Certificates and revocations this node signs.
+    let c = ctx.clone();
+    let mut trust_out = node.trust_out.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match trust_out.recv().await {
+                Ok(msg) => {
+                    if let Err(e) = c.sender.broadcast(Bytes::from(msg)).await {
+                        tracing::warn!("gossip broadcast failed (anti-entropy will carry it): {e}");
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -407,7 +466,7 @@ mod tests {
             network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1,
             members: vec![],
-            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![] }],
+            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
         };
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, _rx) = mpsc::channel(32);
@@ -427,7 +486,7 @@ mod tests {
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Agent { key: fmt_key(&node.seed.public()), digest: String::new(), sig: i.to_string() },
+                    attest: Attest::Agent { key: fmt_key(&node.seed.public()), digest: String::new(), sig: i.to_string(), cert: None },
                     recipients: &recipients,
                 },
                 &node.seed,

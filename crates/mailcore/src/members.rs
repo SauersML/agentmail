@@ -1,11 +1,12 @@
-//! Locally pinned agent identities and direct peers.
+//! The local trust file: pinned agent identities, direct peers and the namespaces those peers may certify agents in.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{anyhow, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::addr;
+use crate::cert::{self, Cert};
 use crate::keys::{self, fmt_key, parse_key, PublicKey};
 use crate::{b64u, b64u_decode};
 
@@ -27,6 +28,53 @@ pub struct NodeEntry {
     /// Direct socket addresses that other peers can dial.
     #[serde(default)]
     pub addrs: Vec<String>,
+    /// Agent names this node may certify: exact names or prefixes ending in '.'. Empty: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+}
+
+impl NodeEntry {
+    pub fn covers(&self, name: &str) -> bool {
+        self.names.iter().any(|e| cert::entry_covers(e, name))
+    }
+}
+
+/// Max namespace entries per node.
+pub const MAX_NAMES: usize = 64;
+
+/// An agent this host accepts: pinned in the trust file, or certified by a trusted node within its namespace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Agent {
+    pub name: String,
+    pub sub: String,
+    pub key: PublicKey,
+    /// Trusted nodes that certify this name and key. Each one can sign the agent in and read its private mail.
+    pub homes: Vec<PublicKey>,
+    /// One live certificate per home.
+    pub certs: Vec<Cert>,
+    pub pinned: bool,
+}
+
+/// The agents named `name`.
+pub fn named<'a>(agents: &'a [Agent], name: &'a str) -> impl Iterator<Item = &'a Agent> + 'a {
+    agents.iter().filter(move |a| addr::same(&a.name, name))
+}
+
+/// The agent named `name` with this key.
+pub fn find<'a>(agents: &'a [Agent], name: &str, key: &PublicKey) -> Option<&'a Agent> {
+    agents.iter().find(|a| addr::same(&a.name, name) && a.key == *key)
+}
+
+/// Mode "private": the agent key and every home node key of each agent `to` addresses, and of the sender.
+pub fn private_keys(agents: &[Agent], to: &str, from: &str) -> Vec<PublicKey> {
+    let mut out = Vec::new();
+    for a in agents.iter().filter(|a| addr::addressed_to(to, &[a.name.as_str()]) || addr::same(&a.name, from)) {
+        out.push(a.key);
+        out.extend(a.homes.iter().copied());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -57,10 +105,7 @@ impl MemberList {
         let mut names = HashSet::new();
         let mut subjects = HashSet::new();
         for m in &self.members {
-            let name = m.name.as_bytes();
-            ensure!(name.first().is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') && name.len() <= 48
-                    && name.iter().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c))
-                    && !m.name.ends_with('.') && !m.name.eq_ignore_ascii_case("all"), "invalid agent name");
+            ensure!(cert::valid_name(&m.name), "invalid agent name");
             ensure!(!m.sub.is_empty() && m.sub.len() <= 120 && m.sub.bytes().all(|b| b.is_ascii_graphic()),
                     "invalid agent subject");
             ensure!(names.insert(addr::norm(&m.name)) && subjects.insert(&m.sub), "duplicate agent name or subject");
@@ -71,8 +116,65 @@ impl MemberList {
             for addr in &n.addrs {
                 addr.parse::<std::net::SocketAddr>().map_err(|_| anyhow!("invalid peer socket address {addr:?}"))?;
             }
+            ensure!(n.names.len() <= MAX_NAMES, "node {:?} lists more than {MAX_NAMES} names", n.name);
+            for e in &n.names {
+                ensure!(cert::valid_namespace_entry(e),
+                        "node {:?}: names entry {e:?} must be an agent name or a prefix ending in '.'", n.name);
+            }
         }
         Ok(())
+    }
+
+    pub fn node_by_key(&self, key: &PublicKey) -> Option<&NodeEntry> {
+        let key = fmt_key(key);
+        self.nodes.iter().find(|n| n.key == key)
+    }
+
+    /// Whether this host trusts `c`: well formed, signed by a node on this list whose namespace covers its name.
+    pub fn accepts(&self, c: &Cert) -> bool {
+        c.check().is_ok() && c.node_key().ok().and_then(|k| self.node_by_key(&k)).is_some_and(|n| n.covers(&c.name))
+    }
+
+    /// Every agent this host accepts at `at_ms`. `revoked_at(cert)` is when the cert's own node revoked its key, if
+    /// it did; a revoked cert counts for times before that. A pinned name takes only its pinned key: certificates
+    /// for that name and key add homes, certificates for another key are ignored.
+    pub fn agents(&self, certs: &[Cert], revoked_at: &dyn Fn(&Cert) -> Option<i64>, at_ms: i64) -> Vec<Agent> {
+        let mut seen = HashSet::new();
+        let live: Vec<&Cert> = certs
+            .iter()
+            .filter(|c| self.accepts(c) && revoked_at(c).is_none_or(|t| at_ms < t))
+            .filter(|c| seen.insert((c.node.clone(), c.key.clone())))
+            .collect();
+        let homes_of = |name: &str, key: &PublicKey| -> (Vec<PublicKey>, Vec<Cert>) {
+            let mut hc: Vec<(PublicKey, Cert)> = live.iter()
+                .filter(|c| addr::same(&c.name, name) && c.agent_key().is_ok_and(|k| k == *key))
+                .filter_map(|c| Some((c.node_key().ok()?, (*c).clone())))
+                .collect();
+            hc.sort_by_key(|a| a.0);
+            hc.into_iter().unzip()
+        };
+        let mut out = Vec::new();
+        for m in &self.members {
+            let Ok(key) = parse_key(&m.key) else { continue };
+            let (homes, certs) = homes_of(&m.name, &key);
+            out.push(Agent { name: m.name.clone(), sub: m.sub.clone(), key, homes, certs, pinned: true });
+        }
+        let mut certified: BTreeMap<(String, PublicKey), String> = BTreeMap::new();
+        for c in &live {
+            if self.member_by_name(&c.name).is_some() {
+                continue;
+            }
+            let Ok(key) = c.agent_key() else { continue };
+            let slot = certified.entry((addr::norm(&c.name), key)).or_insert_with(|| c.name.clone());
+            if c.name < *slot {
+                slot.clone_from(&c.name);
+            }
+        }
+        for ((_, key), name) in certified {
+            let (homes, certs) = homes_of(&name, &key);
+            out.push(Agent { sub: cert::agent_sub(&name), name, key, homes, certs, pinned: false });
+        }
+        out
     }
 
     pub fn is_node(&self, key: &PublicKey) -> bool {
@@ -88,19 +190,6 @@ impl MemberList {
     pub fn all_keys(&self) -> Vec<PublicKey> {
         let mut out: Vec<PublicKey> = self.members.iter().filter_map(|m| parse_key(&m.key).ok()).collect();
         out.extend(self.node_keys());
-        out.sort();
-        out.dedup();
-        out
-    }
-
-    /// Mode "private": the keys of the members `to` addresses, plus the sender's.
-    pub fn private_keys(&self, to: &str, from: &str) -> Vec<PublicKey> {
-        let mut out: Vec<PublicKey> = self
-            .members
-            .iter()
-            .filter(|m| addr::addressed_to(to, &[m.name.as_str()]) || addr::same(&m.name, from))
-            .filter_map(|m| parse_key(&m.key).ok())
-            .collect();
         out.sort();
         out.dedup();
         out
@@ -132,7 +221,7 @@ pub(crate) mod tests {
             nodes: nodes
                 .iter()
                 .enumerate()
-                .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![] })
+                .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
         };
         l.validate().unwrap();
@@ -147,5 +236,23 @@ pub(crate) mod tests {
         l.members[1].name = "a.sue".into();
         l.nodes[0].key = l.members[0].key.clone();
         assert!(l.validate().is_err());
+    }
+
+    #[test]
+    fn namespaces_are_checked_and_may_overlap_for_two_homes() {
+        let mut l = list(&[], &[&Seed::generate(), &Seed::generate()]);
+        l.nodes[0].names = vec!["hypha".into(), "sauersml.".into()];
+        l.nodes[1].names = vec!["hypha".into()];
+        l.validate().unwrap();
+        for bad in ["*", "all", "all.", "a b", "", "sauersml..", "/x"] {
+            l.nodes[1].names = vec![bad.into()];
+            assert!(l.validate().is_err(), "{bad:?}");
+        }
+        // A file without `names` still parses, and its nodes certify nobody.
+        let raw = r#"{"v":2,"network":"NET","seq":1,"members":[],"nodes":[{"name":"x","key":"KEY"}]}"#
+            .replace("NET", &l.network).replace("KEY", &l.nodes[0].key);
+        let old: MemberList = serde_json::from_str(&raw).unwrap();
+        old.validate().unwrap();
+        assert!(old.nodes[0].names.is_empty() && !old.nodes[0].covers("x.y"));
     }
 }

@@ -5,6 +5,7 @@
 //!   mailnode pubkey SEED_FILE
 //!   mailnode network-id
 //!   mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
+//!   mailnode revoke CONFIG.json NAME                (the running node revokes its certificates for NAME)
 
 mod api;
 mod config;
@@ -20,7 +21,7 @@ use anyhow::{bail, Context, Result};
 use mailcore::keys::fmt_key;
 
 const USAGE: &str = "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
-     mailnode network-id\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]";
+     mailnode network-id\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  mailnode revoke CONFIG.json NAME";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -65,12 +66,40 @@ async fn main() -> Result<()> {
             println!("{}", mailcore::agent_token::mint(&seed, name, sub, &node, mailcore::now_millis(), ttl));
             Ok(())
         }
+        Some("revoke") if args.len() == 3 => revoke(Path::new(&args[1]), &args[2]),
         Some("--help" | "-h" | "help") => {
             println!("mailnode {}: peer-to-peer agent mail node (see README.md)\n{USAGE}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         _ => usage(),
     }
+}
+
+/// Asks the running node (whose key file this host owner can read) to revoke its certificates for `name`.
+fn revoke(path: &Path, name: &str) -> Result<()> {
+    use std::io::{Read, Write};
+    let cfg = config::Config::load(path)?;
+    let seed = config::read_seed(&cfg.node_key_file)?;
+    let ts = mailcore::now_ts();
+    let st = node::revoke_statement(name, &fmt_key(&seed.public()), &ts);
+    let body = serde_json::json!({ "name": name, "ts": ts, "sig": mailcore::b64u(&seed.sign(st.as_bytes())) }).to_string();
+    let addr = cfg.api_listen.replace("localhost:", "127.0.0.1:");
+    let mut conn = std::net::TcpStream::connect(&addr).with_context(|| format!("connecting to the node at {addr} (is it running?)"))?;
+    write!(conn, "POST /api/revocations HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let mut resp = String::new();
+    conn.read_to_string(&mut resp)?;
+    let (head, json) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
+    anyhow::ensure!(head.starts_with("HTTP/1.1 200"), "node refused: {}", json.trim());
+    let v: serde_json::Value = serde_json::from_str(json.trim()).context("node answer is not JSON")?;
+    let revoked = v["revoked"].as_array().cloned().unwrap_or_default();
+    if revoked.is_empty() {
+        println!("this node has no live certificate for {name}");
+    }
+    for r in revoked {
+        println!("revoked {} {}", r["name"].as_str().unwrap_or(""), r["key"].as_str().unwrap_or(""));
+    }
+    Ok(())
 }
 
 async fn run(path: &Path) -> Result<()> {
@@ -113,6 +142,7 @@ async fn run(path: &Path) -> Result<()> {
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
+    node.certify_identities();
     let _net = net::start(&cfg, node.clone(), out_rx).await?;
 
     let state = api::AppState {

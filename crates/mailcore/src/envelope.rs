@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::{self, Wrapped};
 use crate::keys::{self, fmt_key, parse_key, PublicKey, Seed};
-use crate::members::MemberList;
+use crate::cert::Cert;
+use crate::members::{self, Agent, MemberList};
 use crate::{b64u, b64u_decode, parse_ts};
 
 pub const VERSION: u32 = 3;
@@ -43,11 +44,21 @@ impl Mode {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Attest {
     /// The sender signs the network, routing fields, attachment IDs and salted body digest.
-    Agent { key: String, digest: String, sig: String },
+    Agent {
+        key: String,
+        digest: String,
+        sig: String,
+        /// For a certified (not pinned) sender: a certificate for `key` from a trusted node, so a receiver can check
+        /// the sender before that certificate replicates to it. Covered by the writing node's signature.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cert: Option<Cert>,
+    },
 }
 
 pub struct PostStatement<'a> {
     pub from: &'a str,
+    /// The sender's durable id: the pinned sub, or `agent:NAME` for a certified agent.
+    pub sub: &'a str,
     pub to: &'a str,
     pub thread: &'a str,
     pub mode: Mode,
@@ -59,7 +70,7 @@ pub struct PostStatement<'a> {
 
 impl PostStatement<'_> {
     pub fn signing_bytes(&self, members: &MemberList) -> Vec<u8> {
-        let sub = members.member_by_name(self.from).map_or("", |m| m.sub.as_str());
+        let sub = self.sub;
         let topic = members.topic();
         let mut recipients = self.recipients.to_vec();
         recipients.sort_unstable();
@@ -223,8 +234,15 @@ impl Envelope {
         Ok((ct, epk, header_ad(self.v, &self.thread, &self.from, &self.to, self.mode, &self.ts)))
     }
 
-    /// Validate framing, writing peer and sender before accepting an envelope.
-    pub fn verify(&self, members: &MemberList, now_ms: i64) -> Result<Verified> {
+    /// The certificate the envelope carries for its sender, if any.
+    pub fn carried_cert(&self) -> Option<&Cert> {
+        let Attest::Agent { cert, .. } = &self.attest;
+        cert.as_ref()
+    }
+
+    /// Validate framing, writing peer and sender before accepting an envelope. `agents` is who this host accepts at
+    /// the envelope's time (`MemberList::agents`, given the carried certificate too).
+    pub fn verify(&self, members: &MemberList, agents: &[Agent], now_ms: i64) -> Result<Verified> {
         if self.v != VERSION {
             bail!("unsupported envelope version {}", self.v);
         }
@@ -268,20 +286,22 @@ impl Envelope {
             bail!("node signature does not verify");
         }
         match &self.attest {
-            Attest::Agent { key, digest, sig } => {
+            Attest::Agent { key, digest, sig, .. } => {
                 if !members.is_node(&node) {
                     bail!("written by a node that is not a member");
                 }
-                let m = members.member_by_name(&self.from).ok_or_else(|| anyhow!("{} is not on the member list", self.from))?;
                 let k = parse_key(key)?;
-                if parse_key(&m.key)? != k {
-                    bail!("signed by a key that is not {}'s key on the member list", self.from);
-                }
+                let m = match members::find(agents, &self.from, &k) {
+                    Some(m) => m,
+                    None if members::named(agents, &self.from).next().is_some() =>
+                        bail!("signed by a key that is not {}'s key on the member list or in its certificates", self.from),
+                    None => bail!("{} is not on the member list and has no certificate from a trusted node", self.from),
+                };
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
                 let st = PostStatement {
-                    from: &self.from, to: &self.to, thread: &self.thread, mode: self.mode,
+                    from: &self.from, sub: &m.sub, to: &self.to, thread: &self.thread, mode: self.mode,
                     ts: &self.ts, digest, blobs: &self.blobs, recipients: &wraps.iter().map(|w| w.to).collect::<Vec<_>>(),
                 }.signing_bytes(members);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
@@ -323,6 +343,10 @@ mod tests {
     use super::*;
     use crate::members::tests::list;
 
+    fn pinned(l: &MemberList) -> Vec<Agent> {
+        l.agents(&[], &|_| None, 0)
+    }
+
     struct World {
         node: Seed,
         alice: Seed,
@@ -346,10 +370,10 @@ mod tests {
         let digest = post_digest(&salt, &body.text, &[]).unwrap();
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
-            Mode::Private => w.members.private_keys(to, from),
+            Mode::Private => members::private_keys(&pinned(&w.members), to, from),
         };
         let sig = b64u(&signer.sign(&PostStatement {
-            from, to, thread: "t", mode,
+            from, sub: &format!("agent:{from}@test"), to, thread: "t", mode,
             ts: &ts, digest: &digest, blobs: &[], recipients: &recipients,
         }.signing_bytes(&w.members)));
         Envelope::seal(
@@ -362,7 +386,7 @@ mod tests {
                 mode,
                 body: &body,
                 blobs: vec![],
-                attest: Attest::Agent { key: fmt_key(&signer.public()), sig, digest },
+                attest: Attest::Agent { key: fmt_key(&signer.public()), sig, digest, cert: None },
                 recipients: &recipients,
             },
             &w.node,
@@ -375,10 +399,10 @@ mod tests {
         let salt = crate::random_bytes::<16>();
         let digest = post_digest(&salt, text, &[]).unwrap();
         let st = PostStatement {
-            from, to: "all", thread: "t", mode: Mode::Members,
+            from, sub: &format!("agent:{from}@test"), to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
-        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)) };
+        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert: None };
         let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
         Envelope::seal(
             Draft {
@@ -403,26 +427,26 @@ mod tests {
         let w = world();
         let now = crate::now_millis();
         let e = signed_env(&w, "a.alice", &w.alice, "signed by alice", crate::now_ts());
-        let v = e.verify(&w.members, now).unwrap();
+        let v = e.verify(&w.members, &pinned(&w.members), now).unwrap();
         assert_eq!(v.sender_sub, "agent:a.alice@test");
         let body = e.open(&w.node).unwrap().unwrap();
         e.check_body(&body).unwrap();
         let mut altered = e.clone();
         altered.keys.pop();
         altered.sig = b64u(&w.node.sign(&altered.signing_bytes()));
-        assert!(altered.verify(&w.members, now).unwrap_err().to_string().contains("sender signature"));
+        assert!(altered.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("sender signature"));
         // Bob's key claiming to be alice.
         let e = signed_env(&w, "a.alice", &w.bob, "forged", crate::now_ts());
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("not a.alice's key"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("not a.alice's key"));
         // Not on the member list at all.
         let stranger = Seed::generate();
         let e = signed_env(&w, "x.stranger", &stranger, "who", crate::now_ts());
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("not on the member list"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("not on the member list"));
         // A header changed by the node after the sender signed (re-signed by the node so only the agent sig breaks).
         let mut e = signed_env(&w, "a.alice", &w.alice, "to all", crate::now_ts());
         e.to = "a.bob".into();
         e.sig = b64u(&w.node.sign(&e.signing_bytes()));
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("sender signature"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("sender signature"));
         // A body swapped by the node under alice's signed digest: verify passes (header intact), check_body refuses.
         let good = signed_env(&w, "a.alice", &w.alice, "original", crate::now_ts());
         let mut body = good.open(&w.node).unwrap().unwrap();
@@ -439,10 +463,10 @@ mod tests {
         let digest = post_digest(&salt, "hi", &[]).unwrap();
         // alice signs to "all", thread "x|y".
         let st = PostStatement {
-            from: "a.alice", to: "all", thread: "x|y", mode: Mode::Members,
+            from: "a.alice", sub: "agent:a.alice@test", to: "all", thread: "x|y", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
-        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)) };
+        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
         let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
         let mk = |to: &str, thread: &str| {
             Envelope::seal(
@@ -462,11 +486,11 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(mk("all", "x|y").verify(&w.members, now).is_ok(), "'|' in the thread is fine");
-        assert!(mk("all|x", "y").verify(&w.members, now).unwrap_err().to_string().contains("sender signature"));
+        assert!(mk("all", "x|y").verify(&w.members, &pinned(&w.members), now).is_ok(), "'|' in the thread is fine");
+        assert!(mk("all|x", "y").verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("sender signature"));
         let mut other_network = w.members.clone();
         other_network.network.push_str("-other");
-        assert!(mk("all", "x|y").verify(&other_network, now).unwrap_err().to_string().contains("sender signature"));
+        assert!(mk("all", "x|y").verify(&other_network, &pinned(&other_network), now).unwrap_err().to_string().contains("sender signature"));
     }
 
     #[test]
@@ -478,19 +502,19 @@ mod tests {
             e
         };
         let base = env(&w, "a.alice", "all", Mode::Members);
-        assert!(base.verify(&w.members, now).is_ok());
+        assert!(base.verify(&w.members, &pinned(&w.members), now).is_ok());
         let mut e = base.clone();
         e.blobs = (0..MAX_BLOBS + 1).map(|i| format!("{i:064x}")).collect();
-        assert!(resign(e).verify(&w.members, now).unwrap_err().to_string().contains("blobs"));
+        assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("blobs"));
         let mut e = base.clone();
         e.blobs = vec!["not-a-hash".into()];
-        assert!(resign(e).verify(&w.members, now).unwrap_err().to_string().contains("blobs"));
+        assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("blobs"));
         let mut e = base.clone();
         e.keys[0].k = b64u(&[0u8; 4096]);
-        assert!(resign(e).verify(&w.members, now).unwrap_err().to_string().contains("wrapped key"));
+        assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("wrapped key"));
         let mut e = base.clone();
         e.epk = b64u(&[0u8; 7]);
-        assert!(resign(e).verify(&w.members, now).unwrap_err().to_string().contains("epk"));
+        assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("epk"));
     }
 
     #[test]
@@ -501,7 +525,7 @@ mod tests {
         let back: Envelope = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, e);
         assert_eq!(back.signing_bytes(), e.signing_bytes());
-        let v = back.verify(&w.members, crate::now_millis()).unwrap();
+        let v = back.verify(&w.members, &pinned(&w.members), crate::now_millis()).unwrap();
         assert_eq!(v.sender_sub, "agent:a.alice@test");
         assert_eq!(back.open(&w.node).unwrap().unwrap().text, "hi from a.alice");
     }
@@ -515,16 +539,16 @@ mod tests {
         let stranger = Seed::generate();
         e.node = fmt_key(&stranger.public());
         e.sig = b64u(&stranger.sign(&e.signing_bytes()));
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("not a member"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("not a member"));
         // header changed after signing
         let mut e = env(&w, "a.alice", "all", Mode::Members);
         e.thread = "other".into();
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("signature"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("signature"));
         // ciphertext swapped: id no longer matches
         let mut e = env(&w, "a.alice", "all", Mode::Members);
         let other = env(&w, "a.alice", "all", Mode::Members);
         e.ciphertext = other.ciphertext;
-        assert!(e.verify(&w.members, now).unwrap_err().to_string().contains("hash"));
+        assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("hash"));
     }
 
     #[test]
@@ -548,5 +572,86 @@ mod tests {
         assert!(t.open(&w.bob).unwrap().is_some());
         assert!(t.open(&w.carol).unwrap().is_some());
         assert!(t.open(&w.node).unwrap().is_none());
+    }
+
+    /// A certified agent's envelope, written by `writer`, carrying `cert` (or none).
+    #[allow(clippy::too_many_arguments)]
+    fn certified_env(l: &MemberList, agents: &[Agent], writer: &Seed, from: &str, signer: &Seed, to: &str, mode: Mode,
+                     ts: String, cert: Option<Cert>) -> Envelope {
+        let salt = crate::random_bytes::<16>();
+        let body = Body { text: "hello".into(), files: vec![], salt: b64u(&salt) };
+        let digest = post_digest(&salt, &body.text, &[]).unwrap();
+        let recipients = match mode {
+            Mode::Members => l.all_keys(),
+            Mode::Private => members::private_keys(agents, to, from),
+        };
+        let st = PostStatement {
+            from, sub: &crate::cert::agent_sub(from), to, thread: "t", mode,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &recipients,
+        }.signing_bytes(l);
+        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert };
+        Envelope::seal(Draft { thread: "t", parents: vec![], ts, from, to, mode, body: &body, blobs: vec![], attest,
+                               recipients: &recipients }, writer).unwrap()
+    }
+
+    #[test]
+    fn node_certified_senders() {
+        let (mac, pod, will) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let (hypha, bob, carol) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let mut l = list(&[("b.carol", &carol)], &[&mac, &pod, &will]);
+        l.nodes[0].names = vec!["hypha".into(), "sauersml.".into()];
+        l.nodes[1].names = vec!["hypha".into()];
+        l.nodes[2].names = vec!["will.".into()];
+        l.validate().unwrap();
+        let now = crate::now_millis();
+        let ts = crate::ts_from_millis(now - 1000);
+        let mac_cert = Cert::issue(&mac, "hypha", &hypha.public(), &ts);
+        let pod_cert = Cert::issue(&pod, "hypha", &hypha.public(), &ts);
+        let none = |_: &Cert| None;
+
+        // A cert from a pinned node within its namespace is accepted, from the envelope alone.
+        let agents = l.agents(std::slice::from_ref(&mac_cert), &none, now);
+        let e = certified_env(&l, &agents, &mac, "hypha", &hypha, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
+        assert_eq!(e.verify(&l, &agents, now).unwrap().sender_sub, "agent:hypha");
+        assert!(e.verify(&l, &l.agents(&[], &none, now), now).unwrap_err().to_string().contains("no certificate"));
+
+        // Out of namespace: will's node cannot vouch for sauersml.x, nor can an untrusted node.
+        let rogue = Cert::issue(&will, "sauersml.x", &bob.public(), &ts);
+        assert!(!l.accepts(&rogue));
+        assert!(!l.accepts(&Cert::issue(&Seed::generate(), "hypha", &bob.public(), &ts)));
+        let agents = l.agents(std::slice::from_ref(&rogue), &none, now);
+        assert!(members::named(&agents, "sauersml.x").next().is_none());
+        assert!(certified_env(&l, &agents, &will, "sauersml.x", &bob, "all", Mode::Members, crate::now_ts(), Some(rogue))
+            .verify(&l, &agents, now).is_err());
+
+        // A pin takes precedence: a cert for a pinned name with another key does not count.
+        let squat = Cert::issue(&mac, "b.carol", &bob.public(), &ts);
+        let mut l2 = l.clone();
+        l2.nodes[0].names.push("b.".into());
+        let agents = l2.agents(&[squat], &none, now);
+        assert_eq!(members::named(&agents, "b.carol").map(|a| a.key).collect::<Vec<_>>(), vec![carol.public()]);
+
+        // Two homes: private mail to hypha opens at both of its nodes, and at no other.
+        let both = [mac_cert.clone(), pod_cert.clone()];
+        let agents = l.agents(&both, &none, now);
+        assert_eq!(members::named(&agents, "hypha").count(), 1);
+        let p = certified_env(&l, &agents, &pod, "hypha", &hypha, "b.carol", Mode::Private, crate::now_ts(), Some(pod_cert.clone()));
+        p.verify(&l, &agents, now).unwrap();
+        assert!(p.open(&mac).unwrap().is_some() && p.open(&pod).unwrap().is_some() && p.open(&hypha).unwrap().is_some());
+        assert!(p.open(&will).unwrap().is_none());
+
+        // Revocation by the mac counts only against the mac's cert, and only from its time on.
+        let rev_at = now - 500;
+        let mac_key = fmt_key(&mac.public());
+        let revoked = |c: &Cert| (c.node == mac_key).then_some(rev_at);
+        let early = crate::ts_from_millis(now - 800);
+        let at = |t: i64| l.agents(std::slice::from_ref(&mac_cert), &revoked, t);
+        let old = certified_env(&l, &at(now - 800), &mac, "hypha", &hypha, "all", Mode::Members, early, Some(mac_cert.clone()));
+        assert!(old.verify(&l, &at(old.ts_ms()), now).is_ok(), "mail dated before the revocation still verifies");
+        let new = certified_env(&l, &at(now), &mac, "hypha", &hypha, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
+        assert!(new.verify(&l, &at(new.ts_ms()), now).is_err(), "mail dated after it does not");
+        let agents = l.agents(&both, &revoked, now);
+        assert_eq!(members::named(&agents, "hypha").next().unwrap().homes, vec![pod.public()],
+                   "the pod's cert for the same key stays live");
     }
 }
