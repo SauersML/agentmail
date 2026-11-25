@@ -41,6 +41,7 @@ enum Req {
     Blob { id: String },
     /// Every certificate and revocation the peer holds (synced before envelopes, which may need them).
     Certs,
+    CertsFor { issuer: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -57,6 +58,8 @@ struct Resp {
     certs: Vec<mailcore::Cert>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     revocations: Vec<mailcore::Revocation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    more_trust: bool,
     /// For `get`: how many of the requested ids this answer covers (the rest did not fit; ask again for them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taken: Option<usize>,
@@ -169,11 +172,9 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             r.taken = Some(taken);
         }
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
-        Req::Certs => {
-            r.certs = node.store.certs()?;
-            r.certs.truncate(crate::store::MAX_SYNC_CERTS);
-            r.revocations = node.store.revocations()?;
-            r.revocations.truncate(crate::store::MAX_SYNC_CERTS);
+        Req::Certs => (r.certs, r.revocations, r.more_trust) = node.store.sync_trust(None, crate::store::MAX_SYNC_CERTS)?,
+        Req::CertsFor { issuer } => {
+            (r.certs, r.revocations, r.more_trust) = node.store.sync_trust(Some(&issuer), crate::store::MAX_CERTS_PER_NODE as usize)?;
         }
     }
     Ok(serde_json::to_vec(&r)?)
@@ -255,22 +256,39 @@ fn peers(node: &Node, lookup: &MemoryLookup, relays: &[RelayUrl]) -> Vec<Endpoin
 }
 
 impl Ctx {
+    async fn apply_trust(&self, trust: Resp, limit: usize) -> Result<()> {
+        anyhow::ensure!(trust.certs.len() <= limit && trust.revocations.len() <= limit, "oversize certificate list");
+        let node = self.node.clone();
+        tokio::task::spawn_blocking(move || {
+            for r in &trust.revocations {
+                if let Err(e) = node.take_revocation(r) { tracing::debug!("sync: refused a revocation: {e:#}"); }
+            }
+            for c in &trust.certs {
+                if let Err(e) = node.take_cert(c) { tracing::debug!("sync: refused a certificate: {e:#}"); }
+            }
+        }).await?;
+        Ok(())
+    }
+
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
     async fn sync_with(&self, peer: EndpointId) -> Result<usize> {
         let node = &self.node;
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
-        anyhow::ensure!(trust.certs.len() <= crate::store::MAX_SYNC_CERTS && trust.revocations.len() <= crate::store::MAX_SYNC_CERTS, "oversize certificate list");
-        let n2 = node.clone();
-        tokio::task::spawn_blocking(move || {
-            for r in &trust.revocations {
-                if let Err(e) = n2.take_revocation(r) { tracing::debug!("sync: refused a revocation: {e:#}"); }
+        if trust.more_trust {
+            // Only a peer advertising a truncated list receives this optional sync-v4 request.
+            let issuers = node.members.read().unwrap().node_keys();
+            for key in issuers {
+                let issuer = mailcore::keys::fmt_key(&key);
+                let page = call(&conn, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;
+                anyhow::ensure!(!page.more_trust && page.certs.iter().all(|c| c.node == issuer)
+                    && page.revocations.iter().all(|r| r.node == issuer), "invalid issuer trust response");
+                self.apply_trust(page, crate::store::MAX_CERTS_PER_NODE as usize).await?;
             }
-            for c in &trust.certs {
-                if let Err(e) = n2.take_cert(c) { tracing::debug!("sync: refused a certificate: {e:#}"); }
-            }
-        }).await?;
+        } else {
+            self.apply_trust(trust, crate::store::MAX_SYNC_CERTS).await?;
+        }
         let theirs = call(&conn, &network, &Req::Days).await?.days;
         let n2 = node.clone();
         let mine = tokio::task::spawn_blocking(move || n2.store.day_hashes()).await??;
@@ -595,6 +613,9 @@ mod tests {
         let peer = hosts[0].1.endpoint.connect(remote.id(), SYNC_ALPN).await?;
         let certs = call(&peer, &network, &Req::Certs).await?.certs;
         assert!(certs.iter().any(|c| c.name == "a1"));
+        let issuer = fmt_key(&reader.seed.public());
+        let page = call(&peer, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;
+        assert!(!page.more_trust && page.certs.len() == 1 && page.certs[0].node == issuer);
         let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
             .relay_mode(relay_mode(&cfg.relay)?).bind().await?;
         let attempt = tokio::time::timeout(Duration::from_secs(10), async {

@@ -547,23 +547,34 @@ impl Store {
                       params![c.node, c.key, norm(&c.name), serde_json::to_string(c)?])? > 0)
     }
 
-    fn certs_where(&self, clause: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<mailcore::Cert>> {
+    fn trust_rows<T: serde::de::DeserializeOwned>(&self, table: &str, clause: &str, args: &[&dyn rusqlite::ToSql], limit: i64) -> Result<Vec<T>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&format!("SELECT json FROM certs {clause} ORDER BY node, key"))?;
-        let rows = st.query_map(args, |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
+        let mut st = db.prepare(&format!("SELECT json FROM {table} {clause} ORDER BY node, key LIMIT {limit}"))?;
+        let rows = st.query_map(args, |r| r.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
     pub fn certs(&self) -> Result<Vec<mailcore::Cert>> {
-        self.certs_where("", &[])
+        self.trust_rows("certs", "", &[], -1)
     }
 
     pub fn certs_named(&self, name: &str) -> Result<Vec<mailcore::Cert>> {
-        self.certs_where("WHERE lname = ?", &[&norm(name)])
+        self.trust_rows("certs", "WHERE lname = ?", &[&norm(name)], -1)
     }
 
     pub fn cert(&self, node: &str, key: &str) -> Result<Option<mailcore::Cert>> {
-        Ok(self.certs_where("WHERE node = ? AND key = ?", &[&node, &key])?.pop())
+        Ok(self.trust_rows("certs", "WHERE node = ? AND key = ?", &[&node, &key], 1)?.pop())
+    }
+
+    pub fn sync_trust(&self, issuer: Option<&str>, limit: usize) -> Result<(Vec<mailcore::Cert>, Vec<mailcore::Revocation>, bool)> {
+        let issuer_param: &[&dyn rusqlite::ToSql] = &[&issuer];
+        let (clause, args) = if issuer.is_some() { ("WHERE node = ?", issuer_param) } else { ("", &[][..]) };
+        let mut certs = self.trust_rows("certs", clause, args, limit as i64 + 1)?;
+        let mut revocations = self.trust_rows("revocations", clause, args, limit as i64 + 1)?;
+        let more = certs.len() > limit || revocations.len() > limit;
+        certs.truncate(limit);
+        revocations.truncate(limit);
+        Ok((certs, revocations, more))
     }
 
     /// Ok(true) when new or earlier than the one held (the earliest revocation of a (node, key) counts).
@@ -623,13 +634,6 @@ impl Store {
         let mut st = db.prepare("SELECT node, key, ts FROM revocations")?;
         let rows = st.query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
-    }
-
-    pub fn revocations(&self) -> Result<Vec<mailcore::Revocation>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT json FROM revocations ORDER BY node, key LIMIT 10000")?;
-        let rows = st.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows.iter().filter_map(|j| serde_json::from_str(j).ok()).collect())
     }
 
     pub fn names(&self, members: &[mailcore::Member]) -> Result<Vec<(String, String, i64)>> {
@@ -734,6 +738,32 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_trust_snapshots_report_truncation_and_cover_each_issuer() -> Result<()> {
+        use mailcore::keys::{fmt_key, Seed};
+        let path = std::env::temp_dir().join(format!("trust-sync-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        let store = Store::open(&path)?;
+        let issuers = [Seed::generate(), Seed::generate()];
+        let ts = mailcore::now_ts();
+        for issuer in &issuers {
+            let key = Seed::generate().public();
+            store.put_cert(&mailcore::Cert::issue(issuer, "x", &key, &ts))?;
+            store.put_revocation(&mailcore::Revocation::sign(issuer, "x", &key, &ts))?;
+        }
+        let (certs, revs, more) = store.sync_trust(None, 1)?;
+        assert!(more && certs.len() == 1 && revs.len() == 1);
+        for issuer in &issuers {
+            let node = fmt_key(&issuer.public());
+            let (certs, revs, more) = store.sync_trust(Some(&node), 1)?;
+            assert!(!more && certs.len() == 1 && revs.len() == 1);
+            assert_eq!(certs[0].node, node);
+            assert!(revs[0].revokes(&certs[0]));
+        }
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 
     #[test]
     fn revocation_sequence_survives_restart() -> Result<()> {

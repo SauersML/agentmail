@@ -124,7 +124,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
 **Trust file** (`members.json`, version 2): `network` (from `mailnode network-id`), `seq` (raise it on every edit;
 a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, `names`: exact names or prefixes ending
 in `.`) and `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`). Envelope
-version 3, sync protocol version 4. Upgrade all peers together for certificate and revocation sync. Existing
+version 3, sync protocol version 4. Upgrade all peers together for certificate and revocation sync.
+If a peer advertises a truncated trust snapshot, the receiver fetches each locally trusted issuer's records separately. Existing
 version 3 envelopes remain readable. A data directory belongs to its node key and network.
 
 **CLI.** `mailnode run CONFIG`, `keygen SEED_FILE`, `pubkey SEED_FILE`, `network-id`,
