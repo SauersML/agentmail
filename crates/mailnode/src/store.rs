@@ -92,9 +92,9 @@ impl Row {
     /// Members mode: any caller with a valid token (as on the old server). Private: the sender and the members it was
     /// addressed to, and only if this node could decrypt it.
     pub fn visible_to(&self, viewer: &Caller) -> bool {
-        self.attest == "agent" && self.text.is_some()
+        self.attest == "agent" && self.text.is_some() && self.wrapped_to.split(',').any(|k| k == viewer.key)
             && (self.mode == "members"
-                || (self.mode == "private" && self.wrapped_to.split(',').any(|k| k == viewer.key)
+                || (self.mode == "private"
                     && self.readers.as_deref().is_some_and(|r| r.contains(&format!(",{},", norm(&viewer.name))))))
     }
 
@@ -135,11 +135,11 @@ pub struct Store {
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
                     length(text) AS len, files, readers, verified, imported, parents, attest, \
-                    CASE WHEN mode = 'private' THEN (SELECT group_concat(value->>'to') FROM json_each(env, '$.keys')) END";
+                    (SELECT group_concat(value->>'to') FROM json_each(env, '$.keys'))";
 
 fn visible_sql() -> &'static str {
-    "(attest = 'agent' AND text IS NOT NULL AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0 \
-      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE value->>'to' = ?))))"
+    "(attest = 'agent' AND text IS NOT NULL AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
+      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE value->>'to' = ?))"
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -576,21 +576,6 @@ impl Store {
     }
 
     /// Blob ids some stored envelope references that this node does not hold yet.
-    /// Members-mode envelopes stored without a readable body (written before this node was on the member list).
-    pub fn unreadable(&self, limit: usize) -> Result<Vec<String>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' AND attest = 'agent' AND json_extract(env, '$.v') = 2 ORDER BY id LIMIT ?")?;
-        let out = st.query_map([limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(out)
-    }
-
-    /// Fills in the body of a row stored unreadable (after a grant). False if it already had one.
-    pub fn set_body(&self, env_id: &str, text: &str, files: &str) -> Result<bool> {
-        let db = self.db.lock().unwrap();
-        let n = db.execute("UPDATE messages SET text = ?, files = ? WHERE env_id = ? AND text IS NULL", (text, files, env_id))?;
-        Ok(n > 0)
-    }
-
     pub fn missing_blobs(&self) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare("SELECT blobs FROM messages WHERE blobs != '[]'")?;

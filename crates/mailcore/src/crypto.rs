@@ -84,14 +84,14 @@ pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: 
 }
 
 /// The content key, if one of the wraps is for `me`.
-pub fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
+fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
     let my_pub = me.public();
     let Some(w) = keys.iter().find(|w| w.to == my_pub) else { return Ok(None) };
     unwrap(epk, &w.k, me).map(Some)
 }
 
 /// Unwraps one wrap made for `me` under ephemeral key `epk`.
-pub fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
+fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
     let my_pub = me.public();
     let sk = me.x25519_secret();
     let shared = sk.diffie_hellman(&XPublic::from(*epk));
@@ -107,24 +107,7 @@ pub fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
     ck?.try_into().map_err(|_| anyhow!("bad content key"))
 }
 
-/// A fresh wrap of `ck` for one more recipient (a node that joined after the envelope was written): (epk, wrapped).
-pub fn wrap_for(ck: &[u8; 32], recipient: &PublicKey) -> Result<([u8; 32], Vec<u8>)> {
-    let esk = StaticSecret::from(crate::random_bytes::<32>());
-    let epk = XPublic::from(&esk).to_bytes();
-    let rx = x25519_public(recipient)?;
-    let shared = esk.diffie_hellman(&XPublic::from(rx));
-    if !shared.was_contributory() {
-        bail!("recipient key is low order");
-    }
-    let mut wk = wrap_key(&epk, &rx, shared.as_bytes());
-    let k = ChaCha20Poly1305::new((&wk).into())
-        .encrypt(&[0u8; 12].into(), Payload { msg: ck, aad: recipient })
-        .map_err(|_| anyhow!("wrap failed"));
-    wk.zeroize();
-    Ok((epk, k?))
-}
-
-pub fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
+fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
     if ciphertext.len() < 24 + 16 {
         bail!("ciphertext too short");
     }
@@ -188,11 +171,5 @@ mod tests {
         let mut keys = s.keys.clone();
         keys[0].to = c.public();
         assert!(open(&s.ciphertext, b"hdr", &s.epk, &keys, &c).is_err());
-        // A later grant: a re-wraps the content key for c, and c opens with it; b cannot use c's grant.
-        let ck = content_key(&s.epk, &s.keys, &a).unwrap().unwrap();
-        let (epk2, k2) = wrap_for(&ck, &c.public()).unwrap();
-        let ck2 = unwrap(&epk2, &k2, &c).unwrap();
-        assert_eq!(decrypt(&s.ciphertext, b"hdr", &ck2).unwrap(), b"hello");
-        assert!(unwrap(&epk2, &k2, &b).is_err());
     }
 }

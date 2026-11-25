@@ -1,10 +1,5 @@
-//! Replication over iroh. One gossip topic carries every new envelope (and every newly adopted member list);
-//! anti-entropy (a small request/response protocol on its own ALPN) runs with each member node every
-//! `sync_secs`: compare per-day hashes
-//! of envelope-id sets, list ids of the days that differ, fetch the missing envelopes, then fetch attachment blobs
-//! referenced by stored envelopes and not yet here, then ask for grants (the content key re-wrapped for this node) for
-//! members-mode envelopes written before this node joined the list. Only member nodes may connect at all (an after-handshake hook
-//! checks the current member list), to protect network membership and traffic metadata.
+//! Authenticated direct-peer replication. Gossip announces envelopes and periodic sync reconciles
+//! envelope IDs and referenced attachment blobs between locally trusted peers.
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -37,7 +32,6 @@ const IDS_PER_GET: usize = 200;
 /// A `get` answer stops adding envelopes past this many bytes (it always carries at least one), so it stays under
 /// MAX_RESP even when every envelope is near the size limit (200 of those are ~110 MiB); the asker requests the rest.
 const GET_BUDGET: usize = 32 << 20;
-const GRANTS_PER_CALL: usize = 500;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum Req {
@@ -45,8 +39,6 @@ enum Req {
     Ids { day: String, after: String },
     Get { ids: Vec<String> },
     Blob { id: String },
-    /// Content keys re-wrapped for the asking node, for members-mode envelopes it stored before it joined.
-    Grants { ids: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -59,8 +51,6 @@ struct Resp {
     envelopes: Vec<String>,
     #[serde(default)]
     blob: Option<String>,
-    #[serde(default)]
-    grants: BTreeMap<String, mailcore::envelope::Grant>,
     /// For `get`: how many of the requested ids this answer covers (the rest did not fit; ask again for them).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taken: Option<usize>,
@@ -164,10 +154,6 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             r.taken = Some(taken);
         }
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
-        Req::Grants { ids } => {
-            let ids: Vec<String> = ids.into_iter().take(GRANTS_PER_CALL).collect();
-            r.grants = node.grants_for(&ids, peer)?;
-        }
     }
     Ok(serde_json::to_vec(&r)?)
 }
@@ -299,23 +285,6 @@ impl Ctx {
                     }
                     _ => tracing::warn!("blob {} from {} does not match its id", &id[..12], peer.fmt_short()),
                 }
-            }
-        }
-        // Members-mode mail written before this node joined was not wrapped for it: ask for grants.
-        let unreadable = node.store.unreadable(GRANTS_PER_CALL)?;
-        if !unreadable.is_empty() {
-            let grants = call(&conn, &network, &Req::Grants { ids: unreadable.clone() }).await?.grants;
-            let mut opened = 0;
-            for (id, g) in &grants {
-                anyhow::ensure!(unreadable.contains(id), "unsolicited key grant");
-                match node.apply_grant(id, g) {
-                    Ok(true) => opened += 1,
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!("grant for {} from {} refused: {e:#}", &id[..12.min(id.len())], peer.fmt_short()),
-                }
-            }
-            if opened > 0 {
-                tracing::info!("{} bodies opened with grants from {}", opened, peer.fmt_short());
             }
         }
         conn.close(0u32.into(), b"done");

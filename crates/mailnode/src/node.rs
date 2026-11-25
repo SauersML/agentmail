@@ -2,12 +2,12 @@
 //! announce), accept a replicated envelope (verify, decrypt if we can, store), and the old server's read-side rules
 //! (names, reaches, addressed rows, message formatting).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use mailcore::addr::{addressed_to, is_broadcast, norm};
-use mailcore::envelope::{Draft, Grant};
+use mailcore::envelope::Draft;
 use mailcore::keys::Seed;
 use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode};
 use serde_json::{json, Value};
@@ -444,36 +444,6 @@ impl Node {
         Ok(Some(row))
     }
 
-    /// Grants for a node that joined later: members-mode envelopes only (private mail stays with its recipients), and
-    /// only to a node on the current member list.
-    pub fn grants_for(&self, ids: &[String], to: &mailcore::keys::PublicKey) -> Result<BTreeMap<String, Grant>> {
-        let mut out = BTreeMap::new();
-        if !self.members.read().unwrap().is_node(to) {
-            return Ok(out);
-        }
-        for id in ids {
-            let Some(raw) = self.store.envelopes(std::slice::from_ref(id))?.pop() else { continue };
-            let env: Envelope = serde_json::from_str(&raw)?;
-            if env.mode == Mode::Members {
-                if let Ok(Some(g)) = env.grant(&self.seed, to) {
-                    out.insert(env.id.clone(), g);
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    /// Fills in a body this node could not read, from a grant. True if the row is readable now.
-    pub fn apply_grant(&self, id: &str, g: &Grant) -> Result<bool> {
-        let Some(raw) = self.store.envelopes(&[id.to_string()])?.pop() else { return Ok(false) };
-        let env: Envelope = serde_json::from_str(&raw)?;
-        anyhow::ensure!(env.mode == Mode::Members, "private mail does not accept grants");
-        let body = env.open_grant(g, &self.seed)?;
-        env.check_body(&body)?;
-        let text: String = body.text.chars().take(MAX_TEXT as usize).collect();
-        self.store.set_body(id, &text, &serde_json::to_string(&body.files)?)
-    }
-
     /* Names */
 
     pub fn names_list(&self, prefix: &str) -> Result<Vec<Value>> {
@@ -663,7 +633,7 @@ mod tests {
         let (node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate());
         let list = MemberList {
             v: 2,
-            network: "t".into(),
+            network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1,
             members: vec![Member { name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()) }],
             nodes: [&node_a, &node_b]
@@ -789,7 +759,6 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let (rows, _) = node.store.query(&crate::store::Query::default(), &who, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(node.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
         // The same signature in another base64 spelling is refused outright.
         let padded = seal(vec![], format!("{sig}=="));
         assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
@@ -813,7 +782,10 @@ mod tests {
 
     #[test]
     fn a_wrong_key_for_a_blob_does_not_shadow_the_real_one() {
-        let (node, agent, node_b, list, _rx) = setup();
+        let (node, agent, node_b, mut list, _rx) = setup();
+        let bob_key = fmt_key(&Seed::generate().public());
+        list.members.push(Member { name:"a.bob".into(), sub:"agent:bob@t".into(), key:bob_key.clone() });
+        *node.members.write().unwrap() = list.clone();
         let alice = node.verify(&agent_token(&agent, &node.seed.public())).unwrap();
         let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
@@ -826,7 +798,7 @@ mod tests {
         node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
             "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
-        let bob = Caller { key: fmt_key(&Seed::generate().public()), name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
+        let bob = Caller { key: bob_key, name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }

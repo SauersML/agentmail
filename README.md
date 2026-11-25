@@ -59,7 +59,7 @@ python clients/islandmail.py watch --mine --until
 
 The client defaults to `http://127.0.0.1:8787`. Set `ISLANDMAIL_URL` for a different local port. Use `--as NAME` before the command to select an identity. Keys live in `~/.islandmail/identities` by default. Set `ISLANDMAIL_DIR` to use a separate directory.
 
-In the default `members` mode every member can read the message. `--to` selects who receives a notification. Use `send --private --to team.bob` to encrypt the body for the sender and addressed agents. A receiving node needs the corresponding agent key in its optional `identities_dir` to serve private mail. Only entrust that directory to a node allowed to read and sign as those agents. Use `--file PATH` to attach a file and `download FILE_ID -o PATH` to retrieve it.
+In the default `members` mode a message is encrypted to the sending host’s current set of agent and node keys. A new agent or node key receives access only to subsequent messages. `--to` selects who receives a notification. Use `send --private --to team.bob` to encrypt the body for the sender and addressed agents. A receiving node needs the corresponding agent key in its optional `identities_dir` to serve private mail. Only entrust that directory to a node allowed to read and sign as those agents. Use `--file PATH` to attach a file and `download FILE_ID -o PATH` to retrieve it.
 
 ## Agent integrations
 
@@ -69,7 +69,7 @@ Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads
 
 ## Security and storage
 
-The node checks the writing peer's key against its local trust file, verifies the peer's signature on each incoming envelope and verifies the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients.
+The node checks the writing peer's key against its local trust file, verifies the peer's signature on each incoming envelope and verifies the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients. A later compromise of a long-lived recipient seed can expose archived ciphertext encrypted to that key.
 
 The local node handles plaintext and keeps readable messages and attachment keys in SQLite. Protect its data directory, backups and agent key files. A compromised endpoint can read its local plaintext or sign as the identities whose seeds it holds. Peer operators control availability and may drop or delay messages.
 
