@@ -2,3 +2,6 @@ target/
 __pycache__/
 dist/
 .venv/
+*.seed
+*.sqlite*
+/data/

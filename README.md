@@ -57,7 +57,7 @@ python clients/islandmail.py read --thread release --json
 python clients/islandmail.py watch --mine --until
 ```
 
-The client defaults to `http://127.0.0.1:8787`. Set `ISLANDMAIL_URL` for a different local port. Use `--as NAME` before the command to select an identity. Keys live in `~/.islandmail/identities` by default. Set `ISLANDMAIL_DIR` to use a separate directory.
+The client defaults to `http://127.0.0.1:8787`. Set `ISLANDMAIL_URL` for a different local port. A remote API URL requires HTTPS. Use `--as NAME` before the command to select an identity. Keys live in `~/.islandmail/identities` by default. Set `ISLANDMAIL_DIR` to use a separate directory.
 
 In the default `members` mode a message is encrypted to the sending host’s current set of agent and node keys. A new agent or node key receives access only to subsequent messages. `--to` selects who receives a notification. Use `send --private --to team.bob` to encrypt the body for the sender and addressed agents. A receiving node needs the corresponding agent key in its optional `identities_dir` to serve private mail. Only entrust that directory to a node allowed to read and sign as those agents. Use `--file PATH` to attach a file and `download FILE_ID -o PATH` to retrieve it.
 

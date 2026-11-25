@@ -26,6 +26,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import ipaddress
 import json
 import mimetypes
 import os
@@ -162,8 +163,11 @@ def load_identity(name):
             mode = os.fstat(fd).st_mode
             if not stat.S_ISREG(mode) or mode & 0o077:
                 raise Fail("identity must be a regular file accessible only to its owner (mode 600)")
-            ident = json.load(f)
+            if os.fstat(fd).st_size > 16_384:
+                raise Fail("identity file exceeds 16 KiB")
+            ident = json.loads(f.read(16_385))
         if (not isinstance(ident, dict) or ident.get("name") != name or not ident.get("sub")
+                or not isinstance(ident["sub"], str) or not re.fullmatch(r"[!-~]{1,120}", ident["sub"])
                 or not re.fullmatch(r"[0-9a-fA-F]{64}", str(ident.get("seed", "")))):
             raise Fail("invalid identity file for %s" % name)
         return ident
@@ -206,6 +210,25 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
 
 
 _node_info = {}
+
+
+def checked_node_url(value):
+    url = urllib.parse.urlsplit(value)
+    if url.scheme not in ("http", "https") or not url.hostname or url.username is not None or url.password is not None:
+        raise Fail("ISLANDMAIL_URL must be an HTTP or HTTPS origin without credentials")
+    if url.path not in ("", "/") or url.query or url.fragment:
+        raise Fail("ISLANDMAIL_URL must contain only a scheme, host and port")
+    port = url.port
+    if url.scheme == "https":
+        return value.rstrip("/")
+    if url.hostname == "localhost":
+        return "http://127.0.0.1" + (":%d" % port if port is not None else "")
+    try:
+        if ipaddress.ip_address(url.hostname).is_loopback:
+            return value.rstrip("/")
+    except ValueError:
+        pass
+    raise Fail("plain HTTP requires a loopback IP address; use HTTPS for a remote node")
 
 
 def node_info():
@@ -346,9 +369,13 @@ def send(ident, a):
     to, thread = norm_field(a.to), norm_field(a.thread)
     mode = "private" if getattr(a, "private", False) else "members"
     files = []
+    if len(a.file or []) > 10:
+        raise Fail("at most 10 attachments per message")
     for path in a.file or []:
         with open(path, "rb") as f:
-            data = f.read()
+            data = f.read(25 * 1024 * 1024 + 1)
+        if len(data) > 25 * 1024 * 1024:
+            raise Fail("attachment exceeds 25 MiB")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), data,
                 {"Content-Type": ctype}, timeout=300)
@@ -498,6 +525,7 @@ def cmd_watch(a):
 
 
 def main():
+    global MAIL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -554,6 +582,7 @@ def main():
     p.set_defaults(fn=cmd_watch)
     a = ap.parse_args()
     try:
+        MAIL = checked_node_url(MAIL)
         a.fn(a)
     except (Fail, OSError, ValueError) as e:
         sys.stderr.write("islandmail: %s\n" % e)
