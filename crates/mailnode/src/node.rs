@@ -127,11 +127,16 @@ impl Node {
 
     /// Recompute who this host accepts (now: any known revocation counts) and wake open sessions.
     pub fn refresh(&self) {
-        let list = self.members.read().unwrap().clone();
-        let certs = self.store.certs().unwrap_or_else(|e| { tracing::warn!("reading certificates: {e:#}"); vec![] });
-        let revs = self.store.revocation_times().unwrap_or_default();
-        let roster = list.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), i64::MAX);
-        *self.roster.write().unwrap() = roster;
+        let list = self.members.read().unwrap();
+        let mut roster = self.roster.write().unwrap();
+        // Serialize snapshot publication so a slow refresh cannot reinstate a revoked certificate.
+        *roster = match self.store.revocation_times().and_then(|revs| Ok((revs, self.store.certs()?))) {
+            Ok((revs, certs)) => list.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), i64::MAX),
+            Err(e) => {
+                tracing::error!("reading certificate state: {e:#}");
+                list.agents(&[], &|_| None, i64::MAX)
+            }
+        };
         self.trust.send_modify(|g| *g += 1);
     }
 
@@ -264,14 +269,11 @@ impl Node {
             || !mailcore::keys::verify(&me, revoke_statement(name, &fmt_key(&me), ts).as_bytes(), &sig) {
             return Err(ApiError::new(401, "revocation requests are signed by this node's key (mailnode revoke CONFIG NAME)"));
         }
-        let mut out = Vec::new();
-        for c in self.store.certs_named(name)?.into_iter().filter(|c| c.node == fmt_key(&me)) {
-            if self.store.revoked_at(&c.node, &c.key)?.is_some() { continue; }
-            let r = Revocation::sign(&self.seed, &c.name, &c.agent_key()?, &now_ts());
-            self.store.put_revocation(&r)?;
+        let out = self.store.revoke_local(&self.seed, name, t)?
+            .ok_or_else(|| ApiError::new(409, "revocation request already used or superseded"))?;
+        for r in &out {
             let _ = self.trust_out.send(json!({ "revocation": r }).to_string());
             tracing::info!("revoked {} {}", r.name, r.key);
-            out.push(r);
         }
         self.refresh();
         Ok(out)
@@ -1273,7 +1275,8 @@ mod tests {
         // The mac's own revocation: sign-in and open sessions end at once, the pod refuses new mail, old mail stays.
         let mut trust = mac.trust.subscribe();
         trust.mark_unchanged();
-        let revoked = mac.revoke(&revoke_request(&mac, "hypha")).unwrap();
+        let request = revoke_request(&mac, "hypha");
+        let revoked = mac.revoke(&request).unwrap();
         assert_eq!(revoked.len(), 1);
         assert!(trust.has_changed().unwrap(), "sessions are woken");
         assert!(!mac.active(&who));
@@ -1286,6 +1289,8 @@ mod tests {
         assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &mac))), 403, "a revoked key stays revoked");
         let fresh = Seed::generate();
         assert_eq!(mac.certify(&proof(&fresh, "hypha", &mac)).unwrap().0, 201, "the name takes a new key");
+        assert_eq!(status(mac.revoke(&request)), 409);
+        assert!(mac.verify(&token(&fresh, "hypha", &mac)).is_ok(), "the replacement key remains live");
         assert!(mac.revoke(&json!({"name": "hypha", "ts": now_ts(), "sig": "AAAA"})).is_err(), "needs the node key");
     }
 

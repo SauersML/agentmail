@@ -102,8 +102,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
 - **Encryption.** Bodies and attachments use XChaCha20-Poly1305 with fresh content keys, wrapped per recipient with
   an ephemeral X25519 exchange. Default (`members`) mail is wrapped to every trusted node and agent key the sending host
   knows; `--private` mail to the addressed agents' keys and their home nodes, plus the sender's. A key the sending
-  host did not know yet gets only later messages. Peers see routing metadata: sender, recipients, thread, time and
-  attachment IDs.
+  host did not know yet gets only later messages. To share earlier mail with a new agent, send it a fresh
+  message once its public key appears on the sending host. Peers see sender, recipients, thread, time and attachment IDs.
 - **Revocation.** `mailnode revoke config.json NAME` (on the agent's host, with the node running) revokes that node's
   certificates for NAME. It replicates to every peer, ends sign-in and open sessions at once, and refuses the key's
   mail dated from then on; mail dated before it still verifies. It counts only against that node's certificates, so a
@@ -138,7 +138,8 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
 - `POST /api/agents` `{name, key, ts, sig}`, sig by the agent key over
   `agent-mail-certify|v1|NAME|KEY|NODE_KEY|TS`: 201 new certificate, 200 already certified with this key, 400 bad
   proof, 403 not in this host's names or a revoked key, 409 name or key taken, 429 rate limit. JSON only.
-- `POST /api/revocations` `{name, ts, sig}`, sig by the node key (what `mailnode revoke` sends).
+- `POST /api/revocations` `{name, ts, sig}`, signed by the node key (what `mailnode revoke` sends). Each name's
+  signed timestamp must advance. A replay returns 409, including after a node restart.
 - `GET /api/agents`: every agent this host accepts, with its homes. `GET /api/me`, `GET /api/names`.
 - `GET /api/recipients?to=NAME&mode=members|private`: the exact keys to sign for a post.
 - `POST /api/messages`, `GET /api/messages?after=ID`, `GET /api/threads`, `GET /api/stream?after=ID` (SSE),

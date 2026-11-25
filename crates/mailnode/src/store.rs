@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mailcore::addr::norm;
 use crate::node::Caller;
 use mailcore::{Envelope, Verified};
@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS certs (node TEXT NOT NULL, key TEXT NOT NULL, lname T
 CREATE INDEX IF NOT EXISTS certs_lname ON certs (lname);
 CREATE TABLE IF NOT EXISTS revocations (node TEXT NOT NULL, key TEXT NOT NULL, ts INTEGER NOT NULL, json TEXT NOT NULL,
   PRIMARY KEY (node, key));
+CREATE TABLE IF NOT EXISTS revoke_requests (lname TEXT PRIMARY KEY, last_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, sub TEXT NOT NULL, seen INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS cursors (sub TEXT PRIMARY KEY, last_id INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS used_tokens (name TEXT NOT NULL, jti TEXT NOT NULL, exp INTEGER NOT NULL,
@@ -568,12 +569,47 @@ impl Store {
     /// Ok(true) when new or earlier than the one held (the earliest revocation of a (node, key) counts).
     pub fn put_revocation(&self, r: &mailcore::Revocation) -> Result<bool> {
         let db = self.db.lock().unwrap();
+        Self::insert_revocation(&db, r)
+    }
+
+    fn insert_revocation(db: &Connection, r: &mailcore::Revocation) -> Result<bool> {
         let held: i64 = db.query_row("SELECT count(*) FROM revocations WHERE node = ? AND key <> ?", [&r.node, &r.key], |x| x.get(0))?;
         anyhow::ensure!(held < MAX_CERTS_PER_NODE, "this node already holds {MAX_CERTS_PER_NODE} revocations from {}", r.node);
         Ok(db.execute("INSERT INTO revocations (node, key, ts, json) VALUES (?, ?, ?, ?)
                        ON CONFLICT (node, key) DO UPDATE SET ts = excluded.ts, json = excluded.json
                        WHERE excluded.ts < revocations.ts",
                       params![r.node, r.key, r.ts_ms(), serde_json::to_string(r)?])? > 0)
+    }
+
+    /// Consume the owner's signed timestamp and revoke this generation in one durable transaction.
+    /// Returning None means the same or a newer request has already been applied to this name.
+    pub fn revoke_local(&self, seed: &mailcore::keys::Seed, name: &str, signed_ms: i64) -> Result<Option<Vec<mailcore::Revocation>>> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let name = norm(name);
+        if tx.execute("INSERT INTO revoke_requests(lname,last_ms) VALUES (?,?)
+                       ON CONFLICT(lname) DO UPDATE SET last_ms=excluded.last_ms
+                       WHERE revoke_requests.last_ms < excluded.last_ms", params![name, signed_ms])? == 0 {
+            return Ok(None);
+        }
+        let node = mailcore::keys::fmt_key(&seed.public());
+        let certs = {
+            let mut st = tx.prepare("SELECT c.json FROM certs c LEFT JOIN revocations r USING(node,key)
+                                     WHERE c.node=? AND c.lname=? AND r.key IS NULL")?;
+            let rows = st.query_map(params![node, name], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut out = Vec::new();
+        let now = mailcore::now_ts();
+        for raw in certs {
+            let c: mailcore::Cert = serde_json::from_str(&raw)?;
+            if mailcore::parse_ts(&c.issued).context("invalid stored issuance time")? > signed_ms { continue; }
+            let r = mailcore::Revocation::sign(seed, &c.name, &c.agent_key()?, &now);
+            Self::insert_revocation(&tx, &r)?;
+            out.push(r);
+        }
+        tx.commit()?;
+        Ok(Some(out))
     }
 
     pub fn revoked_at(&self, node: &str, key: &str) -> Result<Option<i64>> {
@@ -698,6 +734,26 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revocation_sequence_survives_restart() -> Result<()> {
+        let node = mailcore::keys::Seed::generate();
+        let key = mailcore::keys::Seed::generate();
+        let path = std::env::temp_dir().join(format!("revoke-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        let now = mailcore::now_millis();
+        let store = Store::open(&path)?;
+        assert!(store.revoke_local(&node, "x", now)?.unwrap().is_empty());
+        drop(store);
+        let store = Store::open(&path)?;
+        let cert = mailcore::Cert::issue(&node, "x", &key.public(), &mailcore::ts_from_millis(now + 2));
+        store.put_cert(&cert)?;
+        assert!(store.revoke_local(&node, "X", now)?.is_none());
+        assert!(store.revoke_local(&node, "x", now + 1)?.unwrap().is_empty());
+        assert_eq!(store.revoke_local(&node, "x", now + 2)?.unwrap().len(), 1);
+        drop(store);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 
     #[test]
     fn store_rejects_network_switches_and_local_trust_rollback() {
