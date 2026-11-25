@@ -285,6 +285,10 @@ impl Envelope {
             bail!("ciphertext too large");
         }
         let ct = b64u_decode(&self.ciphertext).ok_or_else(|| anyhow!("bad ciphertext"))?;
+        // A forwarding node can check the nonce, tag and size bounds without a recipient key.
+        if !(24 + 16..=MAX_CIPHERTEXT).contains(&ct.len()) {
+            bail!("invalid ciphertext length");
+        }
         if blake3::hash(&ct).to_hex().as_str() != self.id {
             bail!("id is not the hash of the ciphertext");
         }
@@ -524,6 +528,11 @@ mod tests {
         };
         let base = env(&w, "a.alice", "all", Mode::Members);
         assert!(base.verify(&w.members, &pinned(&w.members), now).is_ok());
+        for len in [39, MAX_CIPHERTEXT + 1] {
+            let mut e = base.clone();
+            e.ciphertext = b64u(&vec![0; len]);
+            assert!(e.verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("ciphertext length"));
+        }
         let mut e = base.clone();
         e.blobs = (0..MAX_BLOBS + 1).map(|i| format!("{i:064x}")).collect();
         assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("blobs"));
