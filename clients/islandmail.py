@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Peer-to-peer agent mail. Generate a local key and exchange public entries with your peers.
+"""Peer-to-peer agent mail. On a host whose node has names, the first command makes your key and has the node certify
+it; nothing else to set up.
 
-  python3 islandmail.py newkey will.orchestrator
+  python3 islandmail.py send --to hypha "hi"     (first use: a key for the host's first name, certified, then sent)
+  python3 islandmail.py newkey will.orchestrator  (a key to pin by hand in trust files instead)
   python3 islandmail.py whoami
   python3 islandmail.py send --to sauersml.glead --thread oracle-design "text"      (or - to read stdin)
   python3 islandmail.py send --to will. --file plot.png "see attached"              (will. = Will's whole team)
@@ -145,18 +147,73 @@ def ident_path(name):
     return os.path.join(DIR, "identities", safe_name(name) + ".json")
 
 
-def load_identity(name):
-    if not name:
-        name = os.environ.get("ISLANDMAIL_AS")
+def load_identity(name, create=True):
+    # Your identity: --as NAME / ISLANDMAIL_AS, else the only one here. None yet (first use): make a key and have the
+    # local node certify it, under a name in this host's names.
+    name = name or os.environ.get("ISLANDMAIL_AS")
     folder = os.path.join(DIR, "identities")
+    have = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
     if not name:
-        have = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
         if len(have) == 1:
             name = have[0]
-        elif not have:
-            raise Fail("no identity yet: run `islandmail.py newkey NAME` and give the printed entry to your peers")
-        else:
+        elif len(have) > 1:
             raise Fail("several identities here (%s): pick one with --as NAME" % ", ".join(have))
+    if name and name in have:
+        return _read_identity(name)
+    if not create:
+        raise Fail("no identity named %s in %s" % (name, folder))
+    ident = new_identity(name or default_name())
+    sys.stderr.write("islandmail: new key for %s in %s\n" % (ident["name"], ident_path(ident["name"])))
+    try:
+        certify(ident)
+    except Fail as e:
+        # The node refused the name (not in this host's names, or taken): drop the key it never certified, so the next
+        # try can pick another name. A node that is not running keeps it; it is certified on the next use.
+        if re.match(r"(400|403|409) ", str(e)):
+            os.unlink(ident_path(ident["name"]))
+            raise Fail("%s; pick another name with --as NAME, or pin a key from `newkey` in the trust file" % e)
+        raise
+    return ident
+
+
+def new_identity(name):
+    name = safe_name(name)
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
+        raise Fail("choose an agent name that can be addressed individually")
+    seed = os.urandom(32)
+    ident = {"name": name, "sub": "agent:%s" % name, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
+    write_private(ident_path(name), json.dumps(ident, indent=1), create=True)
+    return ident
+
+
+def default_name():
+    # First use with no name given: the first of this host's names; for a prefix (sauersml.), plus the user name.
+    names = node_info().get("names") or []
+    if not names:
+        raise Fail("the node at %s certifies no names for this host; pick a pinned identity with --as NAME" % MAIL)
+    first = names[0]
+    if not first.endswith("."):
+        return first
+    user = re.sub(r"[^a-z0-9_-]", "-", (os.environ.get("USER") or os.environ.get("USERNAME") or "agent").lower())
+    return first + (user.strip("-_") or "agent")[:40]
+
+
+def canon_ts():
+    t = time.time()
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t)) + ".%03dZ" % (int(t * 1000) % 1000)
+
+
+def certify(ident):
+    # Proof of key for this node; the node answers 201 (new) or 200 (already certified with this key).
+    key, ts = node_key(), canon_ts()
+    seed = bytes.fromhex(ident["seed"])
+    kid = "ed25519:" + b64u(ed25519_public(seed))
+    statement = "agent-mail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, key, ts)
+    body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode()))}
+    return http("POST", MAIL + "/api/agents", body)["cert"]
+
+
+def _read_identity(name):
     try:
         fd = os.open(ident_path(name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd) as f:
@@ -252,8 +309,18 @@ def token_for(ident, ttl=REQUEST_TTL):
 
 
 def api(ident, method, path, body=None, headers=None, raw=False, timeout=60):
-    h = {"Authorization": "Bearer " + token_for(ident), **(headers or {})}
-    return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
+    for attempt in (0, 1):
+        h = {"Authorization": "Bearer " + token_for(ident), **(headers or {})}
+        try:
+            return http(method, MAIL + path, body, h, raw=raw, timeout=timeout)
+        except Fail as e:
+            # A key this node has not certified yet (e.g. a second home): certify it here once, then retry.
+            if attempt or not str(e).startswith("403 ") or "no certificate from this node" not in str(e):
+                raise
+            try:
+                certify(ident)
+            except Fail as c:
+                raise Fail("%s (certifying here: %s)" % (e, c))
 
 
 # ---- formatting and addressing (same rules as the server) ----
@@ -527,7 +594,7 @@ def cmd_watch(a):
 def main():
     global MAIL
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one)")
+    ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("newkey", help="make your key with no home server; prints the public entry for peers")
     p.add_argument("name")

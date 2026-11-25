@@ -41,6 +41,7 @@ jobs:
           node_bin="target/${{ matrix.target }}/release/mailnode"
           python tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
           python tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
+          python tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
       - name: Package
         run: |
           mkdir -p out
