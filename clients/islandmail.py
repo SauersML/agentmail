@@ -374,15 +374,21 @@ def cmd_ask(a):
     # Use the canonical recipient returned by the node.
     if len(sent.get("reaches") or []) == 1:
         to = _addr(sent["reaches"][0])
-    deadline, delay = time.time() + a.wait, 3
-    while time.time() < deadline:
-        time.sleep(min(delay, max(0.0, deadline - time.time())))
-        msgs = api(ident, "GET", "/api/messages?" + urllib.parse.urlencode({"from": to, "after": sent["id"], "limit": 20}))["messages"]
+    deadline, delay, after = time.monotonic() + a.wait, 3, sent["id"]
+    while time.monotonic() < deadline:
+        path = "/api/messages?" + urllib.parse.urlencode({"from": to, "after": after, "limit": 20})
+        page = api(ident, "GET", path, timeout=max(0.1, deadline - time.monotonic()))
+        msgs = page["messages"]
         answers = [m for m in msgs if _addr(m["from"]) == to and addressed_to(m["to"], ident["name"])]
         if answers:
             for m in answers:
                 show(m)
             return
+        if msgs:
+            after = msgs[-1]["id"]
+            if page.get("more"):
+                continue
+        time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 1.5, 20)
     sys.stderr.write("islandmail: no answer from %s within %d s; it may still reply: read --from %s --after %d\n" % (
         to, a.wait, to, sent["id"]))
@@ -463,20 +469,21 @@ def cmd_watch(a):
                     if not line.startswith("data: "):
                         continue
                     m = json.loads(line[6:])
+                    own = m["from"] == ident["name"]
+                    print_it = not (own and (a.skip_own or a.mine)) and (
+                        not a.mine or addressed_to(m["to"], ident["name"])
+                        or any(m["from"].startswith(x) for x in a.also_from or []))
+                    if print_it:
+                        show(m)
                     after = max(after, m["id"])
                     write_private(resume, str(after))
-                    own = m["from"] == ident["name"]
-                    if own and (a.skip_own or a.mine):
-                        continue
-                    if a.mine and not (addressed_to(m["to"], ident["name"]) or
-                                       any(m["from"].startswith(x) for x in a.also_from or [])):
-                        continue
-                    show(m)
-                    if a.until:
+                    if print_it and a.until:
                         return
         except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code not in (408, 429):
+                raise Fail("watch: HTTP %d" % e.code)
             sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
-        except Exception as e:  # network drops, timeouts: resume from the last id
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
         delay = min(delay * 2, 60)
