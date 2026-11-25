@@ -151,6 +151,7 @@ def main():
         seed = open(k(who)).read().strip()
         with open(os.path.join(d, agents[who] + ".json"), "w") as f:
             json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "home": iss, "id": pub[who], "seed": seed}, f)
+        os.chmod(os.path.join(d, agents[who] + ".json"), 0o600)  # nodes skip identity files others can read
 
     def cfg(host):
         return {
@@ -251,12 +252,15 @@ def main():
             seed = open(k(who)).read().strip()
             with open(os.path.join(im_dir, "identities", agents[who] + ".json"), "w") as f:
                 json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "home": iss, "id": pub[who], "seed": seed}, f)
-            # Pre-minted token in islandmail.py's cache, so it never calls a home.
+            os.chmod(os.path.join(im_dir, "identities", agents[who] + ".json"), 0o600)
+            # Pre-minted token in islandmail.py's cache, so it never calls a home. ISLANDMAIL_TOKEN=home below keeps this
+            # test on the home-token (aid1) path; phase2.py covers agent tokens and a node with no home.
             with open(os.path.join(im_dir, "tokens", "%s.mail.json" % agents[who]), "w") as f:
                 json.dump({"token": tok[who], "exp": time.time() + 3600}, f)
 
         def im(port, who, *args, timeout=30):
-            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir, ISLANDMAIL_AS=agents[who])
+            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir, ISLANDMAIL_AS=agents[who],
+                       ISLANDMAIL_TOKEN="home")
             p = subprocess.run([sys.executable, a.islandmail, *args], capture_output=True, text=True, env=env, timeout=timeout)
             return p.returncode, (p.stdout + p.stderr).strip()
 
@@ -339,6 +343,24 @@ def main():
             ws.close()
             check("MCPL backlog on reconnect: only the unacknowledged mail", len(texts) == 1 and "while you were away" in texts[0],
                   "%d pushed" % len(texts))
+            # The same with an agent token (a Connectome host with no home): `mailnode agent-token` mints it from bob's
+            # identity file. B holds bob's key, so it signs his MCPL sends with it.
+            node_b = req("GET", pb, "/api/node")[1]["node"]
+            bob_id = os.path.join(work, "idsB", "identities", "t.bob.json")
+            ws, init = rpc_session(run(bin_, "agent-token", bob_id, node_b, "600"))
+            ws.send(json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "send", "arguments": {
+                "to": "t.alice", "thread": "t4", "text": "sent over MCPL with an agent token"}}}))
+            sent = None
+            t0 = time.time()
+            while time.time() - t0 < 5 and not sent:
+                m = json.loads(ws.recv(timeout=5))
+                if m.get("id") == 4:
+                    sent = m
+            ws.close()
+            check("MCPL with an agent token: initialize and send", init.get("result") and sent and not sent["result"].get("isError"),
+                  sent["result"]["content"][0]["text"] if sent else "no answer")
+            got, dt = wait_for(lambda: [m for m in req("GET", pa, "/api/messages?thread=t4", tok["alice"])[1]["messages"]])
+            check("its mail reaches A, signed by bob's key", got and got[0]["attest"] == "agent", "%.2fs" % dt)
     finally:
         A.stop()
         B.stop()
