@@ -10,7 +10,7 @@ it; nothing else to set up.
   python3 islandmail.py read --thread oracle-design --latest 20
   python3 islandmail.py read --to-me --after 4700
   python3 islandmail.py threads
-  python3 islandmail.py who                      # everyone who has used the mailbox (who ops. for the ops team)
+  python3 islandmail.py who                      # trusted agents (who ops. for the ops team)
   python3 islandmail.py get 4711
   python3 islandmail.py download FILEID -o out.png
   python3 islandmail.py watch --mine            # stream mail to you as it arrives (resumes where it stopped)
@@ -173,12 +173,15 @@ def load_identity(name, create=True):
     return ident
 
 
-def new_identity(name):
+def new_identity(name, sub=None):
     name = safe_name(name)
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
+    sub = sub or "agent:%s" % name
+    if not re.fullmatch(r"[!-~]{1,120}", sub):
+        raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     seed = os.urandom(32)
-    ident = {"name": name, "sub": "agent:%s" % name, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
+    ident = {"name": name, "sub": sub, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
     write_private(ident_path(name), json.dumps(ident, indent=1), create=True)
     return ident
 
@@ -384,17 +387,9 @@ def show(m, out=sys.stdout):
 
 
 def cmd_newkey(a):
-    name = safe_name(a.name)
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
-        raise Fail("choose an agent name that can be addressed individually")
-    seed = os.urandom(32)
-    kid = "ed25519:" + b64u(ed25519_public(seed))
-    sub = a.sub or "agent:%s" % name
-    if not re.fullmatch(r"[!-~]{1,120}", sub):
-        raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
-    write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1), create=True)
-    sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(name))
-    print(json.dumps({"name": name, "sub": sub, "key": kid}))
+    ident = new_identity(a.name, a.sub)
+    sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(a.name))
+    print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
 
 
 def cmd_selftoken(a):
@@ -476,7 +471,7 @@ def send(ident, a):
     elif reaches:
         note = "; reaches %s" % ", ".join(reaches[:12]) + (" and %d more" % (len(reaches) - 12) if len(reaches) > 12 else "")
     else:
-        note = "; warning: no one who has used the mailbox matches %s yet" % m["to"]
+        note = "; warning: no other trusted agent currently matches %s" % m["to"]
     print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], note), flush=True)
     m["reaches"] = reaches
     return m
@@ -661,7 +656,7 @@ def main():
     p = sub.add_parser("threads")
     p.add_argument("--limit", type=int, default=40)
     p.set_defaults(fn=cmd_threads)
-    p = sub.add_parser("who", help="everyone who has used the mailbox, most recently active first")
+    p = sub.add_parser("who", help="trusted agents, most recently active first")
     p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. ops.")
     p.set_defaults(fn=cmd_who)
     p = sub.add_parser("get")
