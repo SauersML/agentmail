@@ -862,6 +862,25 @@ mod tests {
     }
 
     #[test]
+    fn padded_wire_keys_work_in_mailbox_lookups() {
+        let (node, alice, writer, list, _rx) = setup();
+        let mut env = envelope(&writer, &list, &alice, "padded keys");
+        for wrap in &mut env.keys {
+            wrap.to.push('=');
+        }
+        let Attest::Agent { key, .. } = &mut env.attest;
+        key.push('=');
+        env.sig = mailcore::b64u(&writer.sign(&env.signing_bytes()));
+        let row = node.ingest(env).unwrap().unwrap();
+        let viewer = Caller {
+            name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()), exp_ms: i64::MAX,
+        };
+        assert!(node.store.get(row.id, &viewer).unwrap().is_some());
+        assert_eq!(node.store.query(&Default::default(), &viewer, 100).unwrap().0.len(), 1);
+        assert!(node.store.repeat(&viewer, "", "all", "t", "padded keys").unwrap().is_some());
+    }
+
+    #[test]
     fn ingest_dedupes_by_envelope_id() {
         let (node, agent, node_b, list, _rx) = setup();
         let e = envelope(&node_b, &list, &agent, "once");

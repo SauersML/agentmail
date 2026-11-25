@@ -142,11 +142,11 @@ pub struct Store {
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
                     length(text) AS len, files, readers, \
-                    (SELECT group_concat(value->>'to') FROM json_each(env, '$.keys'))";
+                    (SELECT group_concat(rtrim(value->>'to', '=')) FROM json_each(env, '$.keys'))";
 
 fn visible_sql() -> &'static str {
     "(json_extract(env, '$.v') = 3 AND text IS NOT NULL AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
-      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE value->>'to' = ?))"
+      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE rtrim(value->>'to', '=') = ?))"
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -507,7 +507,7 @@ impl Store {
         Ok(db
             .query_row(
                 &format!(
-                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND env->>'$.attest.key' = ? AND ts > ? AND recipient = ? AND thread = ? \
+                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND rtrim(env->>'$.attest.key', '=') = ? AND ts > ? AND recipient = ? AND thread = ? \
                      AND text = ? AND files = '[]' ORDER BY id DESC LIMIT 1"
                 ),
                 params![MAX_TEXT, who.sub, who.name, who.key, since_ts, to, thread, text],
