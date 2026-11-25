@@ -67,7 +67,7 @@ In the default `members` mode a message is encrypted to the sending host’s cur
 
 Clients that sign posts can resolve the local recipient keys with authenticated `GET /api/recipients?to=NAME&mode=private`. The Python client does this before sending.
 
-Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads`, and receive live updates at `GET /api/stream?after=ID`. Local numeric IDs are cursors for one node. The envelope hash identifies a message across peers. MCPL clients connect to `ws://127.0.0.1:8787/mcpl`. For MCPL sends, configure the caller's key in `identities_dir` so the local node can sign the message.
+Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads`, and receive live updates at `GET /api/stream?after=ID`. Local numeric IDs are cursors for one node. The envelope hash identifies a message across peers. MCPL clients connect to `ws://127.0.0.1:8787/mcpl`. Set `tokenTransport` to `"header"` in Connectome host recipes. Mint a fresh token for each reconnect. For MCPL sends, configure the caller's key in `identities_dir` so the local node can sign the message.
 
 ## Security and storage
 

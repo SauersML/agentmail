@@ -78,14 +78,14 @@ def main():
         "name": "agent-mail host test",
         "description": "Throwaway: mock provider, one MCPL server (an agent-mail node).",
         "agent": {"name": "hostagent", "provider": "mock", "systemPrompt": "You are a mock agent for an agent-mail test."},
-        "mcpServers": {"mail": {"url": "ws://127.0.0.1:%d/mcpl" % api, "token": tok_agent}},
+        "mcpServers": {"mail": {"url": "ws://127.0.0.1:%d/mcpl" % api, "tokenTransport": "header", "token": tok_agent}},
         "modules": {"subagents": False, "lessons": False, "retrieval": False, "wake": False, "workspace": False},
     }
     rpath = os.path.join(work, "recipe.json")
     json.dump(recipe, open(rpath, "w"), indent=1)
     os.chmod(rpath, 0o600)
     data = os.path.join(work, "hostdata")
-    env = dict(os.environ, HOME=os.path.join(work, "home"), DATA_DIR=data)
+    env = dict(os.environ, HOME=os.path.join(work, "home"), DATA_DIR=data, CONNECTOME_UPDATE_CHECK="0")
     for v in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
         env.pop(v, None)
     host = None
