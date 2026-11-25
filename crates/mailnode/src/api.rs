@@ -90,7 +90,7 @@ pub fn params(raw: &Option<String>) -> HashMap<String, String> {
     m
 }
 
-/// The old server's intParam: Number(v) must be a safe non-negative integer ("" counts as 0, as in JS).
+/// Parse a non-negative numeric query parameter.
 fn int_param(p: &HashMap<String, String>, name: &str) -> Result<Option<i64>, ApiError> {
     let Some(v) = p.get(name) else { return Ok(None) };
     let v = v.trim();

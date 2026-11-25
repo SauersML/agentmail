@@ -1,5 +1,5 @@
 //! The node's mail logic, shared by the compat API, MCPL and replication: accept a local send (seal, sign, store,
-//! announce), accept a replicated envelope (verify, decrypt if we can, store), and the old server's read-side rules
+//! announce), accept a replicated envelope (verify, decrypt if we can, store), and expose local reads
 //! (names, reaches, addressed rows, message formatting).
 
 use std::collections::{HashMap, HashSet};
@@ -20,7 +20,7 @@ pub const MAX_FIELD: usize = 120;
 const REPEAT_MS: i64 = 10 * 60 * 1000;
 const RATE_WINDOW_MS: i64 = 3_600_000;
 
-/// An HTTP-style error: status and message, as the old server's HttpError.
+/// An HTTP-style error: status and message, for API clients.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -246,7 +246,7 @@ impl Node {
 
         let members = self.members.read().unwrap().clone();
         let recipients = Self::recipients(&members, &to, &who.name, mode)?;
-        // Signed by the sender's own key (islandmail.py sends `signed: {ts, salt, sig}`), or token-attested.
+        // Accept the client signature or sign with the caller's enrolled local key.
         let (ts, attest, salt) = match body.get("signed") {
             Some(s) => {
                 let raw_thread = body.get("thread").and_then(|t| t.as_str()).unwrap_or("general");
@@ -350,7 +350,7 @@ impl Node {
     /// The caller's agent key, if this node holds it: an identity named like the caller whose public key is the one
     /// the member list gives that name, with the same sub as the caller's token. (member-list key string, seed)
     fn local_key(&self, members: &MemberList, who: &Caller) -> Option<(String, Seed)> {
-        let m = members.member_by_name(&who.name).filter(|m| m.sub == who.sub)?;
+        let m = members.member_by_name(&who.name).filter(|m| m.sub == who.sub && m.key == who.key)?;
         let k = mailcore::keys::parse_key(&m.key).ok()?;
         self.opts
             .identities
@@ -479,7 +479,7 @@ pub fn readers_for(members: &MemberList, to: &str, from: &str) -> String {
     format!(",{},", names.join(","))
 }
 
-/* Field rules, as the old server */
+/* Input validation */
 
 fn is_format_char(c: char) -> bool {
     matches!(c as u32,
@@ -511,7 +511,7 @@ pub fn field(v: &Value, name: &str, ok: impl Fn(&str) -> bool) -> Result<String,
     Ok(s)
 }
 
-/// The old server's fileName(): the last path segment, no format/control characters or quotes, at most 200 chars.
+/// Use the last path segment, no format/control characters or quotes, at most 200 chars.
 pub fn file_name(raw: Option<&str>) -> String {
     let base = raw.unwrap_or("").rsplit(['/', '\\']).next().unwrap_or("");
     let s: String = base
@@ -525,7 +525,7 @@ pub fn file_name(raw: Option<&str>) -> String {
     if s.is_empty() { "file".into() } else { s }
 }
 
-/// The old server's mimeType(): a plain type/subtype or application/octet-stream.
+/// Use a plain type/subtype or application/octet-stream.
 pub fn mime_type(raw: Option<&str>) -> String {
     let t = raw.unwrap_or("").split(';').next().unwrap_or("").trim().to_lowercase();
     let ok_part = |p: &str| {
@@ -569,10 +569,10 @@ fn is_line_break(c: char) -> bool {
 
 /// A header field kept on the header line: line breaks and other control characters become spaces.
 fn one_line(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() || is_line_break(c) { ' ' } else { c }).collect()
+    s.chars().map(|c| if c.is_control() || is_line_break(c) || is_bidi(c) { ' ' } else { c }).collect()
 }
 
-/// The old server's formatMessage: one header line the mailbox writes, then the sender's text, every line quoted.
+/// Format one header line from the mailbox, then the sender's text, every line quoted.
 /// Replicated text and header fields come from other nodes unfiltered, so every kind of line break starts a new quoted
 /// line and none can appear in the header: a line that does not start with '> ' is always the mailbox's own.
 pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
@@ -600,15 +600,8 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
         }
         _ => body,
     };
-    // An import's sender is the bridge's word for it (the bridge key can name anyone), so the header says so.
-    let from = if r.verified && r.imported.is_some() {
-        format!("{} [{}] (copied from the old server)", one_line(&r.sender), one_line(&r.sender_sub))
-    } else if r.verified {
-        format!("{} [{}]", one_line(&r.sender), one_line(&r.sender_sub))
-    } else {
-        format!("{} (unverified: copied from the old shared-password inbox)", one_line(&r.sender))
-    };
-    let quoted: Vec<String> = body.replace("\r\n", "\n").split(is_line_break).map(|l| format!("> {l}")).collect();
+    let from = format!("{} [{}]", one_line(&r.sender), one_line(&r.sender_sub));
+    let quoted: Vec<String> = body.replace("\r\n", "\n").split(is_line_break).map(|l| format!("> {}", one_line(l))).collect();
     let ts: String = one_line(&r.ts).chars().take(16).collect();
     format!(
         "#{} {}Z from {} to {}, thread \"{}\":\n{}",
@@ -703,20 +696,14 @@ mod tests {
             files: "[]".into(),
             readers: None,
             wrapped_to: String::new(),
-            verified: true,
-            imported: None,
             parents: vec![],
-            attest: "agent".into(),
         };
         let out = format_message(&row, 100_000, "http://x");
         let lines: Vec<&str> = out.split(is_line_break).collect();
         assert!(lines[0].starts_with("#7 "), "{out:?}");
         assert!(lines[1..].iter().all(|l| l.starts_with("> ")), "{out:?}");
         assert_eq!(lines.len(), 9, "{out:?}");
-        assert!(!lines[0].contains("old server"));
-        let imported = Row { imported: Some(42), attest: "import".into(), ..row };
-        let out = format_message(&imported, 100_000, "http://x");
-        assert!(out.starts_with("#7 2026-01-01T00:00Z from a.alice [agent:alice@t] (copied from the old server) to all"), "{out:?}");
+
     }
 
     #[test]
@@ -837,7 +824,7 @@ mod tests {
         assert!(!p.repeated);
         let out = rx.try_recv().expect("gossiped");
         assert_eq!(out.id, p.row.env_id);
-        assert_eq!(p.row.attest, "agent");
+        assert_eq!(p.row.to_message()["attest"], "agent");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
         for invalid in [json!({"to":"all","thread":"t","text":"hi","signed":null}),
@@ -865,7 +852,7 @@ mod tests {
         let p = node
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
-        assert_eq!(p.row.attest, "agent");
+        assert_eq!(p.row.to_message()["attest"], "agent");
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
         assert_eq!(e.ts, ts);
@@ -895,7 +882,7 @@ mod tests {
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
-        assert_eq!(p.row.attest, "agent");
+        assert_eq!(p.row.to_message()["attest"], "agent");
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
         e.verify(&list, now_millis()).unwrap();
@@ -958,7 +945,7 @@ mod tests {
         let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
         assert_eq!(e.status, 400, "{}", e.message);
         let p = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
-        assert_eq!(p.row.attest, "agent");
+        assert_eq!(p.row.to_message()["attest"], "agent");
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }

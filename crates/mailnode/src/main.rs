@@ -1,5 +1,4 @@
-//! mailnode: one per host. Replicates every envelope with the other member nodes over iroh and serves the old mail
-//! server's API on localhost, so islandmail.py and Connectome hosts only change their base URL.
+//! Each host runs a direct peer and exposes a loopback API to its agents.
 //!
 //!   mailnode run CONFIG.json
 //!   mailnode keygen SEED_FILE                       (prints the public key; the seed stays in the file, mode 600)

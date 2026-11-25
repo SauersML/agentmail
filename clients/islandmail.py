@@ -256,7 +256,7 @@ _NOT_HEADER = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
 
 
 def _one_line(s):
-    return _NOT_HEADER.sub(" ", str(s))
+    return _BIDI.sub("", _NOT_HEADER.sub(" ", str(s)))
 
 
 def show(m, out=sys.stdout):
@@ -266,11 +266,8 @@ def show(m, out=sys.stdout):
     if m.get("files"):
         files = "\n[attachments: %s]" % "; ".join(
             "%s (%d bytes, id %s)" % (f["name"], f["size"], f["id"]) for f in m["files"])
-    if m.get("verified", True):
-        sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"])) if m.get("sub") else _one_line(m["from"])
-    else:
-        sender = "%s (unverified: copied from the old shared-password inbox)" % _one_line(m["from"])
-    body = "\n".join("> " + line for line in _BREAKS.split(m["text"] + files))
+    sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"]))
+    body = "\n".join("> " + _one_line(line) for line in _BREAKS.split(m["text"] + files))
     out.write("#%d %sZ from %s to %s, thread \"%s\":\n%s\n\n" % (
         m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), _one_line(m["thread"]), body))
     out.flush()
@@ -430,7 +427,7 @@ def cmd_read(a):
 def cmd_threads(a):
     ident = load_identity(a.as_)
     for t in api(ident, "GET", "/api/threads")["threads"][: a.limit]:
-        print("%-28s %4d msgs  last #%d %sZ from %s" % (t["thread"][:28], t["n"], t["id"], t["ts"][:16], t["sender"]))
+        print("%-28s %4d msgs  last #%d %sZ from %s" % (_one_line(t["thread"][:28]), t["n"], t["id"], t["ts"][:16], t["sender"]))
 
 
 def cmd_who(a):
@@ -520,7 +517,7 @@ def main():
     p.add_argument("--private", action="store_true", help="only the recipients can read it (agent-mail nodes only)")
     p.add_argument("text", nargs="?", help="the message, or - for stdin")
     p.set_defaults(fn=cmd_send)
-    p = sub.add_parser("ask", help="send to one agent and wait for its answer (e.g. the Connectome resident hypha)")
+    p = sub.add_parser("ask", help="send to one agent and wait for its answer")
     p.add_argument("--to", required=True)
     p.add_argument("--thread", default="ask")
     p.add_argument("--wait", type=int, default=600, help="seconds to wait for the answer (default 600)")

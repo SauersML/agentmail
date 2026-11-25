@@ -1,4 +1,4 @@
-//! /mcpl: MCP over WebSocket (newline-delimited JSON-RPC) with the old server's tools, plus MCPL push/event for hosts
+//! /mcpl: MCP over WebSocket (newline-delimited JSON-RPC) with mail tools and MCPL push/event for hosts
 //! that declare MCPL: mail addressed to the agent is pushed as it arrives; a push the host answers {accepted:true}
 //! (or reason "duplicate") moves the agent's cursor, and on (re)connect the mail past the cursor is pushed (20 at a
 //! time). A connection that leaves 50 pushes unanswered is closed (4008); one whose token expires is
@@ -499,7 +499,7 @@ impl Conn {
     }
 
     fn push(&mut self, r: &Row) {
-        let origin = json!({ "messageId": r.id, "thread": r.thread, "from": r.sender, "to": r.recipient, "verified": r.verified, "attest": r.attest });
+        let origin = json!({ "messageId": r.id, "thread": r.thread, "from": r.sender, "to": r.recipient, "verified": true, "attest": "agent" });
         self.push_text(Some(r.id), &format!("mail-{}", r.id), &self.node.fmt(r, PUSH_TEXT), origin);
     }
 

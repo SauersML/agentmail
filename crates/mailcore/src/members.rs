@@ -125,8 +125,6 @@ pub(crate) mod tests {
             v: 2,
             network: b64u(&crate::random_bytes::<32>()),
             seq: 1,
-
-
             members: members
                 .iter()
                 .map(|(n, s)| Member { name: n.to_string(), sub: format!("agent:{n}@test"), key: fmt_key(&s.public()) })
@@ -136,9 +134,7 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![] })
                 .collect(),
-
         };
-
         l.validate().unwrap();
         l
     }
@@ -147,12 +143,9 @@ pub(crate) mod tests {
     fn membership_rejects_shared_roles_and_ambiguous_names() {
         let mut l = list(&[("a.bob", &Seed::generate()), ("a.sue", &Seed::generate())], &[&Seed::generate()]);
         l.members[1].name = "A.Bob".into();
-
         assert!(l.validate().is_err());
         l.members[1].name = "a.sue".into();
         l.nodes[0].key = l.members[0].key.clone();
-
         assert!(l.validate().is_err());
     }
-
 }

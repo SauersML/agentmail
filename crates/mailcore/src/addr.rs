@@ -1,5 +1,5 @@
-//! Addressing, exactly as the old server: `to` is names separated by commas or spaces, team prefixes ending in '.', or
-//! all / *. Case-insensitive; a slash counts as a dot (the old inbox's sauersml/lead reaches sauersml.lead).
+//! Addressing: `to` is names separated by commas or spaces, team prefixes ending in '.', or
+//! all / *. Case-insensitive; a slash counts as a dot.
 
 pub fn norm(s: &str) -> String {
     s.trim().to_lowercase().replace('/', ".")

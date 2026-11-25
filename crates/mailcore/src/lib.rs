@@ -1,5 +1,5 @@
 //! Agent mail core: the wire envelope, its encryption and signatures, agent tokens (PASETO v4.public, signed by the
-//! agent's own key) and the signed member list, addressing rules and the per-thread order. No I/O: `mailnode` does storage and networking.
+//! agent's own key) and local trust pins, addressing rules and the per-thread order. No I/O: `mailnode` does storage and networking.
 
 pub mod addr;
 pub mod agent_token;
@@ -21,7 +21,7 @@ const B64: GeneralPurpose = GeneralPurpose::new(
     GeneralPurposeConfig::new().with_encode_padding(false).with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
 
-/// base64url without padding (decoding accepts padding too, like the old server's atob-based decoder).
+/// base64url without padding (decoding accepts padding too).
 pub fn b64u(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }

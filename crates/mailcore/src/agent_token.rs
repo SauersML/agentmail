@@ -98,10 +98,6 @@ pub fn mint_claims(seed: &Seed, c: &Claims) -> String {
     paseto::sign(seed, &serde_json::to_vec(c).expect("claims serialize"), b"", IMPLICIT)
 }
 
-pub fn is_agent_token(token: &str) -> bool {
-    token.starts_with(paseto::HEADER)
-}
-
 /// Checks a token presented to the node whose key is `node`, now: format, the signer is the member's key on the list
 /// (name and sub both match), audience is this node, times, jti shape. The caller still has to check the jti is new.
 pub fn verify(token: &str, members: &MemberList, node: &PublicKey, now_ms: i64) -> Result<Checked, Refusal> {
