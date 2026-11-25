@@ -46,17 +46,30 @@ pub enum Attest {
     Agent { key: String, digest: String, sig: String },
 }
 
-pub fn post_statement(members: &MemberList, from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str, blobs: &[String], recipients: &[PublicKey]) -> Vec<u8> {
-    let sub = members.member_by_name(from).map_or("", |m| m.sub.as_str());
-    let topic = members.topic();
-    // Membership can change after delivery. Verify against the audience recorded in the envelope.
-    let mut recipients = recipients.to_vec();
-    recipients.sort_unstable();
-    let audience = crate::paseto::pae(&recipients.iter().map(|k| k.as_slice()).collect::<Vec<_>>());
-    let mut fields: Vec<&[u8]> = vec![b"agent-mail/post/v3", &topic, from.as_bytes(), sub.as_bytes(),
-        to.as_bytes(), thread.as_bytes(), mode.as_str().as_bytes(), ts.as_bytes(), digest.as_bytes(), &audience];
-    fields.extend(blobs.iter().map(|s| s.as_bytes()));
-    crate::paseto::pae(&fields)
+pub struct PostStatement<'a> {
+    pub from: &'a str,
+    pub to: &'a str,
+    pub thread: &'a str,
+    pub mode: Mode,
+    pub ts: &'a str,
+    pub digest: &'a str,
+    pub blobs: &'a [String],
+    pub recipients: &'a [PublicKey],
+}
+
+impl PostStatement<'_> {
+    pub fn signing_bytes(&self, members: &MemberList) -> Vec<u8> {
+        let sub = members.member_by_name(self.from).map_or("", |m| m.sub.as_str());
+        let topic = members.topic();
+        let mut recipients = self.recipients.to_vec();
+        recipients.sort_unstable();
+        let audience = crate::paseto::pae(&recipients.iter().map(|k| k.as_slice()).collect::<Vec<_>>());
+        let mut fields: Vec<&[u8]> = vec![b"agent-mail/post/v3", &topic, self.from.as_bytes(), sub.as_bytes(),
+            self.to.as_bytes(), self.thread.as_bytes(), self.mode.as_str().as_bytes(), self.ts.as_bytes(),
+            self.digest.as_bytes(), &audience];
+        fields.extend(self.blobs.iter().map(|s| s.as_bytes()));
+        crate::paseto::pae(&fields)
+    }
 }
 
 /// Hash the encrypted body's public-facing fields using the same length framing as the signature.
@@ -267,8 +280,10 @@ impl Envelope {
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
-                let st = post_statement(members, &self.from, &self.to, &self.thread, self.mode, &self.ts, digest, &self.blobs,
-                    &wraps.iter().map(|w| w.to).collect::<Vec<_>>());
+                let st = PostStatement {
+                    from: &self.from, to: &self.to, thread: &self.thread, mode: self.mode,
+                    ts: &self.ts, digest, blobs: &self.blobs, recipients: &wraps.iter().map(|w| w.to).collect::<Vec<_>>(),
+                }.signing_bytes(members);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
                 // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
                 if b64u(&s) != *sig {
@@ -333,7 +348,10 @@ mod tests {
             Mode::Members => w.members.all_keys(),
             Mode::Private => w.members.private_keys(to, from),
         };
-        let sig = b64u(&signer.sign(&post_statement(&w.members, from, to, "t", mode, &ts, &digest, &[], &recipients)));
+        let sig = b64u(&signer.sign(&PostStatement {
+            from, to, thread: "t", mode,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &recipients,
+        }.signing_bytes(&w.members)));
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -356,7 +374,10 @@ mod tests {
     fn signed_env(w: &World, from: &str, signer: &Seed, text: &str, ts: String) -> Envelope {
         let salt = crate::random_bytes::<16>();
         let digest = post_digest(&salt, text, &[]).unwrap();
-        let st = post_statement(&w.members, from, "all", "t", Mode::Members, &ts, &digest, &[], &w.members.all_keys());
+        let st = PostStatement {
+            from, to: "all", thread: "t", mode: Mode::Members,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
+        }.signing_bytes(&w.members);
         let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
         Envelope::seal(
@@ -417,7 +438,10 @@ mod tests {
         let salt = crate::random_bytes::<16>();
         let digest = post_digest(&salt, "hi", &[]).unwrap();
         // alice signs to "all", thread "x|y".
-        let st = post_statement(&w.members, "a.alice", "all", "x|y", Mode::Members, &ts, &digest, &[], &w.members.all_keys());
+        let st = PostStatement {
+            from: "a.alice", to: "all", thread: "x|y", mode: Mode::Members,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
+        }.signing_bytes(&w.members);
         let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)) };
         let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
         let mk = |to: &str, thread: &str| {

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use mailcore::addr::{addressed_to, is_broadcast, norm};
-use mailcore::envelope::Draft;
+use mailcore::envelope::{Draft, PostStatement};
 use mailcore::keys::Seed;
 use mailcore::{now_millis, now_ts, ts_from_millis, Attest, Body, Envelope, MemberList, Mode};
 use serde_json::{json, Value};
@@ -271,7 +271,10 @@ impl Node {
                     .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
                 let key = mailcore::keys::parse_key(&m.key)?;
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
-                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids, &recipients);
+                let st = PostStatement {
+                    from: &who.name, to: &to, thread: &thread, mode,
+                    ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
+                }.signing_bytes(&members);
                 let sig = s["sig"].as_str().unwrap_or("").to_string();
                 let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, &st, &b));
                 if !ok {
@@ -302,7 +305,10 @@ impl Node {
                 let salt = mailcore::random_bytes::<16>();
                 let ts = now_ts();
                 let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
-                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids, &recipients);
+                let st = PostStatement {
+                    from: &who.name, to: &to, thread: &thread, mode,
+                    ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
+                }.signing_bytes(&members);
                 let sig = mailcore::b64u(&seed.sign(&st));
                 (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
             }
@@ -644,7 +650,10 @@ mod tests {
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, text, &[]).unwrap();
-        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[], &list.all_keys());
+        let st = PostStatement {
+            from: "a.alice", to: "all", thread: "t", mode: Mode::Members,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
+        }.signing_bytes(list);
         let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
         Envelope::seal(
@@ -712,7 +721,10 @@ mod tests {
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]).unwrap();
-        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[], &list.all_keys());
+        let st = PostStatement {
+            from: "a.alice", to: "all", thread: "t", mode: Mode::Members,
+            ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
+        }.signing_bytes(&list);
         let sig = mailcore::b64u(&alice.sign(&st));
         let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
         let seal = |parents: Vec<String>, sig: String| {
@@ -840,7 +852,10 @@ mod tests {
         let salt = mailcore::random_bytes::<16>();
         let digest = mailcore::envelope::post_digest(&salt, text, files).unwrap();
         let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
-        let st = mailcore::envelope::post_statement(list, "a.alice", to, thread, Mode::Members, ts, &digest, &ids, &list.all_keys());
+        let st = PostStatement {
+            from: "a.alice", to, thread, mode: Mode::Members,
+            ts, digest: &digest, blobs: &ids, recipients: &list.all_keys(),
+        }.signing_bytes(list);
         json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(&st)) })
     }
 
@@ -874,7 +889,7 @@ mod tests {
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
             let (tx, rx) = mpsc::channel(32);
-            let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
+            let opts = Opts { public_url: "http://x".into(), identities: ids };
             let node_seed = Seed::from_bytes(*node_b.bytes());
             (Node::new(Store::open(&path).unwrap(), list.clone(), node_seed, opts, tx), rx)
         };

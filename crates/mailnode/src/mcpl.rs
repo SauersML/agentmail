@@ -66,21 +66,22 @@ fn tools() -> Value {
     ])
 }
 
+type OpenSocket = (u64, mpsc::UnboundedSender<(u16, String)>);
+
 /// Open MCPL sockets per agent, so a new connection can replace the agent's oldest.
 #[derive(Default)]
 pub struct Sockets {
     next: AtomicU64,
-    open: Mutex<HashMap<String, Vec<(u64, i64, mpsc::UnboundedSender<(u16, String)>)>>>,
+    open: Mutex<HashMap<String, Vec<OpenSocket>>>,
 }
 
 impl Sockets {
     fn register(&self, sub: &str) -> Result<(u64, mpsc::UnboundedReceiver<(u16, String)>), ApiError> {
         let mut open = self.open.lock().unwrap();
         let mine = open.entry(sub.to_string()).or_default();
-        mine.retain(|(_, _, tx)| !tx.is_closed());
-        mine.sort_by_key(|x| x.1);
+        mine.retain(|(_, tx)| !tx.is_closed());
         while mine.len() >= MAX_SOCKETS_PER_SUB {
-            let (_, _, tx) = mine.remove(0);
+            let (_, tx) = mine.remove(0);
             let _ = tx.send((4000, "replaced by a newer connection from the same agent".into()));
         }
         if open.values().map(|v| v.len()).sum::<usize>() >= MAX_SOCKETS {
@@ -88,7 +89,7 @@ impl Sockets {
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        open.entry(sub.to_string()).or_default().push((id, now_millis(), tx));
+        open.entry(sub.to_string()).or_default().push((id, tx));
         Ok((id, rx))
     }
 
