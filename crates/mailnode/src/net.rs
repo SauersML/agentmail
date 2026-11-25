@@ -24,7 +24,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::config::Config;
 use crate::node::Node;
 
-pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/3";
+pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/4";
 const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 const MAX_RESP: usize = 64 << 20;
