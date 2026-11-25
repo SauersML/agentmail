@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use mailcore::addr::norm;
+use crate::node::Caller;
 use mailcore::{Envelope, Verified};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -67,6 +68,7 @@ pub struct Row {
     pub len: i64,
     pub files: String,
     pub readers: Option<String>,
+    pub wrapped_to: String,
     pub verified: bool,
     pub imported: Option<i64>,
     pub parents: Vec<String>,
@@ -89,10 +91,11 @@ pub fn public_files(files: &str) -> serde_json::Value {
 impl Row {
     /// Members mode: any caller with a valid token (as on the old server). Private: the sender and the members it was
     /// addressed to, and only if this node could decrypt it.
-    pub fn visible_to(&self, viewer: &str) -> bool {
-        self.text.is_some()
+    pub fn visible_to(&self, viewer: &Caller) -> bool {
+        self.attest == "agent" && self.text.is_some()
             && (self.mode == "members"
-                || self.readers.as_deref().is_some_and(|r| r.contains(&format!(",{},", norm(viewer)))))
+                || (self.mode == "private" && self.wrapped_to.split(',').any(|k| k == viewer.key)
+                    && self.readers.as_deref().is_some_and(|r| r.contains(&format!(",{},", norm(&viewer.name))))))
     }
 
     pub fn to_message(&self) -> serde_json::Value {
@@ -131,10 +134,12 @@ pub struct Store {
 }
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
-                    length(text) AS len, files, readers, verified, imported, parents, attest";
+                    length(text) AS len, files, readers, verified, imported, parents, attest, \
+                    CASE WHEN mode = 'private' THEN (SELECT group_concat(value->>'to') FROM json_each(env, '$.keys')) END";
 
 fn visible_sql() -> &'static str {
-    "(text IS NOT NULL AND (mode = 'members' OR instr(readers, ?) > 0))"
+    "(attest = 'agent' AND text IS NOT NULL AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0 \
+      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE value->>'to' = ?))))"
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -156,6 +161,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         imported: r.get(13)?,
         parents: serde_json::from_str(&parents).unwrap_or_default(),
         attest: r.get(15)?,
+        wrapped_to: r.get::<_, Option<String>>(16)?.unwrap_or_default(),
     })
 }
 
@@ -281,25 +287,16 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
     }
 
-    /// One message by local number, else by its old-server number: an import that reached this node after newer mail
-    /// got a new local number (see insert), but agents still cite the old server's.
-    pub fn get(&self, id: i64, viewer: &str) -> Result<Option<Row>> {
+    pub fn get(&self, id: i64, viewer: &Caller) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
-        let mut row = db
-            .query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
-            .optional()?;
-        if row.is_none() {
-            row = db
-                .query_row(&format!("SELECT {COLS} FROM messages WHERE imported = ? LIMIT 1"), params![MAX_TEXT, id], read_row)
-                .optional()?;
-        }
-        Ok(row.filter(|r| r.visible_to(viewer)))
+        Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
+            .optional()?.filter(|r| r.visible_to(viewer)))
     }
 
     /// The old server's query(): rows in local-id order, at most `limit` (1000) or PAGE_CHARS of text.
-    pub fn query(&self, q: &Query, viewer: &str, text_cap: i64) -> Result<(Vec<Row>, bool)> {
+    pub fn query(&self, q: &Query, viewer: &Caller, text_cap: i64) -> Result<(Vec<Row>, bool)> {
         let mut wh = vec![visible_sql().to_string()];
-        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(viewer)))];
+        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))), Value::Text(viewer.key.clone())];
         if let Some(a) = q.after {
             wh.push("id > ?".into());
             args.push(Value::Integer(a));
@@ -358,7 +355,7 @@ impl Store {
     /// any of `subs`. Used by the inbox tool and MCPL backlog.
     pub fn addressed_page(
         &self,
-        viewer: &str,
+        viewer: &Caller,
         lo: i64,
         hi: i64,
         subs: &[String],
@@ -366,7 +363,7 @@ impl Store {
         ascending: bool,
         text_cap: i64,
     ) -> Result<Vec<Row>> {
-        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(viewer)))];
+        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))), Value::Text(viewer.key.clone())];
         args.push(Value::Integer(lo));
         args.push(Value::Integer(hi));
         let subs_sql = vec!["?"; subs.len().max(1)].join(", ");
@@ -392,7 +389,7 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn thread_rows(&self, viewer: &str, limit: i64) -> Result<Vec<serde_json::Value>> {
+    pub fn thread_rows(&self, viewer: &Caller, limit: i64) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(&format!(
             "SELECT m.thread, t.n, m.id, m.ts, m.sender, m.recipient, substr(m.text, 1, 300) AS snippet
@@ -401,7 +398,7 @@ impl Store {
             visible_sql()
         ))?;
         let rows = st
-            .query_map(params![format!(",{},", norm(viewer)), limit], |r| {
+            .query_map(params![format!(",{},", norm(&viewer.name)), viewer.key, limit], |r| {
                 Ok(json!({
                     "thread": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "id": r.get::<_, i64>(2)?,
                     "ts": r.get::<_, String>(3)?, "sender": r.get::<_, String>(4)?,
@@ -413,7 +410,7 @@ impl Store {
     }
 
     /// All rows of a thread the viewer may read, in the causal thread order every node agrees on.
-    pub fn thread_causal(&self, thread: &str, viewer: &str, text_cap: i64) -> Result<Vec<Row>> {
+    pub fn thread_causal(&self, thread: &str, viewer: &Caller, text_cap: i64) -> Result<Vec<Row>> {
         let rows: Vec<Row> = {
             let db = self.db.lock().unwrap();
             let mut st = db.prepare(&format!("SELECT {COLS} FROM messages WHERE thread = ?"))?;
@@ -636,13 +633,13 @@ impl Store {
     /// File references {id, name, type, size, key} the viewer may use: its own upload first, then the attachments with
     /// this id of messages it can read, oldest first. Several messages can name one blob, and a member node can write
     /// one naming someone else's blob with a wrong key, so callers use the first whose key opens the blob.
-    pub fn find_files(&self, id: &str, viewer: &str, viewer_sub: &str) -> Result<Vec<serde_json::Value>> {
+    pub fn find_files(&self, id: &str, viewer: &Caller) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
         let mut out = Vec::new();
         let up = db
             .query_row(
                 "SELECT name, type, size, key FROM uploads WHERE id = ? AND owner = ?",
-                [id, viewer_sub],
+                [id, &viewer.key],
                 |r| {
                     Ok(json!({ "id": id, "name": r.get::<_, String>(0)?, "type": r.get::<_, String>(1)?,
                                "size": r.get::<_, i64>(2)?, "key": r.get::<_, String>(3)? }))
@@ -655,7 +652,7 @@ impl Store {
             visible_sql()
         ))?;
         let rows: Vec<String> = st
-            .query_map(params![id, format!(",{},", norm(viewer))], |r| r.get(0))?
+            .query_map(params![id, format!(",{},", norm(&viewer.name)), viewer.key], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for files in rows {
             let v: serde_json::Value = serde_json::from_str(&files).unwrap_or(json!([]));

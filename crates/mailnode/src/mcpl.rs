@@ -179,18 +179,20 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
     while !c.closed {
         tokio::select! {
             m = stream.next() => match m {
+                _ if !c.node.active(&c.who) => c.close(4001, "session expired or membership changed"),
                 Some(Ok(Message::Text(t))) => c.frame(t.as_str()),
                 Some(Ok(Message::Binary(b))) => c.frame(&String::from_utf8_lossy(&b)),
                 Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
                 Some(Ok(_)) => {}
             },
             ev = events.recv() => match ev {
+                _ if !c.node.active(&c.who) => c.close(4001, "session expired or membership changed"),
                 Ok(row) => c.on_new(&row),
                 Err(broadcast::error::RecvError::Lagged(_)) => if c.ready && c.push_allowed() { c.flush_backlog() },
                 Err(_) => break,
             },
             k = kill.recv() => { if let Some((code, reason)) = k { c.close(code, &reason) } else { break } },
-            _ = tick.tick() => if c.who.exp_ms < now_millis() { c.close(4001, "token expired; dial again with a fresh one") },
+            _ = tick.tick() => if !c.node.active(&c.who) { c.close(4001, "token expired; dial again with a fresh one") },
         }
     }
     drop(c);
@@ -347,7 +349,7 @@ impl Conn {
         let cap = |v: &Value, d: i64| v.as_i64().unwrap_or(d).clamp(1, 100);
         let int = |v: &Value| v.as_i64().filter(|&x| x >= 0);
         let n = &self.node;
-        let me = &self.who.name;
+        let me = &self.who;
         match name {
             "send" => {
                 let body = json!({ "to": args["to"], "thread": args["thread"], "text": args["text"], "mode": args.get("mode").cloned().unwrap_or(Value::Null) });
@@ -376,9 +378,9 @@ impl Conn {
                 let limit = cap(&args["limit"], 20) as usize;
                 let before = int(&args["before"]).unwrap_or(i64::MAX);
                 let rows = match int(&args["after"]) {
-                    Some(after) => n.addressed_rows(me, &self.who.sub, after, before, limit, 2000, true)?,
+                    Some(after) => n.addressed_rows(me, after, before, limit, 2000, true)?,
                     None => {
-                        let mut r = n.addressed_rows(me, &self.who.sub, 0, before, limit, 2000, false)?;
+                        let mut r = n.addressed_rows(me, 0, before, limit, 2000, false)?;
                         r.reverse();
                         r
                     }
@@ -477,7 +479,7 @@ impl Conn {
         if !self.ready || !self.push_allowed() || self.node.subs_of(&self.who.sub).contains(&r.sender_sub) {
             return;
         }
-        if !self.addressed(r) || !r.visible_to(&self.who.name) {
+        if !self.addressed(r) || !r.visible_to(&self.who) {
             return;
         }
         self.push(r);
@@ -500,7 +502,7 @@ impl Conn {
             }
             Err(_) => return,
         };
-        let Ok(rows) = self.node.addressed_rows(&self.who.name, &sub, cur, i64::MAX, PUSH_BACKLOG + 1, PUSH_TEXT as i64, true)
+        let Ok(rows) = self.node.addressed_rows(&self.who, cur, i64::MAX, PUSH_BACKLOG + 1, PUSH_TEXT as i64, true)
         else {
             return;
         };

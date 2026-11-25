@@ -52,6 +52,7 @@ impl From<rusqlite::Error> for ApiError {
 /// Whoever presented a valid token.
 #[derive(Clone, Debug)]
 pub struct Caller {
+    pub key: String,
     pub name: String,
     pub sub: String,
     pub exp_ms: i64,
@@ -174,7 +175,12 @@ impl Node {
         }
         self.note_auth(&c.name, "agent-token");
         self.touch(&c.name, &c.sub);
-        Ok(Caller { name: c.name, sub: c.sub, exp_ms: c.exp_ms })
+        Ok(Caller { key: c.key, name: c.name, sub: c.sub, exp_ms: c.exp_ms })
+    }
+
+    pub fn active(&self, who: &Caller) -> bool {
+        who.exp_ms > now_millis() && self.members.read().unwrap().member_by_name(&who.name)
+            .is_some_and(|m| m.sub == who.sub && m.key == who.key)
     }
 
     /// Logs the first sign-in of each name with each kind of token (debug-level for every later one). Never the token.
@@ -222,6 +228,9 @@ impl Node {
     /* Writing */
 
     pub fn post(&self, who: &Caller, body: &Value) -> Result<Posted, ApiError> {
+        if !self.active(who) {
+            return Err(ApiError::new(401, "session expired or membership changed"));
+        }
         let bad_files = || ApiError::new(400, format!("files must be a list of at most {MAX_FILES} file ids from POST /api/files"));
         let file_ids: Vec<String> = match body.get("files") {
             None | Some(Value::Null) => vec![],
@@ -258,7 +267,7 @@ impl Node {
         let since = ts_from_millis(now_millis() - REPEAT_MS);
         if files.is_empty() {
             if let Some(row) = self.store.repeat(&who.sub, &since, &to, &thread, &text)? {
-                if row.mode == mode.as_str() {
+                if row.mode == mode.as_str() && row.visible_to(who) {
                     let reaches = self.reaches(&to, &who.sub)?;
                     return Ok(Posted { row, reaches, repeated: true });
                 }
@@ -316,7 +325,7 @@ impl Node {
                 // Canonical encoding (the one every node dedupes by); a client resending the same signed post gets
                 // the first copy back instead of a second envelope.
                 let sig = mailcore::b64u_decode(&sig).map(|b| mailcore::b64u(&b)).unwrap_or(sig);
-                if let Some(row) = self.store.by_agent_sig(&sig)? {
+                if let Some(row) = self.store.by_agent_sig(&sig)?.filter(|row| row.visible_to(who)) {
                     let reaches = self.reaches(&row.recipient, &who.sub)?;
                     return Ok(Posted { row, reaches, repeated: true });
                 }
@@ -387,14 +396,14 @@ impl Node {
             return Err(ApiError::new(413, format!("body is over {MAX_FILE} bytes")));
         }
         self.rate(&who.sub, "upload", 60)?;
-        if self.store.uploaded_bytes(&who.sub)? + data.len() as i64 > MAX_FILES_PER_SUB {
+        if self.store.uploaded_bytes(&who.key)? + data.len() as i64 > MAX_FILES_PER_SUB {
             return Err(ApiError::new(507, "you have stored the most attachments one sender may"));
         }
         let (blob, key) = mailcore::crypto::seal_blob(data)?;
         let id = blake3::hash(&blob).to_hex().to_string();
         let now = now_millis();
         self.store.put_blob(&id, &blob, now)?;
-        self.store.add_upload(&id, &who.sub, name, ty, data.len() as i64, &mailcore::b64u(&key), now)?;
+        self.store.add_upload(&id, &who.key, name, ty, data.len() as i64, &mailcore::b64u(&key), now)?;
         Ok(json!({ "id": id, "name": name, "type": ty, "size": data.len() }))
     }
 
@@ -402,7 +411,7 @@ impl Node {
     /// here: the first reference (own upload, then readable messages, oldest first) whose key opens the blob, so a
     /// message written with a wrong key for someone else's blob cannot shadow the real one.
     fn usable_file(&self, id: &str, who: &Caller) -> Result<Option<FileRef>, ApiError> {
-        let refs = self.store.find_files(id, &who.name, &who.sub)?;
+        let refs = self.store.find_files(id, who)?;
         let Some(first) = refs.first().cloned() else { return Ok(None) };
         let Some(blob) = self.store.get_blob(id)? else { return Ok(Some((first, None))) };
         for f in refs {
@@ -542,17 +551,16 @@ impl Node {
     /// Mail addressed to `name` with ids in (after, before), not sent by it; newest first unless `ascending`.
     pub fn addressed_rows(
         &self,
-        name: &str,
-        sub: &str,
+        who: &Caller,
         after: i64,
         before: i64,
         limit: usize,
         text_cap: i64,
         ascending: bool,
     ) -> Result<Vec<Row>> {
-        let names = self.names_of(name, sub);
+        let names = self.names_of(&who.name, &who.sub);
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-        let subs = self.subs_of(sub);
+        let subs = self.subs_of(&who.sub);
         let mut needles = vec!["all".to_string(), "*".to_string()];
         for n in &names {
             let n = norm(n);
@@ -569,7 +577,7 @@ impl Node {
         let mut rows = Vec::new();
         let mut scanned = 0;
         loop {
-            let page = self.store.addressed_page(name, lo, hi, &subs, &needles, ascending, text_cap)?;
+            let page = self.store.addressed_page(who, lo, hi, &subs, &needles, ascending, text_cap)?;
             if page.is_empty() {
                 break;
             }
@@ -837,6 +845,7 @@ mod tests {
             len: 0,
             files: "[]".into(),
             readers: None,
+            wrapped_to: String::new(),
             verified: true,
             imported: None,
             parents: vec![],
@@ -889,7 +898,7 @@ mod tests {
         assert_eq!(node.store.count().unwrap(), 2, "but kept, so day hashes agree with peers that have it");
         assert!(node.ingest(replay).unwrap().is_none());
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let (rows, _) = node.store.query(&crate::store::Query::default(), &who.name, MAX_TEXT).unwrap();
+        let (rows, _) = node.store.query(&crate::store::Query::default(), &who, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(node.store.unreadable(10).unwrap().is_empty(), "a hidden replay never asks for grants");
         // The same signature in another base64 spelling is refused outright.
@@ -928,7 +937,7 @@ mod tests {
         node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
             "signed": signed(&agent, "all", "t", "see file", std::slice::from_ref(&id), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
-        let bob = Caller { name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
+        let bob = Caller { key: fmt_key(&Seed::generate().public()), name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
         assert_eq!(bytes, b"real bytes");
     }
@@ -940,6 +949,24 @@ mod tests {
         let e = envelope(&stranger, &list, &agent, "spoof");
         assert!(node.ingest(e).is_err());
         assert_eq!(node.store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn rotating_an_agent_key_revokes_sessions_and_private_history() {
+        let (mut node, alice, _, _, _) = setup();
+        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
+        let file = node.upload(&who, "note", "text/plain", b"private").unwrap();
+        let private = node.post(&who, &json!({"to": "a.alice", "mode": "private", "text": "archive",
+                                              "files": [file["id"]]})).unwrap().row;
+        assert!(node.store.get(private.id, &who).unwrap().is_some());
+        let replacement = Seed::generate();
+        node.members.write().unwrap().members[0].key = fmt_key(&replacement.public());
+        assert!(!node.active(&who));
+        let fresh = node.verify(&agent_token(&replacement, &node.seed.public())).unwrap();
+        assert!(node.store.get(private.id, &fresh).unwrap().is_none());
+        assert!(node.store.query(&Default::default(), &fresh, MAX_TEXT).unwrap().0.is_empty());
+        assert!(node.download(file["id"].as_str().unwrap(), &fresh).is_err());
     }
 
     #[test]

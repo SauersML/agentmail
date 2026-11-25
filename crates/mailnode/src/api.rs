@@ -11,9 +11,8 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use mailcore::now_millis;
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::mcpl;
@@ -148,11 +147,11 @@ async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQ
     // Extension: order=causal gives one thread in the order every node agrees on (parents first, then (ts, id)).
     if p.get("order").map(|s| s.as_str()) == Some("causal") {
         let thread = q.thread.clone().ok_or_else(|| ApiError::new(400, "order=causal needs thread"))?;
-        let rows = s.node.store.thread_causal(&thread, &who.name, MAX_TEXT)?;
+        let rows = s.node.store.thread_causal(&thread, &who, MAX_TEXT)?;
         let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();
         return Ok(json_resp(json!({ "messages": msgs, "more": false, "last_id": s.node.store.last_id()? }), 200));
     }
-    let (rows, more) = s.node.store.query(&q, &who.name, MAX_TEXT)?;
+    let (rows, more) = s.node.store.query(&q, &who, MAX_TEXT)?;
     let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();
     Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200))
 }
@@ -185,7 +184,7 @@ async fn post(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Res
 
 async fn threads(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     let who = caller(&s, &headers)?;
-    Ok(json_resp(json!({ "threads": s.node.store.thread_rows(&who.name, 500)? }), 200))
+    Ok(json_resp(json!({ "threads": s.node.store.thread_rows(&who, 500)? }), 200))
 }
 
 async fn names(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
@@ -304,7 +303,7 @@ async fn stream(
         _ => s.node.store.last_id()?,
     };
     let mut rx = s.node.events.subscribe();
-    let (rows, more) = s.node.store.query(&Query { after: Some(after), ..Default::default() }, &who.name, MAX_TEXT)?;
+    let (rows, more) = s.node.store.query(&Query { after: Some(after), ..Default::default() }, &who, MAX_TEXT)?;
     let mut last = after;
     let mut first = String::from("retry: 2000\n: connected\n\n");
     for r in &rows {
@@ -322,24 +321,17 @@ async fn stream(
             loop {
                 tokio::select! {
                     ev = rx.recv() => match ev {
+                        Ok(_) if !node.active(&who) => break,
                         Ok(row) => {
-                            if row.id > last && row.visible_to(&who.name) {
+                            if row.id > last && row.visible_to(&who) {
                                 last = row.id;
                                 if tx.send(Ok(Bytes::from(sse_event(&row.to_message())))).await.is_err() { break; }
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            // Fell behind the event channel: refill from the store.
-                            let Ok((rows, _)) = node.store.query(&Query { after: Some(last), ..Default::default() }, &who.name, MAX_TEXT) else { break };
-                            for r in rows {
-                                last = last.max(r.id);
-                                if tx.send(Ok(Bytes::from(sse_event(&r.to_message())))).await.is_err() { return; }
                             }
                         }
                         Err(_) => break,
                     },
                     _ = beat.tick() => {
-                        if who.exp_ms < now_millis() { break; }
+                        if !node.active(&who) { break; }
                         if tx.send(Ok(Bytes::from_static(b": ping\n\n"))).await.is_err() { break; }
                     }
                     _ = tx.closed() => break,

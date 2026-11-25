@@ -37,6 +37,7 @@ pub struct Claims {
 /// A token that passed every check except the replay check, which needs the node's memory of used jtis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Checked {
+    pub key: String,
     pub name: String,
     pub sub: String,
     pub jti: String,
@@ -153,7 +154,7 @@ pub fn verify(token: &str, members: &MemberList, node: &PublicKey, now_ms: i64) 
     if c.name.is_empty() || c.sub.is_empty() {
         return Err(bad("missing sub or name"));
     }
-    Ok(Checked { name: m.name.clone(), sub: c.sub, jti: c.jti, exp_ms: exp })
+    Ok(Checked { key: fmt_key(&key), name: m.name.clone(), sub: c.sub, jti: c.jti, exp_ms: exp })
 }
 
 fn trunc(s: &str, n: usize) -> String {
