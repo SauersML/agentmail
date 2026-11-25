@@ -54,10 +54,6 @@ pub struct Config {
     /// accepts only agent tokens (signed by each member's own key) and needs no server at all.
     #[serde(default)]
     pub home: Option<HomeConfig>,
-    /// "disabled" (direct addresses only), "n0" (n0's public relays and address lookup), the URL of our own
-    /// iroh-relay (e.g. "http://203.0.113.7:3340"), or a list mixing URLs and "n0" (our relays first, n0 as fallback).
-    #[serde(default = "default_relay")]
-    pub relay: Relay,
     /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
     /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
     #[serde(default)]
@@ -94,25 +90,6 @@ fn default_floor() -> i64 {
 
 fn default_api() -> String {
     "127.0.0.1:8787".into()
-}
-#[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
-pub enum Relay {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl Relay {
-    pub fn entries(&self) -> Vec<String> {
-        match self {
-            Relay::One(s) => vec![s.clone()],
-            Relay::Many(v) => v.clone(),
-        }
-    }
-}
-
-fn default_relay() -> Relay {
-    Relay::One("disabled".into())
 }
 fn default_sync() -> u64 {
     30

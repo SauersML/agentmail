@@ -78,6 +78,9 @@ impl MemberList {
         }
         for n in &self.nodes {
             parse_key(&n.key)?;
+            for addr in &n.addrs {
+                addr.parse::<std::net::SocketAddr>().map_err(|_| anyhow!("invalid peer socket address {addr:?}"))?;
+            }
         }
         for b in &self.bridges {
             parse_key(b)?;
