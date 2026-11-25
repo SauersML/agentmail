@@ -430,7 +430,7 @@ impl Store {
     /// Anti-entropy: BLAKE3 over the sorted envelope ids of each day (the day is the envelope's ts date).
     pub fn day_hashes(&self) -> Result<BTreeMap<String, String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT day, env_id FROM messages WHERE attest = 'agent' ORDER BY day, env_id")?;
+        let mut st = db.prepare("SELECT day, env_id FROM messages WHERE attest = 'agent' AND json_extract(env, '$.v') = 2 ORDER BY day, env_id")?;
         let mut out = BTreeMap::new();
         let mut cur: Option<(String, blake3::Hasher, u64)> = None;
         let mut rows = st.query([])?;
@@ -456,14 +456,14 @@ impl Store {
 
     pub fn ids_for_day(&self, day: &str, after: &str, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND env_id > ? AND attest = 'agent' ORDER BY env_id LIMIT ?")?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND env_id > ? AND attest = 'agent' AND json_extract(env, '$.v') = 2 ORDER BY env_id LIMIT ?")?;
         let ids = st.query_map(params![day, after, limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
 
     pub fn envelopes(&self, ids: &[String]) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ? AND attest = 'agent'")?;
+        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ? AND attest = 'agent' AND json_extract(env, '$.v') = 2")?;
         let mut out = Vec::new();
         for id in ids {
             if let Some(e) = st.query_row([id], |r| r.get::<_, String>(0)).optional()? {
@@ -558,7 +558,7 @@ impl Store {
     /// Members-mode envelopes stored without a readable body (written before this node was on the member list).
     pub fn unreadable(&self, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' AND attest = 'agent' ORDER BY id LIMIT ?")?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE text IS NULL AND mode = 'members' AND attest = 'agent' AND json_extract(env, '$.v') = 2 ORDER BY id LIMIT ?")?;
         let out = st.query_map([limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(out)
     }

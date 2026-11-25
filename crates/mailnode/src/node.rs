@@ -297,10 +297,10 @@ impl Node {
                     .member_by_name(&who.name)
                     .ok_or_else(|| ApiError::new(403, format!("signed post: {} is not on the member list", who.name)))?;
                 let key = mailcore::keys::parse_key(&m.key)?;
-                let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
-                let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
+                let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
+                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids);
                 let sig = s["sig"].as_str().unwrap_or("").to_string();
-                let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, st.as_bytes(), &b));
+                let ok = mailcore::b64u_decode(&sig).is_some_and(|b| mailcore::keys::verify(&key, &st, &b));
                 if !ok {
                     return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key on the member list", who.name)));
                 }
@@ -328,9 +328,9 @@ impl Node {
                 }
                 let salt = mailcore::random_bytes::<16>();
                 let ts = now_ts();
-                let digest = mailcore::envelope::post_digest(&salt, &text, &file_ids);
-                let st = mailcore::envelope::post_statement(&who.name, &to, &thread, mode, &ts, &digest);
-                let sig = mailcore::b64u(&seed.sign(st.as_bytes()));
+                let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
+                let st = mailcore::envelope::post_statement(&members, &who.name, &to, &thread, mode, &ts, &digest, &file_ids);
+                let sig = mailcore::b64u(&seed.sign(&st));
                 (ts, Attest::Agent { key, digest, sig }, mailcore::b64u(&salt))
             }
         };
@@ -703,9 +703,9 @@ mod tests {
     fn envelope(writer: &Seed, list: &MemberList, agent: &Seed, text: &str) -> Envelope {
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, text, &[]);
-        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
-        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(st.as_bytes())) };
+        let digest = mailcore::envelope::post_digest(&salt, text, &[]).unwrap();
+        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[]);
+        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
         Envelope::seal(
             Draft {
@@ -777,9 +777,9 @@ mod tests {
         let (node, alice, node_b, list, _rx) = setup();
         let ts = now_ts();
         let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]);
-        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
-        let sig = mailcore::b64u(&alice.sign(st.as_bytes()));
+        let digest = mailcore::envelope::post_digest(&salt, "deploy now", &[]).unwrap();
+        let st = mailcore::envelope::post_statement(&list, "a.alice", "all", "t", Mode::Members, &ts, &digest, &[]);
+        let sig = mailcore::b64u(&alice.sign(&st));
         let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
         let seal = |parents: Vec<String>, sig: String| {
             Envelope::seal(
@@ -824,7 +824,7 @@ mod tests {
         let id = f["id"].as_str().unwrap().to_string();
         let ts = now_ts();
         let post = json!({ "to": "all", "thread": "t", "text": "with file", "files": [id],
-                           "signed": signed(&alice, "all", "t", "with file", std::slice::from_ref(&id), &ts) });
+                           "signed": signed(&_l, &alice, "all", "t", "with file", std::slice::from_ref(&f), &ts) });
         let p1 = node.post(&who, &post).unwrap();
         let p2 = node.post(&who, &post).unwrap();
         assert!(!p1.repeated && p2.repeated);
@@ -845,7 +845,7 @@ mod tests {
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": mailcore::b64u(&[7u8; 32]) }]);
         node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
         node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
-            "signed": signed(&agent, "all", "t", "see file", std::slice::from_ref(&id), &now_ts()) })).unwrap();
+            "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
         let bob = Caller { key: fmt_key(&Seed::generate().public()), name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
@@ -900,11 +900,12 @@ mod tests {
         assert!(p3.row.id > p.row.id);
     }
 
-    fn signed(alice: &Seed, to: &str, thread: &str, text: &str, files: &[String], ts: &str) -> Value {
+    fn signed(list: &MemberList, alice: &Seed, to: &str, thread: &str, text: &str, files: &[Value], ts: &str) -> Value {
         let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, text, files);
-        let st = mailcore::envelope::post_statement("a.alice", to, thread, Mode::Members, ts, &digest);
-        json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(st.as_bytes())) })
+        let digest = mailcore::envelope::post_digest(&salt, text, files).unwrap();
+        let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
+        let st = mailcore::envelope::post_statement(list, "a.alice", to, thread, Mode::Members, ts, &digest, &ids);
+        json!({ "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(&st)) })
     }
 
     #[test]
@@ -913,21 +914,21 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let ts = now_ts();
         let p = node
-            .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&alice, "all", "t", "signed", &[], &ts) }))
+            .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
         assert_eq!(p.row.attest, "agent");
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest::Agent { .. }));
         assert_eq!(e.ts, ts);
         // A signature over other text, or by another key, is refused.
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&alice, "all", "t", "orig", &[], &ts) }));
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
         assert_eq!(bad.err().unwrap().status, 401);
         let mallory = Seed::generate();
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x", "signed": signed(&mallory, "all", "t", "x", &[], &ts) }));
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x", "signed": signed(&_l, &mallory, "all", "t", "x", &[], &ts) }));
         assert_eq!(bad.err().unwrap().status, 401);
         // Old timestamps are refused.
         let old = ts_from_millis(now_millis() - 3_600_000);
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&alice, "all", "t", "y", &[], &old) }));
+        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&_l, &alice, "all", "t", "y", &[], &old) }));
         assert_eq!(bad.err().unwrap().status, 400);
     }
 
@@ -965,9 +966,15 @@ mod tests {
         let ts = now_ts();
         let p = node
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
-                                 "signed": signed(&alice, "all", "t", "see file", &[id.clone()], &ts) }))
+                                 "signed": signed(&_l, &alice, "all", "t", "see file", std::slice::from_ref(&f), &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
+        let body = e.open(&node.seed).unwrap().unwrap();
+        for (field, replacement) in [("name", json!("different.txt")), ("type", json!("application/json")), ("size", json!(1))] {
+            let mut changed = body.clone();
+            changed.files[0][field] = replacement;
+            assert!(e.check_body(&changed).is_err());
+        }
         assert_eq!(e.blobs, vec![id.clone()]);
         let m = p.row.to_message();
         assert_eq!(m["files"][0]["id"], json!(id));
@@ -979,15 +986,6 @@ mod tests {
 
     fn agent_token(seed: &Seed, aud: &mailcore::keys::PublicKey) -> String {
         mailcore::agent_token::mint(seed, "a.alice", "agent:alice@t", aud, now_millis(), 600)
-    }
-
-    fn signed_body(alice: &Seed, text: &str) -> Value {
-        let ts = now_ts();
-        let salt = mailcore::random_bytes::<16>();
-        let digest = mailcore::envelope::post_digest(&salt, text, &[]);
-        let st = mailcore::envelope::post_statement("a.alice", "all", "t", Mode::Members, &ts, &digest);
-        json!({ "to": "all", "thread": "t", "text": text,
-                "signed": { "ts": ts, "salt": mailcore::b64u(&salt), "sig": mailcore::b64u(&alice.sign(st.as_bytes())) } })
     }
 
     #[test]
@@ -1011,7 +1009,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &me)).unwrap();
         let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
         assert_eq!(e.status, 400, "{}", e.message);
-        let p = node.post(&who, &signed_body(&alice, "signed")).unwrap();
+        let p = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
         assert_eq!(p.row.attest, "agent");
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");

@@ -50,7 +50,7 @@ On each host, save this as `config.json`. Relative paths resolve from the config
 }
 ```
 
-Upgrade peers together for sync protocol version 2 and use the configuration fields shown above. Obsolete keys are rejected. When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain historical rows on disk. The API and replication expose agent-signed mail. Private reads also require a recipient key from the original envelope. Older unattached uploads must be uploaded again to establish key ownership.
+Upgrade nodes and clients together for envelope and sync protocol version 2 and use the configuration fields shown above. Obsolete keys are rejected. When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain historical rows on disk. The API retains readable historical agent-signed mail. Peers replicate only version 2 envelopes. Private reads also require a recipient key from the original envelope. Older unattached uploads must be uploaded again to establish key ownership.
 
 Run `mailnode run config.json`. To change membership, increment `seq`, sign again and place the new list on a running peer. It distributes the signed update. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
 
@@ -76,7 +76,7 @@ Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads
 
 ## Security and storage
 
-The node checks the operator signature on membership, the writing peer's signature on each incoming envelope and the sender's signature on the message. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients.
+The node checks the operator signature on membership, the writing peer's signature on each incoming envelope and the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients.
 
 The local node handles plaintext and keeps readable messages and attachment keys in SQLite. Protect its data directory, backups and agent key files. A compromised endpoint can read its local plaintext or sign as the identities whose seeds it holds. Peer operators control availability and may drop or delay messages.
 

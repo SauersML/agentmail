@@ -9,7 +9,7 @@ use crate::keys::{self, fmt_key, parse_key, PublicKey, Seed};
 use crate::members::MemberList;
 use crate::{b64u, b64u_decode, parse_ts};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 pub const MAX_CIPHERTEXT: usize = 512 * 1024;
@@ -18,7 +18,7 @@ pub const MAX_KEYS: usize = 1000;
 pub const MAX_BLOBS: usize = 10;
 /// An envelope dated further than this past the receiver's clock is refused (it will be fetched again later).
 pub const FUTURE_SKEW_MS: i64 = 10 * 60 * 1000;
-const SIG_CONTEXT: &[u8] = b"agent-mail/envelope/v1\n";
+const SIG_CONTEXT: &[u8] = b"agent-mail/envelope/v2\n";
 const AD_CONTEXT: &str = "agent-mail/body/v1";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -43,26 +43,31 @@ impl Mode {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Attest {
-    /// Signed by the sender's own Ed25519 key (the member list's key for `from`) over `post_statement`:
-    /// the header fields and `digest` = hex SHA-256(salt || text || 0x00 || comma-joined blob ids). The salt is in
-    /// the encrypted body, so the digest cannot be used to guess short texts.
+    /// The sender signs the network, routing fields, attachment IDs and salted body digest.
     Agent { key: String, digest: String, sig: String },
 }
 
-/// What the sender's key signs. Plain text so clients without a JSON canonicalizer (islandmail.py) build it exactly.
-pub fn post_statement(from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str) -> String {
-    format!("agent-mail-post|v1|{from}|{to}|{thread}|{}|{ts}|{digest}", mode.as_str())
+pub fn post_statement(members: &MemberList, from: &str, to: &str, thread: &str, mode: Mode, ts: &str, digest: &str, blobs: &[String]) -> Vec<u8> {
+    let sub = members.member_by_name(from).map_or("", |m| m.sub.as_str());
+    let topic = members.topic();
+    let mut fields: Vec<&[u8]> = vec![b"agent-mail/post/v2", &topic, from.as_bytes(), sub.as_bytes(),
+        to.as_bytes(), thread.as_bytes(), mode.as_str().as_bytes(), ts.as_bytes(), digest.as_bytes()];
+    fields.extend(blobs.iter().map(|s| s.as_bytes()));
+    crate::paseto::pae(&fields)
 }
 
-/// hex SHA-256(salt || text || 0x00 || blob ids joined by ",")
-pub fn post_digest(salt: &[u8], text: &str, blob_ids: &[String]) -> String {
+/// Hash the encrypted body's public-facing fields using the same length framing as the signature.
+pub fn post_digest(salt: &[u8], text: &str, files: &[serde_json::Value]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(salt);
-    h.update(text.as_bytes());
-    h.update([0u8]);
-    h.update(blob_ids.join(",").as_bytes());
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    h.update(crate::paseto::pae(&[b"agent-mail/body-digest/v2", salt, text.as_bytes()]));
+    for file in files {
+        let field = |k: &str| file[k].as_str().ok_or_else(|| anyhow!("invalid attachment {k}"));
+        let size = file["size"].as_u64().ok_or_else(|| anyhow!("invalid attachment size"))?;
+        h.update(crate::paseto::pae(&[field("id")?.as_bytes(), field("name")?.as_bytes(),
+            field("type")?.as_bytes(), &size.to_le_bytes()]));
+    }
+    Ok(format!("{:x}", h.finalize()))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -100,7 +105,7 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blobs: Vec<String>,
     pub attest: Attest,
-    /// The writing node's key (or the bridge's, for imports).
+    /// The writing node's key.
     pub node: String,
     pub sig: String,
 }
@@ -109,8 +114,7 @@ pub struct Envelope {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct Body {
     pub text: String,
-    /// Attachments: {id (blob id), name, type, size, key (b64url blob key)}; imported rows keep the old server's
-    /// file metadata ({id, name, type, size, old: true}).
+    /// Each attachment contains its ciphertext ID, name, media type, byte size and secret blob key.
     #[serde(default)]
     pub files: Vec<serde_json::Value>,
     /// b64url salt of the sender's digest (Attest::Agent only).
@@ -289,19 +293,13 @@ impl Envelope {
                 if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
                     bail!("bad digest");
                 }
-                // The statement joins from, to and thread with '|'. With none in from or to (the API never allows one in
-                // to) it splits one way only; otherwise a node could move text between to and thread under the same
-                // signature (e.g. to "all", thread "x|y" re-labelled to "all|x", thread "y").
-                if self.from.contains('|') || self.to.contains('|') {
-                    bail!("from and to of a signed message cannot contain '|'");
-                }
-                let st = post_statement(&self.from, &self.to, &self.thread, self.mode, &self.ts, digest);
+                let st = post_statement(members, &self.from, &self.to, &self.thread, self.mode, &self.ts, digest, &self.blobs);
                 let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
                 // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
                 if b64u(&s) != *sig {
                     bail!("sender signature is not canonical base64url");
                 }
-                if !keys::verify(&k, st.as_bytes(), &s) {
+                if !keys::verify(&k, &st, &s) {
                     bail!("sender signature does not verify");
                 }
                 Ok(Verified { sender_sub: m.sub.clone() })
@@ -319,7 +317,7 @@ impl Envelope {
         }
         let Attest::Agent { digest, .. } = &self.attest;
         let salt = b64u_decode(&body.salt).filter(|s| s.len() == 16).ok_or_else(|| anyhow!("invalid salt length"))?;
-        if &post_digest(&salt, &body.text, &self.blobs) != digest {
+        if &post_digest(&salt, &body.text, &body.files)? != digest {
             bail!("body does not match the sender's signed digest");
         }
         Ok(())
@@ -355,8 +353,8 @@ mod tests {
         let ts = crate::now_ts();
         let salt = crate::random_bytes::<16>();
         let body = Body { text: format!("hi from {from}"), salt: b64u(&salt), files: vec![] };
-        let digest = post_digest(&salt, &body.text, &[]);
-        let sig = b64u(&signer.sign(post_statement(from, to, "t", mode, &ts, &digest).as_bytes()));
+        let digest = post_digest(&salt, &body.text, &[]).unwrap();
+        let sig = b64u(&signer.sign(&post_statement(&w.members, from, to, "t", mode, &ts, &digest, &[])));
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
             Mode::Private => w.members.private_keys(to, from),
@@ -382,9 +380,9 @@ mod tests {
     /// An envelope signed by `signer` as `from` (the agent-key path), with the given body text.
     fn signed_env(w: &World, from: &str, signer: &Seed, text: &str, ts: String) -> Envelope {
         let salt = crate::random_bytes::<16>();
-        let digest = post_digest(&salt, text, &[]);
-        let st = post_statement(from, "all", "t", Mode::Members, &ts, &digest);
-        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(st.as_bytes())) };
+        let digest = post_digest(&salt, text, &[]).unwrap();
+        let st = post_statement(&w.members, from, "all", "t", Mode::Members, &ts, &digest, &[]);
+        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)) };
         let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
         Envelope::seal(
             Draft {
@@ -438,10 +436,10 @@ mod tests {
         let now = crate::now_millis();
         let ts = crate::now_ts();
         let salt = crate::random_bytes::<16>();
-        let digest = post_digest(&salt, "hi", &[]);
+        let digest = post_digest(&salt, "hi", &[]).unwrap();
         // alice signs to "all", thread "x|y".
-        let st = post_statement("a.alice", "all", "x|y", Mode::Members, &ts, &digest);
-        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(st.as_bytes())) };
+        let st = post_statement(&w.members, "a.alice", "all", "x|y", Mode::Members, &ts, &digest, &[]);
+        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)) };
         let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
         let mk = |to: &str, thread: &str| {
             Envelope::seal(
@@ -462,9 +460,10 @@ mod tests {
             .unwrap()
         };
         assert!(mk("all", "x|y").verify(&w.members, now).is_ok(), "'|' in the thread is fine");
-        // The same statement re-split by the node: to "all|x", thread "y".
-        assert_eq!(post_statement("a.alice", "all|x", "y", Mode::Members, &ts, "d"), post_statement("a.alice", "all", "x|y", Mode::Members, &ts, "d"));
-        assert!(mk("all|x", "y").verify(&w.members, now).unwrap_err().to_string().contains("'|'"));
+        assert!(mk("all|x", "y").verify(&w.members, now).unwrap_err().to_string().contains("sender signature"));
+        let mut other_network = w.members.clone();
+        other_network.network.push_str("-other");
+        assert!(mk("all", "x|y").verify(&other_network, now).unwrap_err().to_string().contains("sender signature"));
     }
 
     #[test]

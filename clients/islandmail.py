@@ -205,20 +205,23 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
         raise Fail("cannot reach %s (%s)" % (urllib.parse.urlsplit(url).netloc, e.reason))
 
 
-_node_key = {}
+_node_info = {}
+
+
+def node_info():
+    if MAIL not in _node_info:
+        info = http("GET", MAIL + "/api/node")
+        if info.get("envelope_version") != 2 or "agent-token" not in info.get("auth", []):
+            raise Fail("node must support envelope version 2 and agent tokens")
+        pin = os.environ.get("ISLANDMAIL_NODE_KEY", "").strip()
+        if pin and info.get("node") != pin:
+            raise Fail("node public key does not match ISLANDMAIL_NODE_KEY")
+        _node_info[MAIL] = info
+    return _node_info[MAIL]
 
 
 def node_key():
-    # The node's public key, which an agent token names as its audience. Pinned by ISLANDMAIL_NODE_KEY, or asked of the
-    # node once per run (GET /api/node needs no token; a token for the wrong key works nowhere else either).
-    if os.environ.get("ISLANDMAIL_NODE_KEY"):
-        return os.environ["ISLANDMAIL_NODE_KEY"].strip()
-    if MAIL not in _node_key:
-        info = http("GET", MAIL + "/api/node")
-        if "agent-token" not in info.get("auth", []) or not str(info.get("node", "")).startswith("ed25519:"):
-            raise Fail("%s does not take agent tokens" % MAIL)
-        _node_key[MAIL] = info["node"]
-    return _node_key[MAIL]
+    return os.environ.get("ISLANDMAIL_NODE_KEY", "").strip() or node_info()["node"]
 
 
 def token_for(ident, ttl=REQUEST_TTL):
@@ -326,31 +329,34 @@ def norm_text(s):
     return _BIDI.sub("", _CTRL.sub("", s))
 
 
-def signed_block(ident, to, thread, text, ids, mode):
-    # digest = SHA-256(salt || text || 0x00 || file ids joined by ",").
+def signed_block(ident, to, thread, text, files, mode):
     seed = bytes.fromhex(ident["seed"])
     now = datetime.datetime.now(datetime.timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
     salt = os.urandom(16)
-    digest = hashlib.sha256(salt + text.encode() + b"\x00" + ",".join(ids).encode()).hexdigest()
-    statement = "agent-mail-post|v1|%s|%s|%s|%s|%s|%s" % (ident["name"], to, thread, mode, ts, digest)
-    return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement.encode()))}
+    digest = hashlib.sha256(pae(b"agent-mail/body-digest/v2", salt, text.encode()))
+    for f in files:
+        digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))
+    topic = base64.urlsafe_b64decode(node_info()["network_id"] + "=")
+    header = [ident["name"], ident["sub"], to, thread, mode, ts, digest.hexdigest()]
+    statement = pae(b"agent-mail/post/v2", topic, *(s.encode() for s in header), *(f["id"].encode() for f in files))
+    return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
 
 
 def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
     to, thread = norm_field(a.to), norm_field(a.thread)
     mode = "private" if getattr(a, "private", False) else "members"
-    ids = []
+    files = []
     for path in a.file or []:
         with open(path, "rb") as f:
             data = f.read()
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), data,
                 {"Content-Type": ctype}, timeout=300)
-        ids.append(r["file"]["id"])
-    body = {"to": to, "thread": thread, "text": text, "files": ids,
-            "signed": signed_block(ident, to, thread, text, ids, mode)}
+        files.append(r["file"])
+    body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files],
+            "signed": signed_block(ident, to, thread, text, files, mode)}
     if mode == "private":
         body["mode"] = "private"
     r = api(ident, "POST", "/api/messages", body)

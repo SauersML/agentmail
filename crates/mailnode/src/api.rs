@@ -117,10 +117,11 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
 
 /// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
 async fn node_info(State(s): State<AppState>) -> Response {
-    let network = s.node.members.read().unwrap().network.clone();
+    let members = s.node.members.read().unwrap();
     json_resp(
-        json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": network,
-                "members_seq": s.node.members_seq(), "auth": ["agent-token"],
+        json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": mailcore::b64u(&members.topic()),
+                "envelope_version": mailcore::envelope::VERSION,
+                "members_seq": members.seq, "auth": ["agent-token"],
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",
                                  "max_lifetime_s": mailcore::agent_token::MAX_LIFETIME_S } }),
         200,
