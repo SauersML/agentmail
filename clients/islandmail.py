@@ -30,6 +30,7 @@ import json
 import mimetypes
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -113,7 +114,7 @@ def ensure_dir(path):
     os.makedirs(path, mode=0o700, exist_ok=True)
 
 
-def write_private(path, data):
+def write_private(path, data, *, create=False):
     # A fresh temporary file per write (two watchers never share one), readable only by you, on disk before the rename.
     folder = os.path.dirname(path)
     ensure_dir(folder)
@@ -124,25 +125,23 @@ def write_private(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        try:
+        if create:
+            os.link(tmp, path)
+        else:
+            os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
             os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+
+
+def safe_name(name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
+        raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens")
+    return name
 
 
 def ident_path(name):
-    return os.path.join(DIR, "identities", name + ".json")
-
-
-def _check_private(path):
-    # A key file other users can read is a leaked key: refuse it rather than use it.
-    if os.name == "posix":
-        mode = os.stat(path).st_mode & 0o777
-        if mode & 0o077:
-            raise Fail("%s holds your private key but has mode %o; run: chmod 600 %s" % (path, mode, path))
+    return os.path.join(DIR, "identities", safe_name(name) + ".json")
 
 
 def load_identity(name):
@@ -158,9 +157,16 @@ def load_identity(name):
         else:
             raise Fail("several identities here (%s): pick one with --as NAME" % ", ".join(have))
     try:
-        _check_private(ident_path(name))
-        with open(ident_path(name)) as f:
-            return json.load(f)
+        fd = os.open(ident_path(name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd) as f:
+            mode = os.fstat(fd).st_mode
+            if not stat.S_ISREG(mode) or mode & 0o077:
+                raise Fail("identity must be a regular file accessible only to its owner (mode 600)")
+            ident = json.load(f)
+        if (not isinstance(ident, dict) or ident.get("name") != name or not ident.get("sub")
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", str(ident.get("seed", "")))):
+            raise Fail("invalid identity file for %s" % name)
+        return ident
     except FileNotFoundError:
         raise Fail("no identity named %s in %s" % (name, folder))
 
@@ -171,7 +177,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise urllib.error.HTTPError(req.full_url, code, "unexpected redirect to %s" % newurl[:200], headers, fp)
 
 
-_opener = urllib.request.build_opener(_NoRedirect)
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
 def http(method, url, body=None, headers=None, raw=False, timeout=60):
@@ -273,15 +279,11 @@ def show(m, out=sys.stdout):
 def cmd_newkey(a):
     # An identity with no home: a fresh key, your name and a durable sub. The operator adds the printed entry to the
     # member list and re-signs it; then any node of the network lets you in with agent tokens.
-    name = a.name
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
-        raise Fail("name: 1-48 characters, letters, digits and . _ -")
-    if os.path.exists(ident_path(name)):
-        raise Fail("%s already exists in %s" % (name, DIR))
+    name = safe_name(a.name)
     seed = os.urandom(32)
     kid = "ed25519:" + b64u(ed25519_public(seed))
     sub = a.sub or "agent:%s" % name
-    write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1))
+    write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1), create=True)
     sys.stderr.write("key saved in %s; give the operator this member-list entry:\n" % ident_path(name))
     print(json.dumps({"name": name, "sub": sub, "key": kid}))
 
@@ -431,16 +433,18 @@ def cmd_get(a):
 
 def cmd_download(a):
     ident = load_identity(a.as_)
+    if not re.fullmatch(r"[a-f0-9]{64}", a.file_id):
+        raise Fail("file_id must be a lowercase 64-digit content hash")
     data = api(ident, "GET", "/api/files/%s?download=1" % a.file_id, raw=True, timeout=300)
     out = a.o or a.file_id
-    with open(out, "wb") as f:
+    with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as f:
         f.write(data)
     print("saved %d bytes to %s" % (len(data), out))
 
 
 def cmd_watch(a):
     ident = load_identity(a.as_)
-    resume = os.path.join(DIR, "watch-%s-%s.last" % (ident["name"], a.name))
+    resume = os.path.join(DIR, "watch-%s-%s-%s.last" % (hashlib.sha256(node_key().encode()).hexdigest(), ident["name"], safe_name(a.name)))
     try:
         with open(resume) as f:
             after = int(f.read().strip())
@@ -536,7 +540,7 @@ def main():
     a = ap.parse_args()
     try:
         a.fn(a)
-    except Fail as e:
+    except (Fail, OSError, ValueError) as e:
         sys.stderr.write("islandmail: %s\n" % e)
         sys.exit(1)
     except KeyboardInterrupt:
