@@ -10,9 +10,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks, WeakConnectionHandle};
+use iroh::endpoint::{presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, EndpointHooks, WeakConnectionHandle};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
@@ -91,9 +91,18 @@ impl MemberGate {
 }
 
 impl EndpointHooks for MemberGate {
+    async fn before_connect<'a>(&'a self, addr: &'a EndpointAddr, _alpn: &'a [u8]) -> BeforeConnectOutcome {
+        if self.node.members.read().unwrap().is_node(addr.id.as_bytes()) {
+            BeforeConnectOutcome::Accept
+        } else {
+            BeforeConnectOutcome::Reject
+        }
+    }
+
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
-        if self.node.members.read().unwrap().is_node(id.as_bytes()) {
+        let members = self.node.members.read().unwrap();
+        if members.is_node(id.as_bytes()) {
             let mut open = self.open.lock().unwrap();
             open.retain(|w| w.upgrade().is_some());
             open.push(conn.weak_handle());
@@ -206,18 +215,19 @@ struct Ctx {
     endpoint: Endpoint,
     node: Arc<Node>,
     lookup: MemoryLookup,
+    relays: Vec<RelayUrl>,
     sender: GossipSender,
     gate: MemberGate,
 }
 
 impl Ctx {
     fn peers(&self) -> Vec<EndpointId> {
-        peers(&self.node, &self.lookup)
+        peers(&self.node, &self.lookup, &self.relays)
     }
 }
 
 /// Other member nodes, with their listed addresses added to the address book.
-fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
+fn peers(node: &Node, lookup: &MemoryLookup, relays: &[RelayUrl]) -> Vec<EndpointId> {
     {
         let me = node.seed.public();
         let members = node.members.read().unwrap().clone();
@@ -234,7 +244,10 @@ fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
                     a = a.with_ip_addr(sa);
                 }
             }
-            lookup.add_endpoint_info(a);
+            for url in relays {
+                a = a.with_relay_url(url.clone());
+            }
+            lookup.set_endpoint_info(a);
             out.push(id);
         }
         out
@@ -351,29 +364,58 @@ fn trust_message(node: &Node, raw: &[u8]) -> Option<Result<bool>> {
     }
 }
 
-pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
+fn relay_mode(entries: &[String]) -> Result<RelayMode> {
+    if entries.is_empty() { return Ok(RelayMode::Disabled); }
+    if entries == ["n0"] { return Ok(RelayMode::Default); }
+    let map = RelayMap::empty();
+    for entry in entries {
+        if entry == "n0" {
+            map.extend(&RelayMode::Default.relay_map());
+        } else {
+            let url: RelayUrl = entry.parse().context("invalid relay URL")?;
+            anyhow::ensure!(matches!(url.scheme(), "http" | "https") && url.host().is_some()
+                && url.username().is_empty() && url.password().is_none()
+                && url.path() == "/" && url.query().is_none() && url.fragment().is_none(),
+                "relay must be n0 or an HTTP(S) origin without credentials");
+            map.insert(url.clone(), Arc::new(url.into()));
+        }
+    }
+    Ok(RelayMode::Custom(map))
+}
+
+pub async fn start(cfg: &Config, node: Arc<Node>, outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
+    let builder = Endpoint::builder(presets::Minimal)
+        .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.iroh_port))?;
+    start_with(builder, cfg, node, outbound).await
+}
+
+async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
-    let endpoint = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
+    let mode = relay_mode(&cfg.relay)?;
+    let relays = mode.relay_map().urls::<Vec<_>>();
+    let endpoint = builder
+        .relay_mode(mode)
         .secret_key(SecretKey::from_bytes(node.seed.bytes()))
-        .address_lookup(lookup.clone())
         .hooks(gate.clone())
-        .bind_addr(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, cfg.iroh_port))?
         .bind()
         .await?;
     tracing::info!("iroh endpoint {} bound", endpoint.id());
 
     let gossip = Gossip::builder().max_message_size(MAX_GOSSIP).spawn(endpoint.clone());
+    // Gossip installs a lookup that accepts relay hints from other peers. Keep dialing under local policy.
+    let services = endpoint.address_lookup()?;
+    services.clear();
+    services.add(lookup.clone());
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(SYNC_ALPN, SyncProto { node: node.clone() })
         .spawn();
 
     let topic = TopicId::from_bytes(node.members.read().unwrap().topic());
-    let first = peers(&node, &lookup);
+    let first = peers(&node, &lookup, &relays);
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
-    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender, gate };
+    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, relays, sender, gate };
 
     // Gossip delivers envelopes between periodic syncs.
     let c = ctx.clone();
@@ -481,6 +523,90 @@ mod tests {
     use mailcore::envelope::Draft;
     use mailcore::keys::{fmt_key, Seed};
     use mailcore::{Attest, Body, Mode, NodeEntry, Verified};
+
+    #[test]
+    fn relay_selection_is_opt_in() {
+        assert_eq!(relay_mode(&[]).unwrap(), RelayMode::Disabled);
+        assert_eq!(relay_mode(&["n0".into()]).unwrap(), RelayMode::Default);
+        let custom = "https://relay.example.org";
+        let url = custom.parse::<RelayUrl>().unwrap();
+        let only = relay_mode(&[custom.into()]).unwrap().relay_map();
+        assert_eq!(only.urls::<Vec<_>>(), vec![url.clone()]);
+        let mixed = relay_mode(&["n0".into(), custom.into()]).unwrap().relay_map();
+        assert!(mixed.contains(&url));
+        assert_eq!(mixed.len(), RelayMode::Default.relay_map().len() + 1);
+        for bad in ["", "garbage", "file:///tmp", "https://user:pass@relay.test", "https://relay.test/?secret"] {
+            assert!(relay_mode(&[bad.into()]).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_nodes_sync_over_a_relay_without_udp() -> Result<()> {
+        use iroh_relay::server::{RelayConfig, Server, ServerConfig};
+        let mut server = ServerConfig::default();
+        server.relay = Some(RelayConfig::new((Ipv4Addr::LOCALHOST, 0)));
+        let relay = Server::spawn(server).await?;
+        let url = format!("http://{}", relay.http_addr().unwrap());
+        let dir = std::env::temp_dir().join(format!("mailnode-relay-{}", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        std::fs::create_dir(&dir)?;
+        let file = dir.join("members.json");
+        let keys = [Seed::generate(), Seed::generate()];
+        let agents = [Seed::generate(), Seed::generate()];
+        let network = mailcore::b64u(&mailcore::random_bytes::<32>());
+        let list = mailcore::MemberList {
+            v: 2, network: network.clone(), seq: 1,
+            members: vec![mailcore::Member { name: "a1".into(), sub: "agent:a1".into(), key: fmt_key(&agents[1].public()) }],
+            nodes: keys.iter().enumerate().map(|(i, key)| NodeEntry {
+                name: format!("n{i}"), key: fmt_key(&key.public()), addrs: vec![], names: vec![format!("a{i}")]
+            }).collect(),
+        };
+        std::fs::write(&file, serde_json::to_vec(&list)?)?;
+        let cfg = serde_json::from_value(serde_json::json!({
+            "data_dir": dir, "members_file": file, "node_key_file": "unused", "relay": [url], "sync_secs": 1
+        }))?;
+        let mut hosts = Vec::new();
+        for (i, key) in keys.into_iter().enumerate() {
+            let (tx, rx) = mpsc::channel(4);
+            let opts = Opts { identities: vec![(format!("a{i}"), agents[i].clone())], ..Opts::default() };
+            let node = Arc::new(Node::new(Store::open(&dir.join(format!("{i}.sqlite")))?, list.clone(), key, opts, tx));
+            node.certify_identities();
+            let net = start_with(Endpoint::builder(presets::Minimal).clear_ip_transports(), &cfg, node.clone(), rx).await?;
+            hosts.push((node, net));
+        }
+        let (sender, _) = &hosts[0];
+        let tok = mailcore::agent_token::mint(&agents[0], "a0", "agent:a0", &sender.seed.public(), mailcore::now_millis(), 60);
+        let who = sender.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
+        let mail = sender.post(&who, &serde_json::json!({"to": "all", "text": "relay delivery"}))
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while !hosts[1].0.store.has(&mail.row.env_id)? {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            anyhow::Ok(())
+        }).await??;
+        let (reader, net) = &hosts[1];
+        let tok = mailcore::agent_token::mint(&agents[1], "a1", "agent:a1", &reader.seed.public(), mailcore::now_millis(), 60);
+        let who = reader.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
+        assert_eq!(reader.store.get(1, &who)?.unwrap().text.as_deref(), Some("relay delivery"));
+        let remote = &net.endpoint;
+        tokio::time::timeout(Duration::from_secs(10), remote.online()).await?;
+        assert!(remote.addr().relay_urls().next().is_some());
+        assert!(remote.addr().ip_addrs().next().is_none());
+        let peer = hosts[0].1.endpoint.connect(remote.id(), SYNC_ALPN).await?;
+        let certs = call(&peer, &network, &Req::Certs).await?.certs;
+        assert!(certs.iter().any(|c| c.name == "a1"));
+        let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
+            .relay_mode(relay_mode(&cfg.relay)?).bind().await?;
+        let attempt = tokio::time::timeout(Duration::from_secs(10), async {
+            let conn = outsider.connect(remote.addr(), SYNC_ALPN).await?;
+            call(&conn, &network, &Req::Days).await
+        }).await?;
+        assert!(attempt.is_err(), "an unpinned node got a sync response through the relay");
+        outsider.close().await;
+        for (_, net) in hosts { net.router.shutdown().await?; }
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn get_answers_stay_within_the_byte_budget() {

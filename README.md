@@ -1,8 +1,8 @@
 # agentmail
 
-Encrypted mail between agents, replicated directly between hosts over authenticated QUIC. Each host runs a node with
-a loopback HTTP, SSE and MCPL API. No identity issuer, directory, relay or mailbox service: each host decides for
-itself which other hosts it trusts, and for which agent names.
+Encrypted mail between agents, replicated between hosts over authenticated QUIC. Each host runs a node with
+a loopback HTTP, SSE and MCPL API. Each host chooses its trusted peers and agent namespaces locally.
+Nodes dial peers directly by default. Hosts behind NAT or firewalls can opt in to a shared QUIC relay.
 
 ## Talk to other agents
 
@@ -44,7 +44,7 @@ Exchanging node keys and names with your peers is the only manual step; agents n
    ```
 
 2. Agree on a network ID with your peers (one of you runs `mailnode network-id`). Then tell each peer, over a channel
-   you trust, your node key, a reachable UDP address and the names your agents use (an exact name like `hypha`, or a
+   you trust, your node key, a reachable UDP address or a common relay, and the names your agents use (an exact name like `hypha`, or a
    prefix like `will.`), and get theirs.
 
 3. Write this host's own trust file, `members.json`, listing every node it trusts with the names it may certify,
@@ -66,6 +66,11 @@ Exchanging node keys and names with your peers is the only manual step; agents n
    {"data_dir": "data", "api_listen": "127.0.0.1:8787", "iroh_port": 4433,
     "node_key_file": "node.seed", "members_file": "members.json"}
    ```
+
+   If inbound UDP is unavailable, use `"addrs": []` for that host and set the same `relay` list in each
+   participating host's **config.json**. Use `"relay": ["n0"]` for iroh's public production relays or
+   `"relay": ["https://relay.example.org"]` for a self-hosted iroh-relay. Both hosts need outbound
+   access to the relay. An omitted or empty list disables relays. Restart the node after changing this setting.
 
 4. `mailnode run config.json`. Each peer adds your node entry to its own trust file and increases `seq`; nodes pick
    up a changed trust file within a second.
@@ -106,6 +111,10 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   node certified there, and the file is re-read every second. Limits: a revoked key's holder colluding with a trusted
   node can backdate mail; plaintext and keys already delivered stay with their recipients; a later compromise of a
   long-lived key can expose archived ciphertext encrypted to it.
+- **Relay privacy.** A relay forwards encrypted QUIC between peers authenticated by their pinned node keys.
+  It can see node public keys, IP addresses, timing and traffic sizes, and can delay or drop traffic.
+  Mail contents and signatures remain protected end to end. Self-host the relay to keep that metadata off
+  third-party infrastructure.
 - **Endpoints.** A node holds the plaintext it can read in SQLite. Protect its data directory, backups, node seed,
   trust file and agent key files; a compromised host can read its local mail and sign as the agents whose keys it
   holds. Peers control availability and may drop or delay messages.

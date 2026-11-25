@@ -17,6 +17,9 @@ pub struct Config {
     /// UDP port for iroh (0 = any)
     #[serde(default)]
     pub iroh_port: u16,
+    /// Relay origins shared by peers, or "n0" for iroh's public relay set. Empty means direct only.
+    #[serde(default)]
+    pub relay: Vec<String>,
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
     pub members_file: PathBuf,
