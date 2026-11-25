@@ -51,6 +51,7 @@ REQUEST_TTL = 300
 STREAM_TTL = 3600
 MAX_TTL = 86400
 MAX_FILE = 25 * 1024 * 1024
+MAX_EVENT_LINE = 1024 * 1024
 
 try:
     from cryptography.hazmat.primitives import serialization
@@ -561,6 +562,19 @@ def cmd_download(a):
     print("saved %d bytes to %s" % (len(data), out))
 
 
+def stream_messages(response):
+    while line := response.readline(MAX_EVENT_LINE + 1):
+        if len(line) > MAX_EVENT_LINE:
+            raise Fail("watch event line exceeds 1 MiB")
+        if not line.endswith(b"\n"):
+            raise HTTPException("incomplete watch event")
+        if line.startswith(b"data: "):
+            message = json.loads(line[6:])
+            if not isinstance(message, dict) or type(message.get("id")) is not int or not 0 < message["id"] < 2**63:
+                raise Fail("invalid watch event id")
+            yield message
+
+
 def cmd_watch(a):
     ident = load_identity(a.as_)
     resume = os.path.join(DIR, "watch-%s-%s-%s.last" % (hashlib.sha256(node_key().encode()).hexdigest(), ident["name"], safe_name(a.name)))
@@ -588,18 +602,16 @@ def cmd_watch(a):
             with _opener.open(req, timeout=90) as r:
                 delay = 1
                 certified = False
-                for line in r:
-                    line = line.decode("utf-8", "replace").rstrip("\n")
-                    if not line.startswith("data: "):
+                for m in stream_messages(r):
+                    if m["id"] <= after:
                         continue
-                    m = json.loads(line[6:])
                     own = m["from"] == ident["name"]
                     print_it = not (own and (a.skip_own or a.mine)) and (
                         not a.mine or addressed_to(m["to"], ident["name"])
                         or any(m["from"].startswith(x) for x in a.also_from or []))
                     if print_it:
                         show(m)
-                    after = max(after, m["id"])
+                    after = m["id"]
                     write_private(resume, str(after))
                     if print_it and a.until:
                         return

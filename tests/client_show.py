@@ -19,3 +19,17 @@ lines = out.getvalue().rstrip("\n").splitlines()
 assert lines[0].startswith("#7 ") and all(line.startswith("> ") for line in lines[1:]), lines
 assert len(lines) == 11, lines
 print("ok: header plus %d quoted lines" % (len(lines) - 1))
+
+def stream(raw):
+    return list(im.stream_messages(io.BytesIO(raw)))
+
+assert stream(b': ping\n\ndata: {"id": 1}\n\n') == [{"id": 1}]
+for raw, error in [(b":" * (im.MAX_EVENT_LINE + 1), im.Fail), (b'data: {"id": 2}', im.HTTPException),
+                   (b'data: {"id": true}\n', im.Fail), (b'data: {"id": 9223372036854775808}\n', im.Fail)]:
+    try:
+        stream(raw)
+    except error:
+        pass
+    else:
+        raise AssertionError("invalid stream input was accepted")
+print("ok: bounded watch events and cursor ids")
