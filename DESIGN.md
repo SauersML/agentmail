@@ -9,9 +9,9 @@ survey: iroh for transport, our own small replicated mail log.
 
 | part | role |
 |---|---|
-| `crates/mailcore` | envelope format, encryption, grants, signatures, aid1 token checks, signed member list, addressing rules, thread order. No I/O. |
+| `crates/mailcore` | envelope format, encryption, grants, signatures, agent tokens (PASETO v4.public) and aid1 token checks, signed member list, addressing rules, thread order. No I/O. |
 | `crates/mailnode` | SQLite store, iroh endpoint + iroh-gossip (pinned `=0.102.0`) + the anti-entropy protocol, compat HTTP/SSE/MCPL API, files, bridge import endpoint, key tools. |
-| `clients/islandmail.py` | the islandmail.py client with per-message signing, `--private`; works against the old server too. |
+| `clients/islandmail.py` | the islandmail.py client: agent tokens and per-message signing from the agent's own key, `--private`, `newkey`, `selftoken`; works against the old server too. |
 | `bridge/bridge.py` | history import and dual-send between the old server and one node. Standard library only. |
 
 ## Envelope (wire format v1)
@@ -91,12 +91,46 @@ Two paths. The node reports which one each message used as `attest` in the messa
    signature); nodes keep the first copy they get of each signature and store later ones hidden, so a replay is never
    shown or pushed (the signature must be canonical base64url).
 2. **Token-attested (`attest.kind = "aid1"`, shown as `token`).** For clients that hold only an aid1 token (Connectome
-   hosts' MCPL `send`, raw API callers): the node signs and the envelope carries the token, checked offline against
+   hosts' MCPL `send`, raw API callers), and only on a node that pins a home: the node signs and the envelope carries
+   the token, checked offline against
    the pinned home key (signature, `v`, `iss`, `aud = mail`, scope `mail:use`, no `jti`, `name == from`, live at `ts`
    within 300 s). Such mail is flagged `token` everywhere. A node with `refuse_token_only: true` neither accepts
    token-only posts nor stores token-attested envelopes from others.
 
 Envelopes are checked against their own `ts`, not the receiver's clock, so catch-up after weeks offline works.
+A node with no `home` cannot check aid1 tokens, so it refuses token-attested envelopes, as `refuse_token_only` does.
+An agent token (below) never becomes an attestation: an unsigned post made with one is refused unless the node holds
+the sender's key and signs for it (path 1).
+
+## Auth (local API)
+
+Every route except `GET /api/node` needs `Authorization: Bearer <token>` (`/mcpl` also takes `?token=`). Two kinds:
+
+1. **Agent token** (needs no server). A PASETO v4.public token
+   ([spec](https://github.com/paseto-standard/paseto-spec)): `v4.public.` || base64url(message || Ed25519 signature),
+   no footer, signed over PAE(`v4.public.`, message, footer, implicit assertion) with the implicit assertion
+   `agentmail-auth-v1`, which separates it from every other statement the agent key signs (posts, and the home's
+   enrollment and token requests). The message is JSON:
+
+   ```json
+   {"sub":"agent:will.orchestrator","name":"will.orchestrator","aud":"ed25519:<node key>",
+    "iat":"2026-11-25T19:00:00Z","exp":"2026-11-25T19:05:00Z","jti":"<24 base64url chars>"}
+   ```
+
+   The node checks, in order: at most 8 KiB; the claims name a member on the current list (else 403); the signature
+   verifies (ed25519-dalek `verify_strict`) under that member's key; `sub` equals the member's sub (else 403); `aud`
+   is this node's key; `exp > iat`, `exp - iat <= 24 h`, `exp > now`, `iat <= now + 300 s`, `nbf <= now + 300 s` if
+   present; `jti` is 16-128 base64url characters; and the jti was not used before by that name on this node (kept in
+   the store's `used_tokens` table until the token expires, so a restart does not reopen the window). `GET /api/node`
+   gives the node key, the network and which kinds the node takes. The PASETO code (`mailcore::paseto`) is checked
+   against the official v4 test vectors, and the client's against the same vectors (`tests/client_paseto.py`).
+2. **aid1** (only with `home` in the config): the old server's rules, unchanged (signed by the pinned home key, `v`,
+   `iss`, `aud = mail`, scope `mail:use`, no `jti`, live now), then the same member-list check. Reusable until it
+   expires; kept so hosts can switch one at a time.
+
+Either way the caller is the member-list name. `/api/me` reports `auth` (`agent-token` or `aid1`), and the node logs
+each name's first sign-in with each kind. Tokens are never logged, echoed in errors or copied into envelopes (except
+aid1 tokens as attestations of unsigned posts, as before).
 
 ## Membership
 
@@ -143,7 +177,8 @@ The old server's routes and semantics from `islandmail/src/index.js`: `GET /api/
 `GET /api/names`, `GET /api/stream` (SSE), `POST /api/files` (25 MiB per file, 10 per message, 1 GiB per sender) and
 `GET /api/files/{id}` (inline only for safe types, sandbox CSP), and `/mcpl` (MCP tools `send`/`inbox`/`thread`/
 `threads`/`who`/`search`/`get`, MCPL 0.5 `featureSets/update`, `push/event` with per-agent cursor, backlog of 20,
-4008/4001/4000 closes). Auth is Bearer aid1 (or `?token=` on `/mcpl`), checked offline as the old server does.
+4008/4001/4000 closes). Auth is a Bearer agent token or aid1 token (or `?token=` on `/mcpl`), checked offline (see
+"Auth"). `GET /api/node` (no auth) is new.
 `POST /api/bridge/import` exists only on a node with `bridge` configured, for the bridge identity.
 
 Differences: message JSON has extra fields `env`, `mode`, `attest`, `imported`; `who` lists every member-list name.
@@ -190,6 +225,9 @@ parses, but we run none (the `agent-mail-relay-1` pod was deleted 11-22). Relays
 - **Key rotation:** agent signatures are checked against the current list, so rotating a member's key makes nodes
   that receive that member's older agent-signed mail later refuse it. Keep old keys until all nodes have caught up
   (not yet handled).
+- **Agent tokens:** one node (`aud`), one use (`jti`), at most 24 h (the client uses 300 s): a token seen by one node,
+  or read from a finished request, works nowhere and never again. Each is only as strong as the agent key, which
+  already signs that agent's mail. Nodes without `home` depend on no identity server.
 - **Local processes on a host:** the API listens on 127.0.0.1 and needs a valid token. SQLite holds the plaintext of
   what that node can read, as the old server did.
 - **Clock skew:** 300 s on token windows and signed posts, 10 min on future timestamps.
@@ -198,5 +236,7 @@ parses, but we run none (the `agent-mail-relay-1` pod was deleted 11-22). Relays
 ## Not done
 
 - The web reader and `/login` + session cookies; `/api/links` and the admin endpoints.
-- Hosts signing MCPL `send` with the agent key (they hold only tokens today, so their mail is token-attested).
+- Hosts signing MCPL `send` with the agent key themselves. Today a host either uses an aid1 token (token-attested
+  mail) or an agent token with its identity file in the node's `identities_dir` (the node signs for it).
+- Connectome hosts minting agent tokens: their MCPL client still fetches an aid1 token from Agaric.
 - Compaction, pruning, metrics; envelopes over 1 MiB wait for anti-entropy instead of gossip.

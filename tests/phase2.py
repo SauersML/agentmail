@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Phase 2 integration test: sender signatures, attachments, the history bridge against a fake old server, and member
-list replication (a third node joins through a list only one node was given). All keys are throwaway.
+"""Phase 2 integration test: sender signatures, attachments, the history bridge against a fake old server, member
+list replication (a third node joins through a list only one node was given), and agent tokens: that third node has
+no identity home at all, and a client holding only its agent key sends and reads there. All keys are throwaway.
 
   python3 tests/phase2.py --bin target/debug/mailnode --repo . [--workdir DIR]
 """
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -73,17 +75,41 @@ def main():
     os.makedirs(os.path.join(im_dir, "identities"))
     os.makedirs(os.path.join(im_dir, "tokens"))
     for n in agents:
+        path = os.path.join(im_dir, "identities", agents[n] + ".json")
         json.dump({"name": agents[n], "sub": "agent:%s@test" % n, "home": iss, "id": pub[n], "seed": open(k(n)).read().strip()},
-                  open(os.path.join(im_dir, "identities", agents[n] + ".json"), "w"))
+                  open(path, "w"))
+        os.chmod(path, 0o600)  # the client refuses identity files other users can read
         json.dump({"token": tok[n], "exp": time.time() + 3600}, open(os.path.join(im_dir, "tokens", agents[n] + ".mail.json"), "w"))
+    # carol again, as an agent with no home: only her key, name and sub (what `islandmail.py newkey` writes) and no
+    # token cache. With no home in the identity the client has nowhere to fetch a home token from.
+    nohome_dir = os.path.join(work, "islandmail-nohome")
+    os.makedirs(os.path.join(nohome_dir, "identities"))
+    path = os.path.join(nohome_dir, "identities", "u.carol.json")
+    json.dump({"name": "u.carol", "sub": "agent:carol@test", "id": pub["carol"], "seed": open(k("carol")).read().strip()}, open(path, "w"))
+    os.chmod(path, 0o600)
 
-    def im(port, who, *args, timeout=60):
-        env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir, ISLANDMAIL_AS=agents[who])
+    def im(port, who, *args, timeout=60, folder=None):
+        env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=folder or im_dir,
+                   ISLANDMAIL_AS=agents[who])
+        env.pop("ISLANDMAIL_TOKEN", None)
         p = subprocess.run([sys.executable, client, *args], capture_output=True, text=True, env=env, timeout=timeout, cwd=work)
         return p.returncode, (p.stdout + p.stderr).strip()
 
+    # Agent tokens minted the way the client mints them (single-use, for one node's key).
+    spec = importlib.util.spec_from_file_location("islandmail", client)
+    imc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(imc)
+
+    def atok(port, who, ttl=300, seed_of=None):
+        key = req("GET", port, "/api/node")[1]["node"]
+        ident = {"name": agents[who], "sub": "agent:%s@test" % who, "seed": open(k(seed_of or who)).read().strip()}
+        return imc.agent_token(ident, key, ttl)
+
+    home_less = {P["apiC"]}
+
     def msgs(port, who, q=""):
-        return req("GET", port, "/api/messages?" + q, tok[who])[1].get("messages", [])
+        t = atok(port, who) if port in home_less else tok[who]
+        return req("GET", port, "/api/messages?" + q, t)[1].get("messages", [])
 
     # Fake old server with history: gaps in the numbers and one unverified legacy row.
     old_tokens = {"old-alice": {"name": "t.alice", "sub": "agent:alice@test"},
@@ -119,7 +145,9 @@ def main():
 
     A = Node(bin_, work, "A", cfg("A", bridge={"key_file": k("bridgekey"), "sub": "agent:bridge@test"}))
     B = Node(bin_, work, "B", cfg("B"))
-    C = Node(bin_, work, "C", cfg("C", refuse_token_only=True))
+    cfg_c = cfg("C", refuse_token_only=True)
+    del cfg_c["home"]  # C pins no identity home: agent tokens only
+    C = Node(bin_, work, "C", cfg_c)
     bridge = None
     try:
         time.sleep(0.5)
@@ -217,17 +245,53 @@ def main():
         check("C catches up the agent-signed mail (sealed before C joined; read through a grant)", got, "%.1fs" % dt)
         hist = {m["id"]: m["text"] for m in msgs(pc, "carol")}
         check("C reads the imported history under the old numbers", hist.get(1) == "first ever" and hist.get(8) == "eighth", str(sorted(hist))[:80])
-        rc, out = im(pc, "carol", "download", fid, "-o", os.path.join(work, "gotC.bin"))
+        rc, out = im(pc, "carol", "download", fid, "-o", os.path.join(work, "gotC.bin"), folder=nohome_dir)
         check("C downloads the attachment sent before it joined", rc == 0 and open(os.path.join(work, "gotC.bin"), "rb").read() == payload, out)
-        rc, out = im(pc, "carol", "read", "--thread", "signed", "--json")
+        rc, out = im(pc, "carol", "read", "--thread", "signed", "--json", folder=nohome_dir)
         check("C cannot read the private mail between alice and bob", rc == 0 and "private and signed" not in out)
         check("C stored no token-only mail", not [m for m in msgs(pc, "carol") if m["attest"] == "token"])
-        st, r = req("POST", pc, "/api/messages", tok["carol"], {"to": "all", "thread": "c", "text": "token only on C"})
-        check("C refuses a token-only post", st == 400, r.get("error", ""))
-        rc, out = im(pc, "carol", "send", "--to", "all", "--thread", "c", "signed from C")
-        check("C accepts a signed post", rc == 0, out)
+        st, r = req("POST", pc, "/api/messages", atok(pc, "carol"), {"to": "all", "thread": "c", "text": "token only on C"})
+        check("C refuses an unsigned post", st == 400, r.get("error", ""))
+        rc, out = im(pc, "carol", "send", "--to", "all", "--thread", "c", "signed from C", folder=nohome_dir)
+        check("C accepts a signed post from a client with only its agent key", rc == 0, out)
         got, dt = wait_for(lambda: [m for m in msgs(pb, "bob", "thread=c")], timeout=30)
         check("B (accepting C only through the adopted list) receives C's mail", got and got[0]["text"] == "signed from C", "%.1fs" % dt)
+
+        # 6. No home anywhere: C pins none, carol's client has only her key. Sign-in rules for agent tokens.
+        st, r = req("GET", pc, "/api/me", tok["carol"])
+        check("C (no home) refuses an aid1 token", st == 401 and "only agent tokens" in r.get("error", ""), r.get("error", ""))
+        rc, out = im(pc, "carol", "whoami", folder=nohome_dir)
+        check("islandmail.py whoami on C with only the agent key", rc == 0 and "u.carol" in out, out)
+        t = atok(pc, "carol")
+        st, r = req("GET", pc, "/api/me", t)
+        check("/api/me reports auth agent-token", st == 200 and r.get("auth") == "agent-token" and r.get("name") == "u.carol", str(r)[:120])
+        st, r = req("GET", pc, "/api/me", t)
+        check("an agent token works once (replay refused)", st == 401 and "already used" in r.get("error", ""), r.get("error", ""))
+        st, r = req("GET", pc, "/api/me", atok(pa, "carol"))
+        check("a token minted for node A is refused on C", st == 401 and "another node" in r.get("error", ""), r.get("error", ""))
+        st, r = req("GET", pc, "/api/me", atok(pc, "carol", seed_of="bob"))
+        check("a token claiming carol but signed by bob's key is refused", st == 401 and "signature" in r.get("error", ""), r.get("error", ""))
+        stranger = imc.agent_token({"name": "x.eve", "sub": "agent:eve@test", "seed": os.urandom(32).hex()},
+                                   req("GET", pc, "/api/node")[1]["node"])
+        st, r = req("GET", pc, "/api/me", stranger)
+        check("a name not on the member list is refused (403)", st == 403, r.get("error", ""))
+        st, r = req("POST", pa, "/api/messages", atok(pa, "alice"), {"to": "t.bob", "thread": "signed", "text": "unsigned"})
+        check("an unsigned post with an agent token is refused on A too (no bearer token goes into envelopes)",
+              st == 400 and "sign" in r.get("error", ""), r.get("error", ""))
+        rc, out = im(pc, "carol", "selftoken", "--ttl", "120", folder=nohome_dir)
+        st, r = req("GET", pc, "/api/threads", out) if rc == 0 else (0, {"error": out})
+        check("islandmail.py selftoken prints a token C accepts", st == 200 and "threads" in r, r.get("error", ""))
+        rc, out = im(pc, "carol", "send", "--private", "--to", "t.alice", "--thread", "nohome-private", "private, no home", folder=nohome_dir)
+        check("private send from C with only the agent key", rc == 0, out)
+        rc, out = im(pc, "carol", "send", "--to", "t.alice", "--thread", "nohome", "sent with no home", folder=nohome_dir)
+        got, dt = wait_for(lambda: [m for m in msgs(pa, "alice", "thread=nohome")], timeout=30)
+        check("A delivers carol's mail to alice", rc == 0 and got and got[0]["text"] == "sent with no home" and got[0]["attest"] == "agent", "%.1fs" % dt)
+        rc, out = im(pa, "alice", "send", "--to", "u.carol", "--thread", "nohome", "reply via A")
+        got, dt = wait_for(lambda: (lambda r: r if r[0] == 0 and "> reply via A" in r[1] else None)(
+            im(pc, "carol", "read", "--thread", "nohome", folder=nohome_dir)), timeout=30, every=1)
+        check("carol reads alice's reply on C with only her key", got, "%.1fs" % dt)
+        log = open(os.path.join(work, "C.log")).read()
+        check("C logs the sign-in kind (agent-token) and never a token", "signed in with an agent-token token" in log and "v4.public." not in log)
     finally:
         if bridge:
             bridge.terminate()

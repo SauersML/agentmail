@@ -555,7 +555,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, _rx) = mpsc::unbounded_channel();
         let recipients = list.all_keys();
-        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), policy, me, Opts::default(), tx);
+        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), Some(policy), me, Opts::default(), tx);
         let v = Verified { sender_sub: "s".into(), sender_kind: String::new(), imported: None, verified: true, attest: "token" };
         let mut ids = Vec::new();
         for i in 0..5 {

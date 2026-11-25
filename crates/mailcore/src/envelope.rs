@@ -274,7 +274,9 @@ impl Envelope {
 
     /// Everything a receiver checks before storing: shape, id, the node's signature and membership, and the sender's
     /// attestation (token signed by the home, scope, name == from, live at ts).
-    pub fn verify(&self, members: &MemberList, policy: &TokenPolicy, now_ms: i64) -> Result<Verified> {
+    /// `policy` is the pinned home, if this node has one; without it, token-attested envelopes cannot be checked and are
+    /// refused.
+    pub fn verify(&self, members: &MemberList, policy: Option<&TokenPolicy>, now_ms: i64) -> Result<Verified> {
         if self.v != VERSION {
             bail!("unsupported envelope version {}", self.v);
         }
@@ -321,6 +323,7 @@ impl Envelope {
                 if !members.is_node(&node) {
                     bail!("written by a node that is not a member");
                 }
+                let policy = policy.ok_or_else(|| anyhow!("token-attested envelope, and this node pins no home key to check it"))?;
                 let p = token::verify_at(token, policy, ts as f64 / 1000.0, TOKEN_SKEW_S)
                     .map_err(|e| anyhow!("sender token refused: {e}"))?;
                 if p.jti.is_some() {
@@ -484,22 +487,22 @@ mod tests {
         let p = policy(&w.home);
         let now = crate::now_millis();
         let e = signed_env(&w, "a.alice", &w.alice, "signed by alice", crate::now_ts());
-        let v = e.verify(&w.members, &p, now).unwrap();
+        let v = e.verify(&w.members, Some(&p), now).unwrap();
         assert_eq!((v.attest, v.sender_sub.as_str()), ("agent", "agent:a.alice@test"));
         let body = e.open(&w.node).unwrap().unwrap();
         e.check_body(&body).unwrap();
         // Bob's key claiming to be alice.
         let e = signed_env(&w, "a.alice", &w.bob, "forged", crate::now_ts());
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not a.alice's key"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("not a.alice's key"));
         // Not on the member list at all.
         let stranger = Seed::generate();
         let e = signed_env(&w, "x.stranger", &stranger, "who", crate::now_ts());
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not on the member list"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("not on the member list"));
         // A header changed by the node after the sender signed (re-signed by the node so only the agent sig breaks).
         let mut e = signed_env(&w, "a.alice", &w.alice, "to all", crate::now_ts());
         e.to = "a.bob".into();
         e.sig = b64u(&w.node.sign(&e.signing_bytes()));
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("sender signature"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("sender signature"));
         // A body swapped by the node under alice's signed digest: verify passes (header intact), check_body refuses.
         let good = signed_env(&w, "a.alice", &w.alice, "original", crate::now_ts());
         let mut body = good.open(&w.node).unwrap().unwrap();
@@ -537,10 +540,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(mk("all", "x|y").verify(&w.members, &p, now).is_ok(), "'|' in the thread is fine");
+        assert!(mk("all", "x|y").verify(&w.members, Some(&p), now).is_ok(), "'|' in the thread is fine");
         // The same statement re-split by the node: to "all|x", thread "y".
         assert_eq!(post_statement("a.alice", "all|x", "y", Mode::Members, &ts, "d"), post_statement("a.alice", "all", "x|y", Mode::Members, &ts, "d"));
-        assert!(mk("all|x", "y").verify(&w.members, &p, now).unwrap_err().to_string().contains("'|'"));
+        assert!(mk("all|x", "y").verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("'|'"));
     }
 
     #[test]
@@ -588,19 +591,19 @@ mod tests {
             e
         };
         let base = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
-        assert!(base.verify(&w.members, &p, now).is_ok());
+        assert!(base.verify(&w.members, Some(&p), now).is_ok());
         let mut e = base.clone();
         e.blobs = (0..MAX_BLOBS + 1).map(|i| format!("{i:064x}")).collect();
-        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        assert!(resign(e).verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("blobs"));
         let mut e = base.clone();
         e.blobs = vec!["not-a-hash".into()];
-        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("blobs"));
+        assert!(resign(e).verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("blobs"));
         let mut e = base.clone();
         e.keys[0].k = b64u(&[0u8; 4096]);
-        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("wrapped key"));
+        assert!(resign(e).verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("wrapped key"));
         let mut e = base.clone();
         e.epk = b64u(&[0u8; 7]);
-        assert!(resign(e).verify(&w.members, &p, now).unwrap_err().to_string().contains("epk"));
+        assert!(resign(e).verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("epk"));
     }
 
     #[test]
@@ -632,15 +635,15 @@ mod tests {
             .unwrap()
         };
         let now = crate::now_millis();
-        assert!(mk(42).verify(&members, &p, now).is_ok());
-        assert!(mk(MAX_OLD_ID).verify(&members, &p, now).is_ok());
-        assert!(mk(0).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
-        assert!(mk(MAX_OLD_ID + 1).verify(&members, &p, now).unwrap_err().to_string().contains("old_id"));
-        assert!(mk(i64::MAX as u64).verify(&members, &p, now).is_err());
+        assert!(mk(42).verify(&members, Some(&p), now).is_ok());
+        assert!(mk(MAX_OLD_ID).verify(&members, Some(&p), now).is_ok());
+        assert!(mk(0).verify(&members, Some(&p), now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(MAX_OLD_ID + 1).verify(&members, Some(&p), now).unwrap_err().to_string().contains("old_id"));
+        assert!(mk(i64::MAX as u64).verify(&members, Some(&p), now).is_err());
         let mut e = mk(7);
         e.attest = Attest::Import { old_id: 7, sub: "agent:x\n#1 from someone.else".into(), verified: true };
         e.sig = b64u(&bridge.sign(&e.signing_bytes()));
-        assert!(e.verify(&members, &p, now).unwrap_err().to_string().contains("sub"));
+        assert!(e.verify(&members, Some(&p), now).unwrap_err().to_string().contains("sub"));
     }
 
     fn tok(w: &World, name: &str) -> String {
@@ -656,7 +659,7 @@ mod tests {
         let back: Envelope = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, e);
         assert_eq!(back.signing_bytes(), e.signing_bytes());
-        let v = back.verify(&w.members, &policy(&w.home), crate::now_millis()).unwrap();
+        let v = back.verify(&w.members, Some(&policy(&w.home)), crate::now_millis()).unwrap();
         assert_eq!(v.sender_sub, "agent:a.alice@test");
         assert_eq!(back.open(&w.node).unwrap().unwrap().text, "hi from a.alice");
     }
@@ -668,31 +671,35 @@ mod tests {
         let now = crate::now_millis();
         // from != token name
         let e = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.bob"));
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not the token's name"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("not the token's name"));
+        // a node with no home cannot check a token-attested envelope, so it refuses it
+        let e = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
+        assert!(e.verify(&w.members, Some(&p), now).is_ok());
+        assert!(e.verify(&w.members, None, now).unwrap_err().to_string().contains("no home"));
         // token from another home
         let evil = Seed::generate();
         let t = token::mint(&evil, &payload("a.alice", now as f64 / 1000.0, now as f64 / 1000.0 + 60.0));
         let e = env(&w, "a.alice", "all", Mode::Members, t);
-        assert!(e.verify(&w.members, &p, now).is_err());
+        assert!(e.verify(&w.members, Some(&p), now).is_err());
         // token expired before the envelope's ts
         let t = token::mint(&w.home, &payload("a.alice", now as f64 / 1000.0 - 7200.0, now as f64 / 1000.0 - 3600.0));
         let e = env(&w, "a.alice", "all", Mode::Members, t);
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("expired"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("expired"));
         // written by a node not on the member list
         let mut e = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
         let stranger = Seed::generate();
         e.node = fmt_key(&stranger.public());
         e.sig = b64u(&stranger.sign(&e.signing_bytes()));
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("not a member"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("not a member"));
         // header changed after signing
         let mut e = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
         e.thread = "other".into();
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("signature"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("signature"));
         // ciphertext swapped: id no longer matches
         let mut e = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
         let other = env(&w, "a.alice", "all", Mode::Members, tok(&w, "a.alice"));
         e.ciphertext = other.ciphertext;
-        assert!(e.verify(&w.members, &p, now).unwrap_err().to_string().contains("hash"));
+        assert!(e.verify(&w.members, Some(&p), now).unwrap_err().to_string().contains("hash"));
     }
 
     #[test]

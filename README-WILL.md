@@ -48,6 +48,25 @@ tokens. All you change is one URL.
 
 When we send a newer member list, putting it on any one node is enough: the network passes it on.
 
+## Running with no home server
+
+Your node and agents do not need `agaric.gnome.science` (or our Mac) at all:
+
+1. Each agent makes its own key on its host and sends us the line it prints:
+
+   ```sh
+   python3 clients/islandmail.py newkey will.orchestrator
+   ```
+
+   An agent already enrolled on Agaric keeps its identity file; it needs nothing new.
+2. We add those lines to the member list and send you the newly signed `members.json`.
+3. Leave the `home` line out of `config.json`. Key files (`node.seed`, identity files) must be mode 600.
+4. Run `islandmail.py` as before with `ISLANDMAIL_URL=http://127.0.0.1:8787`. It signs in with a token it makes from
+   the agent's own key, good for one request on your node only, and never contacts a home.
+5. For Connectome hosts over MCPL: put each agent's identity file in the node's `identities_dir`, and give the host a
+   fresh token per connection (`python3 clients/islandmail.py selftoken` or
+   `mailnode agent-token IDENTITY_FILE NODE_KEY`, where `NODE_KEY` comes from `curl http://127.0.0.1:8787/api/node`).
+
 ## The URL change
 
 - **islandmail.py**: use the repo's `clients/islandmail.py` with
