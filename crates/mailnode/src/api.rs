@@ -321,44 +321,34 @@ async fn stream(
         _ => s.node.store.last_id()?,
     };
     let mut rx = s.node.events.subscribe();
-    let (rows, more) = s.node.store.query(&Query { after: Some(after), ..Default::default() }, &who, MAX_TEXT)?;
-    let mut last = after;
-    let mut first = String::from("retry: 2000\n: connected\n\n");
-    for r in &rows {
-        first.push_str(&sse_event(&r.to_message()));
-        last = last.max(r.id);
-    }
-    let (tx, out) = mpsc::channel::<Result<Bytes, Infallible>>(256);
-    let _ = tx.send(Ok(Bytes::from(first))).await;
-    if !more {
-        let node = s.node.clone();
-        tokio::spawn(async move {
-            let _slot = slot;
-            let mut beat = tokio::time::interval(Duration::from_millis(HEARTBEAT_MS));
-            beat.tick().await;
-            loop {
-                tokio::select! {
-                    ev = rx.recv() => match ev {
-                        Ok(_) if !node.active(&who) => break,
-                        Ok(row) => {
-                            if row.id > last && row.visible_to(&who) {
-                                last = row.id;
-                                if tx.send(Ok(Bytes::from(sse_event(&row.to_message())))).await.is_err() { break; }
-                            }
-                        }
-                        Err(_) => break,
-                    },
-                    _ = beat.tick() => {
-                        if !node.active(&who) { break; }
-                        if tx.send(Ok(Bytes::from_static(b": ping\n\n"))).await.is_err() { break; }
-                    }
-                    _ = tx.closed() => break,
-                }
+    let node = s.node.clone();
+    let (tx, out) = mpsc::channel::<Result<Bytes, Infallible>>(1);
+    tokio::spawn(async move {
+        let _slot = slot;
+        let mut after = after;
+        let mut beat = tokio::time::interval(Duration::from_millis(HEARTBEAT_MS));
+        beat.tick().await;
+        let mut chunk = String::from("retry: 2000\n: connected\n\n");
+        loop {
+            if !node.active(&who) { break; }
+            let Ok((rows, more)) = node.store.query(&Query { after: Some(after), ..Default::default() }, &who, MAX_TEXT) else { break };
+            for r in rows {
+                chunk.push_str(&sse_event(&r.to_message()));
+                after = r.id;
             }
-        });
-    } else {
-        drop(slot);
-    }
+            if !chunk.is_empty() {
+                let bytes = Bytes::from(std::mem::take(&mut chunk));
+                if !matches!(tokio::time::timeout(Duration::from_secs(15), tx.send(Ok(bytes))).await, Ok(Ok(()))) { break; }
+            }
+            if more { break; }
+            tokio::select! {
+                // A notification is only a wakeup. SQLite supplies committed messages in cursor order.
+                event = rx.recv() => if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; },
+                _ = beat.tick() => chunk.push_str(": ping\n\n"),
+                _ = tx.closed() => break,
+            }
+        }
+    });
     let mut r = Response::new(Body::from_stream(ReceiverStream::new(out)));
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-transform"));

@@ -316,7 +316,7 @@ impl Store {
             args.push(Value::Text(s.clone()));
         }
         let limit = q.latest.or(q.limit).unwrap_or(PAGE).min(PAGE);
-        args.push(Value::Integer(limit));
+        args.push(Value::Integer(limit + 1));
         let sql = format!(
             "SELECT {COLS} FROM messages WHERE {} ORDER BY id {} LIMIT ?",
             wh.join(" AND "),
@@ -329,15 +329,12 @@ impl Store {
         let mut more = false;
         for r in st.query_map(params_from_iter(args), read_row)? {
             let r = r?;
-            chars += r.text.as_deref().map_or(0, |t| t.len()) + 200;
-            if !rows.is_empty() && chars > PAGE_CHARS {
+            chars += r.text.as_deref().map_or(0, |t| t.len()) + r.files.len() + 200;
+            if rows.len() as i64 >= limit || (!rows.is_empty() && chars > PAGE_CHARS) {
                 more = true;
                 break;
             }
             rows.push(r);
-        }
-        if rows.len() as i64 == limit {
-            more = true;
         }
         if q.latest.is_some() {
             rows.reverse();
@@ -514,9 +511,10 @@ impl Store {
         Ok(rows)
     }
 
-    pub fn cursor(&self, sub: &str) -> Result<Option<i64>> {
+    pub fn cursor(&self, sub: &str) -> Result<i64> {
         let db = self.db.lock().unwrap();
-        Ok(db.query_row("SELECT last_id FROM cursors WHERE sub = ?", [sub], |r| r.get(0)).optional()?)
+        db.execute("INSERT OR IGNORE INTO cursors (sub, last_id) SELECT ?, COALESCE(MAX(id), 0) FROM messages", [sub])?;
+        Ok(db.query_row("SELECT last_id FROM cursors WHERE sub = ?", [sub], |r| r.get(0))?)
     }
 
     pub fn advance_cursor(&self, sub: &str, id: i64) -> Result<()> {

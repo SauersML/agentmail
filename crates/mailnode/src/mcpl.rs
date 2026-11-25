@@ -1,8 +1,5 @@
-//! /mcpl: MCP over WebSocket (newline-delimited JSON-RPC) with mail tools and MCPL push/event for hosts
-//! that declare MCPL: mail addressed to the agent is pushed as it arrives; a push the host answers {accepted:true}
-//! (or reason "duplicate") moves the agent's cursor, and on (re)connect the mail past the cursor is pushed (20 at a
-//! time). A connection that leaves 50 pushes unanswered is closed (4008); one whose token expires is
-//! closed (4001); a fifth connection of the same agent replaces its oldest (4000).
+//! MCP tools and MCPL push over authenticated WebSockets. Each connection delivers messages
+//! in cursor order and waits for acknowledgement before sending the next one.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +11,6 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
-use mailcore::addr::addressed_to;
 use mailcore::{now_millis, now_ts};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
@@ -23,9 +19,7 @@ use crate::api::{bearer, AppState};
 use crate::node::{ApiError, Caller, Node};
 use crate::store::{Query, Row};
 
-const PUSH_BACKLOG: usize = 20;
 const PUSH_TEXT: usize = 20_000;
-const MAX_PENDING_PUSHES: usize = 50;
 const MAX_WS_FRAME: usize = 1_000_000;
 const MAX_RPCS_PER_FRAME: usize = 20;
 const MAX_SOCKETS_PER_SUB: usize = 4;
@@ -144,8 +138,7 @@ struct Conn {
     version: Option<String>,
     grant: Option<Vec<String>>,
     ready: bool,
-    /// rpc id -> (message number, sent at ms)
-    pending: HashMap<String, i64>,
+    pending: Option<(String, i64, std::time::Instant)>,
     closed: bool,
 }
 
@@ -160,7 +153,7 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
         version: None,
         grant: None,
         ready: false,
-        pending: HashMap::new(),
+        pending: None,
         closed: false,
     };
     let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -175,12 +168,16 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
             },
             ev = events.recv() => match ev {
                 _ if !c.node.active(&c.who) => c.close(4001, "session expired or membership changed"),
-                Ok(row) => c.on_new(&row),
-                Err(broadcast::error::RecvError::Lagged(_)) => if c.ready && c.push_allowed() { c.flush_backlog() },
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => c.flush_backlog(),
                 Err(_) => break,
             },
             k = kill.recv() => { if let Some((code, reason)) = k { c.close(code, &reason) } else { break } },
-            _ = tick.tick() => if !c.node.active(&c.who) { c.close(4001, "token expired; dial again with a fresh one") },
+            _ = tick.tick() => {
+                if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed"); }
+                else if c.pending.as_ref().is_some_and(|(_, _, since)| since.elapsed() >= Duration::from_secs(60)) {
+                    c.close(4008, "push acknowledgement timed out");
+                }
+            },
         }
         for frame in c.out.drain(..) {
             if !matches!(frame, Message::Close(_)) && !c.node.active(&c.who) {
@@ -240,15 +237,19 @@ impl Conn {
             // A response to one of our push/event requests: the cursor moves only on an accepted push.
             let Some(id) = id else { return };
             let key = id.as_str().map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
-            if let Some(m) = self.pending.remove(&key) {
-                let r = &msg["result"];
-                if r["accepted"] == json!(true) || r["reason"] == json!("duplicate") {
-                    let _ = self.node.store.advance_cursor(&self.who.sub, m);
-                    tracing::info!("mcpl {}: push of #{m} accepted; cursor -> {m}", self.who.name);
-                } else {
-                    tracing::info!("push of #{m} to {} not accepted", self.who.name);
-                }
+            let Some((rpc, m, _)) = self.pending.as_ref() else { return };
+            if rpc != &key { return; }
+            let m = *m;
+            let r = &msg["result"];
+            if r["accepted"] != json!(true) && r["reason"] != json!("duplicate") {
+                return self.close(4008, "push declined; reconnect to retry");
             }
+            if self.node.store.advance_cursor(&self.who.key, m).is_err() {
+                return self.close(1011, "cannot save delivery cursor");
+            }
+            self.pending = None;
+            tracing::info!("mcpl {}: push of #{m} accepted", self.who.name);
+            self.flush_backlog();
             return;
         };
         let reply = |c: &mut Conn, result: Value| {
@@ -457,74 +458,29 @@ impl Conn {
         !(major > 0 || minor >= 5)
     }
 
-    fn on_new(&mut self, r: &Row) {
-        if !self.ready || !self.push_allowed() || self.who.sub == r.sender_sub {
-            return;
-        }
-        if !addressed_to(&r.recipient, &[&self.who.name]) || !r.visible_to(&self.who) {
-            return;
-        }
-        self.push(r);
-    }
-
     fn flush_backlog(&mut self) {
-        let sub = self.who.sub.clone();
-        let cur = match self.node.store.cursor(&sub) {
-            Ok(Some(c)) => c,
-            Ok(None) => {
-                if let Ok(last) = self.node.store.last_id() {
-                    let _ = self.node.store.advance_cursor(&sub, last);
-                }
-                return;
-
-            }
-            Err(_) => return,
-        };
-        let Ok(rows) = self.node.store.addressed_rows(&self.who, cur, i64::MAX, PUSH_BACKLOG + 1, PUSH_TEXT as i64, true)
-        else {
-            return;
-        };
-        for r in rows.iter().take(PUSH_BACKLOG) {
-            self.push(r);
-            if self.closed {
-                return;
-            }
-        }
-        if rows.len() > PUSH_BACKLOG {
-            let last = rows[PUSH_BACKLOG - 1].id;
-            self.push_text(None, &format!("backlog-{sub}-{last}"), &format!(
-                "More mail for you arrived while you were away than was pushed; the inbox tool with after={last} lists the rest."
-            ), json!({}));
+        if !self.ready || !self.push_allowed() || self.pending.is_some() { return; }
+        let rows = self.node.store.cursor(&self.who.key).and_then(|cursor|
+            self.node.store.addressed_rows(&self.who, cursor, i64::MAX, 1, PUSH_TEXT as i64, true));
+        match rows {
+            Ok(rows) => if let Some(row) = rows.first() { self.push(row); },
+            Err(_) => self.close(1011, "cannot read delivery cursor"),
         }
     }
 
     fn push(&mut self, r: &Row) {
-        let origin = json!({ "messageId": r.id, "thread": r.thread, "from": r.sender, "to": r.recipient, "verified": true, "attest": "agent" });
-        self.push_text(Some(r.id), &format!("mail-{}", r.id), &self.node.fmt(r, PUSH_TEXT), origin);
-    }
-
-    fn push_text(&mut self, msg_id: Option<i64>, event_id: &str, text: &str, origin: Value) {
-        if self.pending.len() >= MAX_PENDING_PUSHES {
-            // The agent is not reading. Its cursor stays where it was, so it gets the mail on its next connection.
-            self.pending.clear();
-            return self.close(4008, &format!("{MAX_PENDING_PUSHES} pushes unanswered; reconnect to receive the rest"));
-        }
+        let event_id = format!("mail-{}", r.id);
         let rpc = format!("push-{event_id}-{}", mailcore::b64u(&mailcore::random_bytes::<6>()));
-        let mut o = json!({ "server": "agentmail" });
-        if let Some(obj) = origin.as_object() {
-            for (k, v) in obj {
-                o[k] = v.clone();
-            }
-        }
+        let text = self.node.fmt(r, PUSH_TEXT);
+        let o = json!({ "server": "agentmail", "messageId": r.id, "thread": r.thread, "from": r.sender,
+                        "to": r.recipient, "verified": true, "attest": "agent" });
         self.send(json!({
             "jsonrpc": "2.0", "id": rpc, "method": "push/event",
             "params": { "featureSet": "mail", "eventId": event_id, "timestamp": now_ts(), "origin": o,
                         "tags": ["mail"], "payload": { "content": [{ "type": "text", "text": text }] } },
         }));
         tracing::info!("mcpl {}: push/event {event_id}", self.who.name);
-        if let Some(m) = msg_id {
-            self.pending.insert(rpc, m);
-        }
+        self.pending = Some((rpc, r.id, std::time::Instant::now()));
     }
 }
 

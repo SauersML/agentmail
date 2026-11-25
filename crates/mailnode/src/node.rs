@@ -82,7 +82,7 @@ pub struct Node {
     pub members: RwLock<MemberList>,
     pub seed: Seed,
     pub opts: Opts,
-    pub events: broadcast::Sender<Arc<Row>>,
+    pub events: broadcast::Sender<i64>,
     pub outbound: mpsc::Sender<Envelope>,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
@@ -341,7 +341,7 @@ impl Node {
                 return Ok(Posted { row, reaches, repeated: true });
             }
         };
-        let _ = self.events.send(Arc::new(row.clone()));
+        let _ = self.events.send(row.id);
         let _ = self.outbound.try_send(env);
         let reaches = self.reaches(&to, &who.sub);
         Ok(Posted { row, reaches, repeated: false })
@@ -438,7 +438,7 @@ impl Node {
         };
         let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
-        let _ = self.events.send(row.clone());
+        let _ = self.events.send(row.id);
         Ok(Some(row))
     }
 
