@@ -218,6 +218,27 @@ impl Store {
         Ok(Store { db: Mutex::new(db) })
     }
 
+    /// A data directory belongs to one node and network. Keep the last accepted local revision across restarts.
+    pub fn bind_roster(&self, key: &mailcore::keys::PublicKey, list: &mailcore::MemberList) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS local_trust (id INTEGER PRIMARY KEY CHECK(id=1), node TEXT NOT NULL, roster TEXT NOT NULL)")?;
+        let node = mailcore::keys::fmt_key(key);
+        let current = tx.query_row("SELECT node, roster FROM local_trust WHERE id=1", [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?;
+        if let Some((owner, raw)) = current {
+            let previous: mailcore::MemberList = serde_json::from_str(&raw)?;
+            anyhow::ensure!(owner == node && previous.network == list.network, "use a separate data directory for each network and node");
+            anyhow::ensure!(list.seq > previous.seq || *list == previous, "trust file conflicts with the last accepted local revision");
+        } else {
+            anyhow::ensure!(!tx.prepare("SELECT 1 FROM messages UNION ALL SELECT 1 FROM uploads UNION ALL SELECT 1 FROM blobs LIMIT 1")?.exists([])?,
+                "existing mail store predates locally pinned trust; start with a new data directory");
+        }
+        tx.execute("INSERT OR REPLACE INTO local_trust VALUES (1, ?, ?)", params![node, serde_json::to_string(list)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn has(&self, env_id: &str) -> Result<bool> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT 1 FROM messages WHERE env_id = ?", [env_id], |_| Ok(())).optional()?.is_some())

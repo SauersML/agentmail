@@ -1,6 +1,6 @@
 //! Replication over iroh. One gossip topic carries every new envelope (and every newly adopted member list);
 //! anti-entropy (a small request/response protocol on its own ALPN) runs with each member node every
-//! `sync_secs`: exchange member lists (the newest operator-signed one wins), compare per-day hashes
+//! `sync_secs`: compare per-day hashes
 //! of envelope-id sets, list ids of the days that differ, fetch the missing envelopes, then fetch attachment blobs
 //! referenced by stored envelopes and not yet here, then ask for grants (the content key re-wrapped for this node) for
 //! members-mode envelopes written before this node joined the list. Only member nodes may connect at all (an after-handshake hook
@@ -22,14 +22,14 @@ use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
 use iroh_gossip::proto::TopicId;
 use mailcore::keys::parse_key;
-use mailcore::{Envelope, MemberList};
+use mailcore::Envelope;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::node::Node;
 
-pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/2";
+pub const SYNC_ALPN: &[u8] = b"agent-mail/sync/3";
 const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 const MAX_RESP: usize = 64 << 20;
@@ -44,7 +44,6 @@ enum Req {
     Days,
     Ids { day: String, after: String },
     Get { ids: Vec<String> },
-    Members,
     Blob { id: String },
     /// Content keys re-wrapped for the asking node, for members-mode envelopes it stored before it joined.
     Grants { ids: Vec<String> },
@@ -58,8 +57,6 @@ struct Resp {
     ids: Vec<String>,
     #[serde(default)]
     envelopes: Vec<String>,
-    #[serde(default)]
-    members: Option<MemberList>,
     #[serde(default)]
     blob: Option<String>,
     #[serde(default)]
@@ -154,7 +151,8 @@ impl std::fmt::Debug for Node {
 /// `peer`: the asking node's key (its iroh endpoint id is its Ed25519 node key).
 fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(node.members.read().unwrap().is_node(peer), "peer removed from membership");
-    let req: Req = serde_json::from_slice(req).context("bad sync request")?;
+    let (network, req): (String, Req) = serde_json::from_slice(req).context("bad sync request")?;
+    anyhow::ensure!(network == node.members.read().unwrap().network, "different network");
     let mut r = Resp::default();
     match req {
         Req::Days => r.days = node.store.day_hashes()?,
@@ -165,7 +163,6 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             r.envelopes = envelopes;
             r.taken = Some(taken);
         }
-        Req::Members => r.members = Some(node.members.read().unwrap().clone()),
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
         Req::Grants { ids } => {
             let ids: Vec<String> = ids.into_iter().take(GRANTS_PER_CALL).collect();
@@ -191,9 +188,9 @@ fn get_within(node: &Node, ids: &[String], budget: usize) -> Result<(Vec<String>
     Ok((out, ids.len()))
 }
 
-async fn call(conn: &Connection, req: &Req) -> Result<Resp> {
+async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
     let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&serde_json::to_vec(req)?).await?;
+    send.write_all(&serde_json::to_vec(&(network, req))?).await?;
     send.finish()?;
     let bytes = recv.read_to_end(MAX_RESP).await?;
     Ok(serde_json::from_slice(&bytes)?)
@@ -247,27 +244,12 @@ fn peers(node: &Node, lookup: &MemoryLookup) -> Vec<EndpointId> {
 }
 
 impl Ctx {
-    async fn announce_members(&self) {
-        self.gate.close_removed();
-        let list = self.node.members.read().unwrap().clone();
-        if let Ok(b) = serde_json::to_vec(&list) {
-            let _ = self.sender.broadcast(Bytes::from(b)).await;
-        }
-        let _ = self.sender.join_peers(self.peers()).await;
-    }
-
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
     async fn sync_with(&self, peer: EndpointId) -> Result<usize> {
         let node = &self.node;
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
-        if let Some(list) = call(&conn, &Req::Members).await?.members {
-            match node.adopt_members(&list) {
-                Ok(true) => self.announce_members().await,
-                Ok(false) => {}
-                Err(e) => tracing::warn!("member list from {} refused: {e:#}", peer.fmt_short()),
-            }
-        }
-        let theirs = call(&conn, &Req::Days).await?.days;
+        let network = node.members.read().unwrap().network.clone();
+        let theirs = call(&conn, &network, &Req::Days).await?.days;
         let n2 = node.clone();
         let mine = tokio::task::spawn_blocking(move || n2.store.day_hashes()).await??;
         let differ: Vec<String> = theirs.iter().filter(|(d, h)| mine.get(*d) != Some(*h)).map(|(d, _)| d.clone()).collect();
@@ -275,7 +257,7 @@ impl Ctx {
         for day in differ {
             let mut after = String::new();
             loop {
-                let page = call(&conn, &Req::Ids { day: day.clone(), after: after.clone() }).await?.ids;
+                let page = call(&conn, &network, &Req::Ids { day: day.clone(), after: after.clone() }).await?.ids;
                 anyhow::ensure!(page.len() <= IDS_PER_GET, "oversize id page");
                 let mut missing = Vec::new();
                 for id in &page {
@@ -287,7 +269,7 @@ impl Ctx {
                 }
                 let mut rest = missing.as_slice();
                 while !rest.is_empty() {
-                    let resp = call(&conn, &Req::Get { ids: rest.to_vec() }).await?;
+                    let resp = call(&conn, &network, &Req::Get { ids: rest.to_vec() }).await?;
                     let taken = resp.taken.context("missing envelope count")?;
                     anyhow::ensure!((1..=rest.len()).contains(&taken) && resp.envelopes.len() <= taken,
                                     "invalid envelope count");
@@ -309,7 +291,7 @@ impl Ctx {
         }
         // Attachments: blobs our envelopes name that we lack. The id is the hash, so any peer's copy will do.
         for id in node.store.missing_blobs()? {
-            if let Some(b64) = call(&conn, &Req::Blob { id: id.clone() }).await?.blob {
+            if let Some(b64) = call(&conn, &network, &Req::Blob { id: id.clone() }).await?.blob {
                 match mailcore::b64u_decode(&b64) {
                     Some(data) if (40..=crate::node::MAX_FILE + 40).contains(&data.len()) && blake3::hash(&data).to_hex().as_str() == id => {
                         node.store.put_blob(&id, &data, mailcore::now_millis())?;
@@ -322,7 +304,7 @@ impl Ctx {
         // Members-mode mail written before this node joined was not wrapped for it: ask for grants.
         let unreadable = node.store.unreadable(GRANTS_PER_CALL)?;
         if !unreadable.is_empty() {
-            let grants = call(&conn, &Req::Grants { ids: unreadable.clone() }).await?.grants;
+            let grants = call(&conn, &network, &Req::Grants { ids: unreadable.clone() }).await?.grants;
             let mut opened = 0;
             for (id, g) in &grants {
                 anyhow::ensure!(unreadable.contains(id), "unsolicited key grant");
@@ -365,31 +347,13 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<E
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
     let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, sender, gate };
 
-    // Gossip delivers envelopes and membership changes between periodic syncs.
+    // Gossip delivers envelopes between periodic syncs.
     let c = ctx.clone();
     tokio::spawn(async move {
         while let Some(ev) = receiver.next().await {
             match ev {
                 Ok(Event::Received(msg)) => {
-                    let v: serde_json::Value = match serde_json::from_slice(&msg.content) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!("gossip: not JSON: {e}");
-                            continue;
-                        }
-                    };
-                    if v.get("operator").is_some() && v.get("nodes").is_some() {
-                        match serde_json::from_value::<MemberList>(v).map_err(anyhow::Error::from).and_then(|l| c.node.adopt_members(&l)) {
-                            Ok(true) => {
-                                c.gate.close_removed();
-                                let _ = c.sender.join_peers(c.peers()).await;
-                            }
-                            Ok(false) => {}
-                            Err(e) => tracing::warn!("gossip: member list refused: {e:#}"),
-                        }
-                        continue;
-                    }
-                    match serde_json::from_value::<Envelope>(v).map_err(anyhow::Error::from).and_then(|e| c.node.ingest(e)) {
+                    match serde_json::from_slice::<Envelope>(&msg.content).map_err(anyhow::Error::from).and_then(|e| c.node.ingest(e)) {
                         Ok(Some(r)) => {
                             tracing::info!("gossip: stored #{} {}", r.id, &r.env_id[..12]);
                         }
@@ -432,12 +396,10 @@ pub async fn start(cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<E
     let cfg2 = cfg.clone();
     tokio::spawn(async move {
         loop {
-            if let Ok(file) = cfg2.members() {
-                match c.node.adopt_members(&file) {
-                    Ok(true) => c.announce_members().await,
-                    Ok(false) => {}
-                    Err(e) => tracing::warn!("member list file refused: {e:#}"),
-                }
+            match cfg2.members().and_then(|list| c.node.reload_members(&list)) {
+                Ok(true) => { c.gate.close_removed(); }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("local trust file refused: {e:#}"),
             }
             let peers = c.peers();
             futures::stream::iter(peers.iter().copied()).for_each_concurrent(4, |peer| {
@@ -470,22 +432,18 @@ mod tests {
 
     #[test]
     fn get_answers_stay_within_the_byte_budget() {
-        let (op, me) = (Seed::generate(), Seed::generate());
-        let mut list = MemberList {
-            v: 1,
-            network: "t".into(),
+        let me = Seed::generate();
+        let list = mailcore::MemberList {
+            v: 2,
+            network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1,
-            issued: mailcore::now_ts(),
-            operator: String::new(),
             members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![] }],
-            sig: String::new(),
         };
-        list.sign(&op);
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, _rx) = mpsc::channel(32);
         let recipients = list.all_keys();
-        let node = Node::new(Store::open(&path).unwrap(), list, op.public(), me, Opts::default(), tx);
+        let node = Node::new(Store::open(&path).unwrap(), list, me, Opts::default(), tx);
         let v = Verified { sender_sub: "s".into() };
         let mut ids = Vec::new();
         for i in 0..5 {

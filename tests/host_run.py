@@ -54,7 +54,7 @@ def main():
     os.makedirs(os.path.join(work, "keys"))
     os.makedirs(os.path.join(work, "home"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    pub = {n: run(bin_, "keygen", k(n)) for n in ("operator", "nodeA", "alice", "hostagent")}
+    pub = {n: run(bin_, "keygen", k(n)) for n in ("nodeA", "alice", "hostagent")}
     ids = os.path.join(work, "identities")
     os.mkdir(ids, 0o700)
     for name in ("alice", "hostagent"):
@@ -63,15 +63,15 @@ def main():
             os.fchmod(f.fileno(), 0o600)
             json.dump({"name": "t." + name, "sub": "agent:%s@test" % name, "seed": open(k(name)).read().strip()}, f)
     api, udp = free_port(), free_port(socket.SOCK_DGRAM)
-    lst = {"v": 1, "network": "test", "seq": 1, "issued": "", "operator": "",
+    lst = {"v": 2, "network": run(bin_, "network-id"), "seq": 1,
            "members": [{"name": "t.alice", "sub": "agent:alice@test", "key": pub["alice"]},
                        {"name": "t.hostagent", "sub": "agent:hostagent@test", "key": pub["hostagent"]}],
-           "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % udp]}], "sig": ""}
-    json.dump(lst, open(os.path.join(work, "members.unsigned.json"), "w"))
-    run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
+           "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % udp]}]}
+    json.dump(lst, open(os.path.join(work, "members.json"), "w"))
+
     A = Node(bin_, work, "A", {
         "data_dir": os.path.join(work, "dataA"), "api_listen": "127.0.0.1:%d" % api, "iroh_port": udp,
-        "node_key_file": k("nodeA"), "operator_key": pub["operator"], "members_file": os.path.join(work, "members.json"),
+        "node_key_file": k("nodeA"), "members_file": os.path.join(work, "members.json"),
         "identities_dir": ids, "sync_secs": 5})
     tok_agent, tok_alice = [run(bin_, "agent-token", os.path.join(ids, n + ".json"), pub["nodeA"]) for n in ("hostagent", "alice")]
     recipe = {

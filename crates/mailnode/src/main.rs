@@ -4,7 +4,7 @@
 //!   mailnode run CONFIG.json
 //!   mailnode keygen SEED_FILE                       (prints the public key; the seed stays in the file, mode 600)
 //!   mailnode pubkey SEED_FILE
-//!   mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json
+//!   mailnode network-id
 //!   mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
 
 mod api;
@@ -19,10 +19,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use mailcore::keys::fmt_key;
-use mailcore::MemberList;
 
 const USAGE: &str = "usage:\n  mailnode run CONFIG.json\n  mailnode keygen SEED_FILE\n  mailnode pubkey SEED_FILE\n  \
-     mailnode sign-members OPERATOR_SEED_FILE IN.json OUT.json\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]";
+     mailnode network-id\n  mailnode agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -44,17 +43,8 @@ async fn main() -> Result<()> {
             println!("{}", fmt_key(&config::read_seed(Path::new(&args[1]))?.public()));
             Ok(())
         }
-        Some("sign-members") if args.len() == 4 => {
-            let op = config::read_seed(Path::new(&args[1]))?;
-            let raw = std::fs::read_to_string(&args[2])?;
-            let mut list: MemberList = serde_json::from_str(&raw).context("member list JSON")?;
-            if list.issued.is_empty() {
-                list.issued = mailcore::now_ts();
-            }
-            list.sign(&op);
-            list.verify(&op.public())?;
-            std::fs::write(&args[3], serde_json::to_string_pretty(&list)?)?;
-            println!("signed member list seq {} by {}", list.seq, list.operator);
+        Some("network-id") if args.len() == 1 => {
+            println!("{}", mailcore::b64u(&mailcore::random_bytes::<32>()));
             Ok(())
         }
         Some("agent-token") if args.len() == 3 || args.len() == 4 => {
@@ -103,9 +93,9 @@ async fn run(path: &Path) -> Result<()> {
     anyhow::ensure!(cfg.data_dir.symlink_metadata()?.is_dir(), "data_dir must be a directory");
     std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))?;
     let seed = cfg.node_seed()?;
-    let members = cfg.best_members()?;
+    let members = cfg.members()?;
     if !members.is_node(&seed.public()) {
-        bail!("this node's key {} is not on the member list; add it and re-sign", fmt_key(&seed.public()));
+        bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));
     }
     let identities = cfg.identities();
     tracing::info!(
@@ -120,11 +110,10 @@ async fn run(path: &Path) -> Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities,
-        members_path: Some(cfg.adopted_members_path()),
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
     };
-    let operator = mailcore::keys::parse_key(&cfg.operator_key)?;
-    let node = Arc::new(node::Node::new(store, members, operator, seed, opts, out_tx));
+    store.bind_roster(&seed.public(), &members)?;
+    let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
     let _net = net::start(&cfg, node.clone(), out_rx).await?;
 
     let state = api::AppState {

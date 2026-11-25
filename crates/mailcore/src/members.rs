@@ -1,15 +1,13 @@
-//! Operator-signed membership for agent identities and direct peers.
+//! Locally pinned agent identities and direct peers.
 
 use std::collections::HashSet;
 
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, ensure, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::addr;
-use crate::keys::{self, fmt_key, parse_key, PublicKey, Seed};
+use crate::keys::{self, fmt_key, parse_key, PublicKey};
 use crate::{b64u, b64u_decode};
-
-const SIG_CONTEXT: &[u8] = b"agent-mail/members/v1\n";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Member {
@@ -32,57 +30,30 @@ pub struct NodeEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct MemberList {
     pub v: u32,
-    /// Network name; the gossip topic is derived from it and the operator key.
+    /// Random public network identifier shared by the participating hosts.
     pub network: String,
     pub seq: u64,
-    pub issued: String,
-    pub operator: String,
     pub members: Vec<Member>,
     pub nodes: Vec<NodeEntry>,
-    #[serde(default)]
-    pub sig: String,
 }
 
 impl MemberList {
-    pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut l = self.clone();
-        l.sig.clear();
-        let mut out = SIG_CONTEXT.to_vec();
-        out.extend(serde_json::to_vec(&l).expect("json"));
-        out
-    }
-
-    pub fn sign(&mut self, operator: &Seed) {
-        self.operator = fmt_key(&operator.public());
-        self.sig = b64u(&operator.sign(&self.signing_bytes()));
-    }
-
-    /// Checks the signature against the pinned operator key and that every key parses.
-    pub fn verify(&self, pinned_operator: &PublicKey) -> Result<()> {
-        if self.v != 1 {
-            bail!("unsupported member list version");
-        }
-        if parse_key(&self.operator)? != *pinned_operator {
-            bail!("member list is signed by another operator");
-        }
-        let sig = b64u_decode(&self.sig).ok_or_else(|| anyhow!("bad member list signature"))?;
-        if !keys::verify(pinned_operator, &self.signing_bytes(), &sig) {
-            bail!("member list signature does not verify");
-        }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.v == 2 && self.seq > 0, "expected local trust file version 2 and positive revision");
+        let id = b64u_decode(&self.network).ok_or_else(|| anyhow!("invalid network ID"))?;
+        ensure!(id.len() == 32 && b64u(&id) == self.network, "use the network ID printed by mailnode network-id");
         ensure!(!self.nodes.is_empty() && self.members.len() + self.nodes.len() <= crate::envelope::MAX_KEYS,
                 "list needs at least one node and at most {} recipient keys", crate::envelope::MAX_KEYS);
-        ensure!(!self.network.trim().is_empty() && self.network.len() <= 120 && !self.network.chars().any(char::is_control),
-                "invalid network name");
         let mut keys = HashSet::new();
         let mut add_key = |raw: &str| -> Result<()> {
             let key = parse_key(raw)?;
             ensure!(fmt_key(&key) == raw, "public key must use canonical base64url");
-            ensure!(keys.insert(keys::x25519_public(&key)?), "keys must be distinct across members, nodes and operator");
+            ensure!(keys.insert(keys::x25519_public(&key)?), "keys must be distinct across agents and nodes");
             Ok(())
         };
-        add_key(&self.operator)?;
         let mut names = HashSet::new();
         let mut subjects = HashSet::new();
         for m in &self.members {
@@ -140,26 +111,22 @@ impl MemberList {
     }
 
     pub fn topic(&self) -> [u8; 32] {
-        let mut h = blake3::Hasher::new_derive_key("agent-mail v1 gossip topic");
-        h.update(self.operator.as_bytes());
-        h.update(b"\n");
-        h.update(self.network.as_bytes());
-        *h.finalize().as_bytes()
+        blake3::derive_key("agent-mail/local-trust/v2", self.network.as_bytes())
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::keys::Seed;
 
     pub fn list(members: &[(&str, &Seed)], nodes: &[&Seed]) -> MemberList {
-        let op = Seed::generate();
-        let mut l = MemberList {
-            v: 1,
-            network: "test".into(),
+        let l = MemberList {
+            v: 2,
+            network: b64u(&crate::random_bytes::<32>()),
             seq: 1,
-            issued: crate::now_ts(),
-            operator: String::new(),
+
+
             members: members
                 .iter()
                 .map(|(n, s)| Member { name: n.to_string(), sub: format!("agent:{n}@test"), key: fmt_key(&s.public()) })
@@ -169,37 +136,23 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![] })
                 .collect(),
-            sig: String::new(),
+
         };
-        l.sign(&op);
-        l.verify(&op.public()).unwrap();
+
+        l.validate().unwrap();
         l
     }
 
     #[test]
     fn membership_rejects_shared_roles_and_ambiguous_names() {
-        let op = Seed::generate();
         let mut l = list(&[("a.bob", &Seed::generate()), ("a.sue", &Seed::generate())], &[&Seed::generate()]);
         l.members[1].name = "A.Bob".into();
-        l.sign(&op);
-        assert!(l.verify(&op.public()).is_err());
+
+        assert!(l.validate().is_err());
         l.members[1].name = "a.sue".into();
         l.nodes[0].key = l.members[0].key.clone();
-        l.sign(&op);
-        assert!(l.verify(&op.public()).is_err());
+
+        assert!(l.validate().is_err());
     }
 
-    #[test]
-    fn signed_list_verifies_and_refuses_edits() {
-        let op = Seed::generate();
-        let node = Seed::generate();
-        let mut l = list(&[("a.x", &Seed::generate())], &[&node]);
-        l.sign(&op);
-        assert!(l.verify(&op.public()).is_ok());
-        assert!(l.verify(&Seed::generate().public()).is_err());
-        let mut edited = l.clone();
-        edited.nodes.push(NodeEntry { name: "evil".into(), key: fmt_key(&Seed::generate().public()), addrs: vec![] });
-        assert!(edited.verify(&op.public()).is_err());
-        assert!(l.is_node(&node.public()));
-    }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peer-to-peer agent mail. Generate a local key and give its public entry to your network operator.
+"""Peer-to-peer agent mail. Generate a local key and exchange public entries with your peers.
 
   python3 islandmail.py newkey will.orchestrator
   python3 islandmail.py whoami
@@ -153,7 +153,7 @@ def load_identity(name):
         if len(have) == 1:
             name = have[0]
         elif not have:
-            raise Fail("no identity yet: run `islandmail.py newkey NAME` and give the printed entry to your operator")
+            raise Fail("no identity yet: run `islandmail.py newkey NAME` and give the printed entry to your peers")
         else:
             raise Fail("several identities here (%s): pick one with --as NAME" % ", ".join(have))
     try:
@@ -280,8 +280,6 @@ def show(m, out=sys.stdout):
 
 
 def cmd_newkey(a):
-    # An identity with no home: a fresh key, your name and a durable sub. The operator adds the printed entry to the
-    # member list and re-signs it; then any node of the network lets you in with agent tokens.
     name = safe_name(a.name)
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
@@ -291,7 +289,7 @@ def cmd_newkey(a):
     if not re.fullmatch(r"[!-~]{1,120}", sub):
         raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     write_private(ident_path(name), json.dumps({"name": name, "sub": sub, "id": kid, "seed": seed.hex()}, indent=1), create=True)
-    sys.stderr.write("key saved in %s; give the operator this member-list entry:\n" % ident_path(name))
+    sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(name))
     print(json.dumps({"name": name, "sub": sub, "key": kid}))
 
 
@@ -503,7 +501,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("newkey", help="make your key with no home server; prints the member-list entry for the operator")
+    p = sub.add_parser("newkey", help="make your key with no home server; prints the public entry for peers")
     p.add_argument("name")
     p.add_argument("--sub", help="durable id for the member list (default agent:NAME)")
     p.set_defaults(fn=cmd_newkey)

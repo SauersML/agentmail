@@ -3,7 +3,7 @@
 
   python3 tests/two_nodes.py --bin target/debug/mailnode --islandmail /path/to/islandmail.py [--workdir DIR]
 
-Everything is throwaway: an operator key, node keys and agent identities in --workdir.
+Everything is throwaway: node keys and agent identities in --workdir.
 Needs `websockets` (pip) for the MCPL check; skipped if missing.
 """
 import argparse
@@ -128,20 +128,19 @@ def main():
     k = lambda n: os.path.join(work, "keys", n + ".seed")
     os.makedirs(os.path.join(work, "keys"))
 
-    # Throwaway keys: operator, two nodes, three agents.
-    pub = {n: run(bin_, "keygen", k(n)) for n in ["operator", "nodeA", "nodeB", "alice", "bob", "carol"]}
+    # Throwaway keys: two nodes, three agents.
+    pub = {n: run(bin_, "keygen", k(n)) for n in ["nodeA", "nodeB", "alice", "bob", "carol"]}
     agents = {"alice": "t.alice", "bob": "t.bob", "carol": "u.carol"}
     ports = {"apiA": free_port(), "apiB": free_port(), "udpA": free_port(socket.SOCK_DGRAM), "udpB": free_port(socket.SOCK_DGRAM)}
     unsigned = {
-        "v": 1, "network": "test", "seq": 1, "issued": "", "operator": "",
+        "v": 2, "network": run(bin_, "network-id"), "seq": 1,
         "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents],
         "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % ports["udpA"]]},
                   {"name": "B", "key": pub["nodeB"], "addrs": ["127.0.0.1:%d" % ports["udpB"]]}],
-        "sig": "",
     }
-    with open(os.path.join(work, "members.unsigned.json"), "w") as f:
+    with open(os.path.join(work, "members.json"), "w") as f:
         json.dump(unsigned, f)
-    run(bin_, "sign-members", k("operator"), os.path.join(work, "members.unsigned.json"), os.path.join(work, "members.json"))
+
 
     # islandmail.py-style identity folders: node A hosts alice, node B hosts bob (their keys open private mail).
     for host, who in (("A", "alice"), ("B", "bob"), ("B", "carol")):
@@ -158,7 +157,7 @@ def main():
             "api_listen": "127.0.0.1:%d" % ports["api" + host],
             "iroh_port": ports["udp" + host],
             "node_key_file": k("node" + host),
-            "operator_key": pub["operator"],
+
             "members_file": os.path.join(work, "members.json"),
             "identities_dir": os.path.join(work, "ids" + host, "identities"),
             "sync_secs": 3,

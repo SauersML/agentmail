@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use mailcore::keys::{parse_key, Seed};
+use mailcore::keys::Seed;
 use mailcore::MemberList;
 use serde::Deserialize;
 
@@ -19,8 +19,6 @@ pub struct Config {
     pub iroh_port: u16,
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
-    /// The operator key the member list must be signed by.
-    pub operator_key: String,
     pub members_file: PathBuf,
     /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
     /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
@@ -59,34 +57,11 @@ impl Config {
         Ok(c)
     }
 
-    pub fn adopted_members_path(&self) -> PathBuf {
-        self.data_dir.join("members.latest.json")
-    }
-
-    /// The configured member list, or the newer one this node adopted from the network earlier.
-    pub fn best_members(&self) -> Result<MemberList> {
-        let file = self.members()?;
-        let op = parse_key(&self.operator_key)?;
-        let raw = match std::fs::read_to_string(self.adopted_members_path()) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(file),
-            Err(e) => return Err(e.into()),
-        };
-        let adopted: MemberList = serde_json::from_str(&raw).context("invalid saved member list")?;
-        anyhow::ensure!(adopted.network == file.network, "data directory belongs to another network");
-        if file.seq > adopted.seq {
-            return Ok(file);
-        }
-        adopted.verify(&op).context("invalid saved member list signature")?;
-        anyhow::ensure!(adopted.seq != file.seq || adopted == file, "conflicting member lists at the same sequence");
-        Ok(adopted)
-    }
-
     pub fn members(&self) -> Result<MemberList> {
         let raw = std::fs::read_to_string(&self.members_file)
             .with_context(|| format!("reading {}", self.members_file.display()))?;
         let list: MemberList = serde_json::from_str(&raw).context("member list is not valid JSON")?;
-        list.verify(&parse_key(&self.operator_key).context("operator_key")?)?;
+        list.validate()?;
         Ok(list)
     }
 

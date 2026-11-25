@@ -1,6 +1,6 @@
 # agentmail
 
-Agentmail replicates encrypted mail directly between peers over authenticated QUIC. Each host runs a node with a loopback HTTP, SSE and MCPL API. Agents create their own Ed25519 keys. Each network chooses an offline operator key to sign its membership list. Once configured, peers can exchange mail without an online identity issuer, directory, relay or mailbox service.
+Agentmail replicates encrypted mail directly between peers over authenticated QUIC. Each host runs a node with a loopback HTTP, SSE and MCPL API. Agents create their own Ed25519 keys. Each host chooses which agent and node public keys it trusts. Peers exchange mail without an identity issuer, directory, relay or mailbox service.
 
 ## Start a network
 
@@ -21,20 +21,14 @@ mailnode keygen node.seed
 python clients/islandmail.py newkey team.alice
 ```
 
-The operator runs `mailnode keygen operator.seed` once. Create `members.unsigned.json` from the public entries. Replace the example keys and addresses with your own. Use a reachable UDP address for each host. For a single node on one machine, use `127.0.0.1:4433`.
+Run `mailnode network-id` once and share the resulting public identifier with the participating hosts. On each host, create a local `members.json` file. Verify public keys directly with their owners through a trusted channel. Include your own node and the agents and peers you accept. Replace the placeholders below. Use a reachable UDP address for each host, or `127.0.0.1:4433` for a single machine.
 
 ```json
 {
-  "v": 1, "network": "team-mail", "seq": 1, "issued": "", "operator": "",
+  "v": 2, "network": "NETWORK_ID", "seq": 1,
   "members": [{"name": "team.alice", "sub": "agent:team.alice", "key": "ed25519:AGENT_PUBLIC_KEY"}],
   "nodes": [{"name": "first-host", "key": "ed25519:NODE_PUBLIC_KEY", "addrs": ["192.0.2.10:4433"]}]
 }
-```
-
-Sign the list. Give each host the signed file and the operator's public key through a trusted channel.
-
-```sh
-mailnode sign-members operator.seed members.unsigned.json members.json
 ```
 
 On each host, save this as `config.json`. Relative paths resolve from the config directory. Set `iroh_port` to the port advertised for this peer.
@@ -45,14 +39,13 @@ On each host, save this as `config.json`. Relative paths resolve from the config
   "api_listen": "127.0.0.1:8787",
   "iroh_port": 4433,
   "node_key_file": "node.seed",
-  "operator_key": "ed25519:OPERATOR_PUBLIC_KEY",
   "members_file": "members.json"
 }
 ```
 
-Upgrade nodes and clients together for envelope and sync protocol version 2 and use the configuration fields shown above. Obsolete keys are rejected. When upgrading, sign a fresh membership list with the operator key and a higher sequence number. Existing databases retain historical rows on disk. The API retains readable historical agent-signed mail. Peers replicate only version 2 envelopes. Private reads also require a recipient key from the original envelope. Older unattached uploads must be uploaded again to establish key ownership.
+Upgrade nodes and clients together. Local trust uses file version 2, envelope version 2 and sync protocol version 3. Use a fresh data directory when migrating from a deployment with a shared membership signer. Archive the previous database if you need its history. Each new database is bound to its node key and network.
 
-Run `mailnode run config.json`. To change membership, increment `seq`, sign again and place the new list on a running peer. It distributes the signed update. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
+Run `mailnode run config.json`. To change who a host trusts, edit its local `members.json` and increase `seq`. That node reloads the file on its sync interval. Every host independently approves its own changes. Protect both configuration files and their directories against unauthorized writes. Direct replication requires a working IP route and an open UDP port. An offline peer catches up when it reconnects.
 
 ## Send and receive
 
@@ -76,7 +69,7 @@ Read messages at `GET /api/messages?after=ID`, list threads at `GET /api/threads
 
 ## Security and storage
 
-The node checks the operator signature on membership, the writing peer's signature on each incoming envelope and the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients.
+The node checks the writing peer's key against its local trust file, verifies the peer's signature on each incoming envelope and verifies the sender's signature on the network identity, sender identity, routing fields, timestamp, attachment IDs and salted body digest. The digest covers the text and each attachment’s name, media type and size. Message bodies and attachments use XChaCha20-Poly1305 with fresh content keys. Each envelope wraps its content key separately for each recipient using an ephemeral X25519 key exchange. Peers see routing metadata including the sender, recipients, thread, time and attachment identifiers. Removing a member affects future access. Previously disclosed keys and plaintext stay with their recipients.
 
 The local node handles plaintext and keeps readable messages and attachment keys in SQLite. Protect its data directory, backups and agent key files. A compromised endpoint can read its local plaintext or sign as the identities whose seeds it holds. Peer operators control availability and may drop or delay messages.
 

@@ -32,23 +32,24 @@ def main():
         shutil.move(work, work + ".old-%d" % int(time.time()))
     os.makedirs(os.path.join(work, "keys"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    names = ["operator", "nodeA", "nodeB", "nodeC", "alice", "bob", "carol", "dave"]
+    names = ["nodeA", "nodeB", "nodeC", "alice", "bob", "carol", "dave"]
     pub = {n: run(bin_, "keygen", k(n)) for n in names}
     agents = {"alice": "t.alice", "bob": "t.bob", "carol": "u.carol"}
     P = {x: free_port() for x in ("apiA", "apiB", "apiC")}
     P.update({x: free_port(socket.SOCK_DGRAM) for x in ("udpA", "udpB", "udpC")})
 
+    network_id = run(bin_, "network-id")
+
     def member_list(seq, nodes, extra_members=()):
         lst = {
-            "v": 1, "network": "test", "seq": seq, "issued": "", "operator": "",
+            "v": 2, "network": network_id, "seq": seq,
             "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents]
                        + [{"name": "u.dave", "sub": "agent:dave@test", "key": pub["dave"]} for _ in extra_members],
             "nodes": [{"name": h, "key": pub["node" + h], "addrs": ["127.0.0.1:%d" % P["udp" + h]]} for h in nodes],
         }
-        raw = os.path.join(work, "members.%d.unsigned.json" % seq)
         out = os.path.join(work, "members.%d.json" % seq)
-        json.dump(lst, open(raw, "w"))
-        run(bin_, "sign-members", k("operator"), raw, out)
+        json.dump(lst, open(out, "w"))
+
         return out
 
     m1 = member_list(1, ["A", "B"])
@@ -58,7 +59,7 @@ def main():
     def cfg(h, **extra):
         c = {
             "data_dir": os.path.join(work, "data" + h), "api_listen": "127.0.0.1:%d" % P["api" + h],
-            "iroh_port": P["udp" + h], "node_key_file": k("node" + h), "operator_key": pub["operator"],
+            "iroh_port": P["udp" + h], "node_key_file": k("node" + h),
             "members_file": os.path.join(work, "members.%s.json" % h),
             "sync_secs": 2,
         }
@@ -130,11 +131,15 @@ def main():
             code = e.code
         check("upload over 25 MiB refused (413)", code == 413, str(code))
 
-        # 5. Member list replication: seq 2 (adds node C and member u.dave) given only to A.
+        # 5. Local trust change: seq 2 (adds node C and member u.dave) given only to A.
         m2 = member_list(2, ["A", "B", "C"], extra_members=["dave"])
         shutil.copy(m2, os.path.join(work, "members.A.json"))
-        got, dt = wait_for(lambda: req("GET", pb, "/api/me", atok(pb, "bob"))[1].get("members_seq") == 2, timeout=30)
-        check("B adopts seq 2 from the network (its own file still says 1)", got, "%.1fs" % dt)
+        got, dt = wait_for(lambda: req("GET", pa, "/api/node")[1]["members_seq"] == 2)
+        check("A reloads its local trust file", got)
+        check("another host cannot change B's local trust", req("GET", pb, "/api/node")[1]["members_seq"] == 1)
+        shutil.copy(m2, os.path.join(work, "members.B.json"))
+        got, dt = wait_for(lambda: req("GET", pb, "/api/node")[1]["members_seq"] == 2)
+        check("B independently approves the new peer", got)
         shutil.copy(m2, os.path.join(work, "members.C.json"))
         check("node C (only in seq 2; refuse_token_only) starts", C.start())
         got, dt = wait_for(lambda: [m for m in msgs(pc, "carol", "thread=signed") if m["attest"] == "agent"], timeout=40)
@@ -149,7 +154,7 @@ def main():
         rc, out = im(pc, "carol", "send", "--to", "all", "--thread", "c", "signed from C")
         check("C accepts a signed post from a client with only its agent key", rc == 0, out)
         got, dt = wait_for(lambda: [m for m in msgs(pb, "bob", "thread=c")], timeout=30)
-        check("B (accepting C only through the adopted list) receives C's mail", got and got[0]["text"] == "signed from C", "%.1fs" % dt)
+        check("B (accepting C through its own trust file) receives C's mail", got and got[0]["text"] == "signed from C", "%.1fs" % dt)
 
         rc, out = im(pc, "carol", "whoami")
         check("islandmail.py whoami on C with only the agent key", rc == 0 and "u.carol" in out, out)

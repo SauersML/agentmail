@@ -66,8 +66,6 @@ pub struct Posted {
 #[derive(Default)]
 pub struct Opts {
     pub identities: Vec<(String, Seed)>,
-    /// Where the latest adopted member list is kept.
-    pub members_path: Option<std::path::PathBuf>,
     /// Base URL written into attachment links.
     pub public_url: String,
 }
@@ -82,7 +80,6 @@ const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
 pub struct Node {
     pub store: Store,
     pub members: RwLock<MemberList>,
-    pub operator: mailcore::keys::PublicKey,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<Arc<Row>>,
@@ -96,7 +93,6 @@ impl Node {
     pub fn new(
         store: Store,
         members: MemberList,
-        operator: mailcore::keys::PublicKey,
         seed: Seed,
         opts: Opts,
         outbound: mpsc::Sender<Envelope>,
@@ -105,7 +101,6 @@ impl Node {
         Node {
             store,
             members: RwLock::new(members),
-            operator,
             seed,
             opts,
             events,
@@ -120,25 +115,13 @@ impl Node {
         self.members.read().unwrap().seq
     }
 
-    /// Adopts `list` if it is signed by the pinned operator, for this network, and newer than ours. Returns whether
-    /// it was adopted (the caller re-announces it and updates peers).
-    pub fn adopt_members(&self, list: &MemberList) -> Result<bool> {
-        list.verify(&self.operator)?;
+    /// Reload only from the local configuration file. Remote input never changes peer trust.
+    pub fn reload_members(&self, list: &MemberList) -> Result<bool> {
         let mut cur = self.members.write().unwrap();
-        if list.network != cur.network || list.seq <= cur.seq {
-            return Ok(false);
-        }
-        if let Some(p) = &self.opts.members_path {
-            use std::io::Write;
-            let tmp = p.with_extension("tmp");
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(&serde_json::to_vec(list)?)?;
-            file.sync_all()?;
-            std::fs::rename(tmp, p)?;
-            if let Some(dir) = p.parent() {
-                std::fs::File::open(dir)?.sync_all()?;
-            }
-        }
+        if *list == *cur { return Ok(false); }
+        anyhow::ensure!(list.network == cur.network && list.seq > cur.seq, "trust changes require the same network and a higher revision");
+        anyhow::ensure!(list.is_node(&self.seed.public()), "local node key missing from trust file");
+        self.store.bind_roster(&self.seed.public(), list)?;
         *cur = list.clone();
         drop(cur);
         for m in &list.members {
@@ -159,7 +142,7 @@ impl Node {
             mailcore::agent_token::verify(token, &members, &self.seed.public(), now)
         };
         let c = checked.map_err(|r| match r {
-            Refusal::NotMember(s) => ApiError::new(403, format!("{s}; ask its operator to add you")),
+            Refusal::NotMember(s) => ApiError::new(403, format!("{s}; have this peer pin your public entry")),
             Refusal::Bad(s) => ApiError::new(401, format!("token refused: {s}")),
         })?;
         if !self.store.use_token(&c.name, &c.jti, c.exp_ms, now)? {
@@ -677,26 +660,22 @@ mod tests {
     use mailcore::{Member, NodeEntry};
 
     fn setup() -> (Node, Seed, Seed, MemberList, mpsc::Receiver<Envelope>) {
-        let (op, node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate(), Seed::generate());
-        let mut list = MemberList {
-            v: 1,
+        let (node_a, node_b, alice) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let list = MemberList {
+            v: 2,
             network: "t".into(),
             seq: 1,
-            issued: now_ts(),
-            operator: String::new(),
             members: vec![Member { name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()) }],
             nodes: [&node_a, &node_b]
                 .iter()
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![] })
                 .collect(),
-            sig: String::new(),
         };
-        list.sign(&op);
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, rx) = mpsc::channel(32);
         let opts = Opts { public_url: "http://x".into(), ..Default::default() };
-        let node = Node::new(Store::open(&path).unwrap(), list.clone(), op.public(), node_a, opts, tx);
+        let node = Node::new(Store::open(&path).unwrap(), list.clone(), node_a, opts, tx);
         (node, alice, node_b, list, rx)
     }
 
@@ -935,13 +914,12 @@ mod tests {
     #[test]
     fn node_signs_for_a_caller_whose_key_it_holds() {
         let (_n, alice, node_b, list, _rx) = setup();
-        let op = mailcore::keys::parse_key(&list.operator).unwrap();
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
             let (tx, rx) = mpsc::channel(32);
             let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
             let node_seed = Seed::from_bytes(*node_b.bytes());
-            (Node::new(Store::open(&path).unwrap(), list.clone(), op, node_seed, opts, tx), rx)
+            (Node::new(Store::open(&path).unwrap(), list.clone(), node_seed, opts, tx), rx)
         };
         // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
