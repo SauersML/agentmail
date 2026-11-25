@@ -834,7 +834,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, rx) = mpsc::channel(32);
         let opts = Opts { public_url: "http://x".into(), ..Default::default() };
-        let node = Node::new(Store::open(&path).unwrap(), list.clone(), node_a, opts, tx);
+        let store = Store::open(&path).unwrap();
+        store.bind_roster(&node_a.public(), &list).unwrap();
+        let node = Node::new(store, list.clone(), node_a, opts, tx);
         (node, alice, node_b, list, rx)
     }
 
