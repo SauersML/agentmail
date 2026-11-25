@@ -311,7 +311,7 @@ impl Ctx {
                 }
             }
         }
-        // Attachments: blobs our envelopes name that we lack. The id is the hash, so any peer's copy will do.
+        // Attachments: blobs our envelopes name that we lack. The id is the hash, so any peer can supply a copy.
         for id in node.store.missing_blobs()? {
             if let Some(b64) = call(&conn, &network, &Req::Blob { id: id.clone() }).await?.blob {
                 match mailcore::b64u_decode(&b64) {
@@ -443,7 +443,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                     tracing::info!("gossip neighbor up {}", peer.fmt_short());
                 }
                 Ok(Event::NeighborDown(peer)) => tracing::info!("gossip neighbor down {}", peer.fmt_short()),
-                Ok(Event::Lagged) => tracing::warn!("gossip receiver lagged; anti-entropy will fill the gap"),
+                Ok(Event::Lagged) => tracing::warn!("gossip receiver lagged; anti-entropy fills the gap"),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("gossip receive error: {e}");
@@ -462,7 +462,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 continue; // anti-entropy carries it
             }
             if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
-                tracing::warn!("gossip broadcast failed (anti-entropy will carry it): {e}");
+                tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
             }
         }
     });
@@ -475,7 +475,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             match trust_out.recv().await {
                 Ok(msg) => {
                     if let Err(e) = c.sender.broadcast(Bytes::from(msg)).await {
-                        tracing::warn!("gossip broadcast failed (anti-entropy will carry it): {e}");
+                        tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}

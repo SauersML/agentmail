@@ -16,7 +16,7 @@ pub const MAX_CIPHERTEXT: usize = 512 * 1024;
 pub const MAX_KEYS: usize = 1000;
 /// Attachments per message (the compat API's limit).
 pub const MAX_BLOBS: usize = 10;
-/// An envelope dated further than this past the receiver's clock is refused (it will be fetched again later).
+/// An envelope dated further than this past the receiver's clock is refused (peers fetch it again later).
 pub const FUTURE_SKEW_MS: i64 = 10 * 60 * 1000;
 const SIG_CONTEXT: &[u8] = b"agent-mail/envelope/v3\n";
 const AD_CONTEXT: &str = "agent-mail/body/v1";
@@ -596,12 +596,12 @@ mod tests {
 
     #[test]
     fn node_certified_senders() {
-        let (mac, pod, will) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let (mac, pod, ops) = (Seed::generate(), Seed::generate(), Seed::generate());
         let (hypha, bob, carol) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let mut l = list(&[("b.carol", &carol)], &[&mac, &pod, &will]);
+        let mut l = list(&[("b.carol", &carol)], &[&mac, &pod, &ops]);
         l.nodes[0].names = vec!["hypha".into(), "sauersml.".into()];
         l.nodes[1].names = vec!["hypha".into()];
-        l.nodes[2].names = vec!["will.".into()];
+        l.nodes[2].names = vec!["ops.".into()];
         l.validate().unwrap();
         let now = crate::now_millis();
         let ts = crate::ts_from_millis(now - 1000);
@@ -615,13 +615,13 @@ mod tests {
         assert_eq!(e.verify(&l, &agents, now).unwrap().sender_sub, "agent:hypha");
         assert!(e.verify(&l, &l.agents(&[], &none, now), now).unwrap_err().to_string().contains("no certificate"));
 
-        // Out of namespace: will's node cannot vouch for sauersml.x, nor can an untrusted node.
-        let rogue = Cert::issue(&will, "sauersml.x", &bob.public(), &ts);
+        // Out of namespace: ops's node cannot vouch for sauersml.x, nor can an untrusted node.
+        let rogue = Cert::issue(&ops, "sauersml.x", &bob.public(), &ts);
         assert!(!l.accepts(&rogue));
         assert!(!l.accepts(&Cert::issue(&Seed::generate(), "hypha", &bob.public(), &ts)));
         let agents = l.agents(std::slice::from_ref(&rogue), &none, now);
         assert!(members::named(&agents, "sauersml.x").next().is_none());
-        assert!(certified_env(&l, &agents, &will, "sauersml.x", &bob, "all", Mode::Members, crate::now_ts(), Some(rogue))
+        assert!(certified_env(&l, &agents, &ops, "sauersml.x", &bob, "all", Mode::Members, crate::now_ts(), Some(rogue))
             .verify(&l, &agents, now).is_err());
 
         // A pin takes precedence: a cert for a pinned name with another key does not count.
@@ -638,7 +638,7 @@ mod tests {
         let p = certified_env(&l, &agents, &pod, "hypha", &hypha, "b.carol", Mode::Private, crate::now_ts(), Some(pod_cert.clone()));
         p.verify(&l, &agents, now).unwrap();
         assert!(p.open(&mac).unwrap().is_some() && p.open(&pod).unwrap().is_some() && p.open(&hypha).unwrap().is_some());
-        assert!(p.open(&will).unwrap().is_none());
+        assert!(p.open(&ops).unwrap().is_none());
 
         // Revocation by the mac counts only against the mac's cert, and only from its time on.
         let rev_at = now - 500;

@@ -26,7 +26,7 @@ pub fn valid_name(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("all")
 }
 
-/// A namespace entry in a trust file: an exact agent name, or a prefix ending in '.' (e.g. "will.").
+/// A namespace entry in a trust file: an exact agent name, or a prefix ending in '.' (e.g. "ops.").
 pub fn valid_namespace_entry(entry: &str) -> bool {
     match entry.strip_suffix('.') {
         Some(prefix) => valid_name(prefix),
@@ -181,11 +181,11 @@ mod tests {
         assert!(valid_name("sauersml.lead") && valid_name("hypha") && valid_name("_x-1"));
         assert!(!valid_name("all") && !valid_name("ALL") && !valid_name("a.") && !valid_name(".a") && !valid_name("a/b"));
         assert!(!valid_name("") && !valid_name(&"a".repeat(49)));
-        assert!(valid_namespace_entry("will.") && valid_namespace_entry("hypha"));
+        assert!(valid_namespace_entry("ops.") && valid_namespace_entry("hypha"));
         assert!(!valid_namespace_entry("*") && !valid_namespace_entry("all") && !valid_namespace_entry("all.")
                 && !valid_namespace_entry(".") && !valid_namespace_entry("a b."));
-        assert!(entry_covers("will.", "Will.Orchestrator") && entry_covers("hypha", "HYPHA"));
-        assert!(!entry_covers("will.", "will") && !entry_covers("will.", "willy.x") && !entry_covers("hypha", "hypha.x"));
+        assert!(entry_covers("ops.", "Ops.Orchestrator") && entry_covers("hypha", "HYPHA"));
+        assert!(!entry_covers("ops.", "ops") && !entry_covers("ops.", "opswest.x") && !entry_covers("hypha", "hypha.x"));
     }
 
     #[test]

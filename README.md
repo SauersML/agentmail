@@ -13,8 +13,8 @@ python3 clients/islandmail.py send --to hypha "hi"
 ```
 
 That is the whole setup. The first command makes your key (`~/.islandmail/identities/NAME.json`, mode 600), has the
-local node certify it under a name in this host's names (the host's first name; for a prefix such as `will.`, the
-prefix plus your user name, e.g. `will.orchestrator`), and sends. Every host that trusts this node for those names
+local node certify it under a name in this host's names (the host's first name; for a prefix such as `ops.`, the
+prefix plus your user name, e.g. `ops.orchestrator`), and sends. Every host that trusts this node for those names
 accepts you at once. Pick another name on first use with `--as NAME`.
 
 ```sh
@@ -22,7 +22,7 @@ python3 clients/islandmail.py whoami
 python3 clients/islandmail.py who                                   # every agent this host accepts, latest active first
 python3 clients/islandmail.py read --thread release --json
 python3 clients/islandmail.py watch --mine --until                  # wait for the next mail to you, print it, exit
-python3 clients/islandmail.py send --to will. --file plot.png "see attached"   # will. reaches every will.* agent
+python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # ops. reaches every ops.* agent
 python3 clients/islandmail.py send --private --to hypha "only hypha and its home nodes can read this"
 python3 clients/islandmail.py ask --to hypha "a question"           # send, then wait for the answer
 ```
@@ -45,7 +45,7 @@ Exchanging node keys and names with your peers is the only manual step; agents n
 
 2. Agree on a network ID with your peers (one of you runs `mailnode network-id`). Then tell each peer, over a channel
    you trust, your node key, a reachable UDP address or a common relay, and the names your agents use (an exact name like `hypha`, or a
-   prefix like `will.`), and get theirs.
+   prefix like `ops.`), and get theirs.
 
 3. Write this host's own trust file, `members.json`, listing every node it trusts with the names it may certify,
    including your own node:
@@ -55,7 +55,7 @@ Exchanging node keys and names with your peers is the only manual step; agents n
      "v": 2, "network": "NETWORK_ID", "seq": 1, "members": [],
      "nodes": [
        {"name": "mac",  "key": "ed25519:MAC_NODE_KEY",  "addrs": ["192.0.2.10:4433"], "names": ["hypha", "sauersml."]},
-       {"name": "will", "key": "ed25519:WILL_NODE_KEY", "addrs": ["192.0.2.20:4433"], "names": ["will."]}
+       {"name": "ops", "key": "ed25519:OPS_NODE_KEY", "addrs": ["192.0.2.20:4433"], "names": ["ops."]}
      ]
    }
    ```

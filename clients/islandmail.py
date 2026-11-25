@@ -3,26 +3,26 @@
 it; nothing else to set up.
 
   python3 islandmail.py send --to hypha "hi"     (first use: a key for the host's first name, certified, then sent)
-  python3 islandmail.py newkey will.orchestrator  (a key to pin by hand in trust files instead)
+  python3 islandmail.py newkey ops.orchestrator  (a key to pin by hand in trust files instead)
   python3 islandmail.py whoami
   python3 islandmail.py send --to sauersml.glead --thread oracle-design "text"      (or - to read stdin)
-  python3 islandmail.py send --to will. --file plot.png "see attached"              (will. = Will's whole team)
+  python3 islandmail.py send --to ops. --file plot.png "see attached"              (ops. = the entire ops team)
   python3 islandmail.py read --thread oracle-design --latest 20
   python3 islandmail.py read --to-me --after 4700
   python3 islandmail.py threads
-  python3 islandmail.py who                      # everyone who has used the mailbox (who will. for Will's team)
+  python3 islandmail.py who                      # everyone who has used the mailbox (who ops. for the ops team)
   python3 islandmail.py get 4711
   python3 islandmail.py download FILEID -o out.png
   python3 islandmail.py watch --mine            # stream mail to you as it arrives (resumes where it stopped)
   python3 islandmail.py watch --mine --until    # wait for the next mail to you, print it, exit (wake pattern)
-  python3 islandmail.py watch --mine --also-from will. --until   # ... or anything from Will's team
+  python3 islandmail.py watch --mine --also-from ops. --until   # ... or anything from the ops team
 
   python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
 
 Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
 readable only by you (the client refuses identity files other users can read).
 Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). ISLANDMAIL_NODE_KEY pins the token audience.
-Addressing: names separated by commas, a team prefix ending in a dot (will.), or all.
+Addressing: names separated by commas, a team prefix ending in a dot (ops.), or all.
 """
 import argparse
 import base64
@@ -662,7 +662,7 @@ def main():
     p.add_argument("--limit", type=int, default=40)
     p.set_defaults(fn=cmd_threads)
     p = sub.add_parser("who", help="everyone who has used the mailbox, most recently active first")
-    p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. will.")
+    p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. ops.")
     p.set_defaults(fn=cmd_who)
     p = sub.add_parser("get")
     p.add_argument("id", type=int)
@@ -674,7 +674,7 @@ def main():
     p = sub.add_parser("watch")
     p.add_argument("--name", default="main", help="resume-file name, so several watchers can coexist")
     p.add_argument("--mine", action="store_true", help="only mail addressed to you (or all), not from you")
-    p.add_argument("--also-from", action="append", help="with --mine: also mail from senders starting with this (e.g. will.)")
+    p.add_argument("--also-from", action="append", help="with --mine: also mail from senders starting with this (e.g. ops.)")
     p.add_argument("--skip-own", action="store_true", help="everything except mail you sent")
     p.add_argument("--until", action="store_true", help="exit after the first message printed")
     p.set_defaults(fn=cmd_watch)

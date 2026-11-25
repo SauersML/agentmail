@@ -31,12 +31,12 @@ mod tests {
     fn addressing_matches_old_server() {
         assert!(addressed_to("sauersml.lead", &["SauersML.Lead"]));
         assert!(addressed_to("sauersml/lead", &["sauersml.lead"]));
-        assert!(addressed_to("will., hypha", &["will.orchestrator"]));
+        assert!(addressed_to("ops., hypha", &["ops.orchestrator"]));
         assert!(addressed_to("all", &["x"]));
         assert!(addressed_to("*", &["x"]));
-        assert!(!addressed_to("will.", &["sauersml.lead"]));
+        assert!(!addressed_to("ops.", &["sauersml.lead"]));
         assert!(!addressed_to("sauersml.lea", &["sauersml.lead"]));
-        assert!(is_broadcast("a, will."));
+        assert!(is_broadcast("a, ops."));
         assert!(!is_broadcast("a, b"));
     }
 }

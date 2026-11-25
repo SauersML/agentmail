@@ -4,7 +4,7 @@ throwaway made here.
 
   python3 tests/network.py --bin target/debug/mailnode --islandmail clients/islandmail.py [--workdir DIR]
 
-Hosts: "mac" (names hypha, s.), "pod" (names hypha: a second home for hypha) and "will" (names will.). The mac's trust
+Hosts: "mac" (names hypha, s.), "pod" (names hypha: a second home for hypha) and "ops" (names ops.). The mac's trust
 file also lists an offline peer. Checks: an agent's first `islandmail.py send` on a host just works (key made with
 mode 600, certified by its node, mail delivered to another host) with no per-agent pins; names outside a host's names
 are refused; one agent served by two homes signs in and reads its private mail at either; a node's revocation ends
@@ -50,12 +50,12 @@ def main():
     work = work_directory(a.workdir)
     os.makedirs(os.path.join(work, "keys"))
     k = lambda n: os.path.join(work, "keys", n + ".seed")
-    hosts = ("mac", "pod", "will")
+    hosts = ("mac", "pod", "ops")
     pub = {h: run(bin_, "keygen", k(h)) for h in hosts + ("ghost",)}
     udp = {h: free_port(socket.SOCK_DGRAM) for h in hosts + ("ghost",)}
     api = {h: free_port() for h in hosts}
     network = run(bin_, "network-id")
-    names = {"mac": ["hypha", "s."], "pod": ["hypha"], "will": ["will."]}
+    names = {"mac": ["hypha", "s."], "pod": ["hypha"], "ops": ["ops."]}
 
     def node_entry(h, names_=None):
         return {"name": h, "key": pub[h], "addrs": ["127.0.0.1:%d" % udp[h]], "names": names_ if names_ is not None else names.get(h, [])}
@@ -100,24 +100,24 @@ def main():
 
         # The first command on a fresh host: key, certificate, delivery. No pins anywhere.
         t0 = time.time()
-        rc, out = cl("will", "send", "--to", "hypha", "first words from will", user="orchestrator")
+        rc, out = cl("ops", "send", "--to", "hypha", "first words from ops", user="orchestrator")
         check("first `send` on a host works with no setup", rc == 0, out[-200:])
         check("it took about a second", time.time() - t0 < 5, "%.1fs" % (time.time() - t0))
-        path = ident("will", "will.orchestrator")
+        path = ident("ops", "ops.orchestrator")
         check("the key is made under the host's names, mode 600",
               os.path.exists(path) and stat.S_IMODE(os.stat(path).st_mode) == 0o600)
-        rc, out = cl("mac", "send", "--to", "will.orchestrator", "hi will, from hypha")
+        rc, out = cl("mac", "send", "--to", "ops.orchestrator", "hi ops, from hypha")
         check("the mac's first command makes hypha (its first name)", rc == 0 and os.path.exists(ident("mac", "hypha")), out[-200:])
-        got, t = wait_for(lambda: [m for m in read("will") if m.get("from") == "hypha"], timeout=15)
-        check("will reads hypha's mail on another host", got and got[0]["text"] == "hi will, from hypha", "%.1fs" % t)
-        rc, out = cl("will", "send", "--to", "hypha", "a reply", user="orchestrator")
+        got, t = wait_for(lambda: [m for m in read("ops") if m.get("from") == "hypha"], timeout=15)
+        check("ops reads hypha's mail on another host", got and got[0]["text"] == "hi ops, from hypha", "%.1fs" % t)
+        rc, out = cl("ops", "send", "--to", "hypha", "a reply", user="orchestrator")
         got, t = wait_for(lambda: [m for m in read("mac") if m.get("text") == "a reply"], timeout=15)
-        check("and hypha reads will's reply", rc == 0 and bool(got), "%.1fs" % t)
+        check("and hypha reads ops's reply", rc == 0 and bool(got), "%.1fs" % t)
 
         # Outside the host's names: refused, and the uncertified key is dropped.
-        rc, out = cl("will", "--as", "s.mallory", "send", "--to", "hypha", "spoof")
+        rc, out = cl("ops", "--as", "s.mallory", "send", "--to", "hypha", "spoof")
         check("a name outside the host's names is refused", rc != 0 and "403" in out, out[-160:])
-        check("the refused key is not kept", not os.path.exists(ident("will", "s.mallory")))
+        check("the refused key is not kept", not os.path.exists(ident("ops", "s.mallory")))
         rc, out = cl("pod", "--as", "s.other", "whoami")
         check("the pod may not certify the mac's other names", rc != 0 and "403" in out, out[-160:])
 
@@ -133,37 +133,37 @@ def main():
         with open(os.path.join(work, "client-pod", cursor), "w") as f:
             f.write("0")
         # Send after hypha's mac certificate has replicated, so its key is in the signed recipient list.
-        rc, out = cl("will", "send", "--to", "hypha", "watch at the second home")
+        rc, out = cl("ops", "send", "--to", "hypha", "watch at the second home")
         check("mail posted for second-home watch", rc == 0, out[-160:])
         rc, out = cl("pod", "watch", "--mine", "--until", timeout=25)
         check("resumed watch gets the second home's certificate", rc == 0 and "> " in out, out[-160:])
         rc, out = cl("pod", "whoami")
         check("hypha signs in at its second home", rc == 0 and "hypha" in out, out[-200:])
-        homes = lambda: [x["homes"] for x in req("GET", api["will"], "/api/agents", token=cl(
-            "will", "selftoken", "--ttl", "60", user="orchestrator")[1])[1].get("agents", []) if x["name"] == "hypha"]
+        homes = lambda: [x["homes"] for x in req("GET", api["ops"], "/api/agents", token=cl(
+            "ops", "selftoken", "--ttl", "60", user="orchestrator")[1])[1].get("agents", []) if x["name"] == "hypha"]
         got, t = wait_for(lambda: [sorted(h) for h in homes()] == [["mac", "pod"]], timeout=15)
-        check("will's host sees hypha with two homes", bool(got), "%.1fs" % t)
-        rc, out = cl("will", "send", "--private", "--to", "hypha", "for hypha only", user="orchestrator")
-        check("will sends private mail to hypha", rc == 0, out[-200:])
+        check("ops's host sees hypha with two homes", bool(got), "%.1fs" % t)
+        rc, out = cl("ops", "send", "--private", "--to", "hypha", "for hypha only", user="orchestrator")
+        check("ops sends private mail to hypha", rc == 0, out[-200:])
         for h in ("mac", "pod"):
             got, t = wait_for(lambda: [m for m in read(h) if m.get("text") == "for hypha only"], timeout=15)
             check("hypha reads the private mail at the %s" % h, bool(got), "%.1fs" % t)
-        rc, out = cl("pod", "send", "--private", "--to", "will.orchestrator", "private reply from the pod")
-        got, t = wait_for(lambda: [m for m in read("will") if m.get("text") == "private reply from the pod"], timeout=15)
+        rc, out = cl("pod", "send", "--private", "--to", "ops.orchestrator", "private reply from the pod")
+        got, t = wait_for(lambda: [m for m in read("ops") if m.get("text") == "private reply from the pod"], timeout=15)
         check("hypha writes private mail from the pod", rc == 0 and bool(got), out[-120:])
         got, _ = wait_for(lambda: [m for m in read("mac") if m.get("text") == "private reply from the pod"], timeout=15)
         check("and reads its own private mail at the mac", bool(got))
 
-        # Revocation by will's node: sign-in ends there at once, and other hosts learn it.
-        rc, out = cl("will", "--as", "will.temp", "whoami", user="temp")
-        check("a second agent on will's host", rc == 0, out[-120:])
-        p = subprocess.run([bin_, "revoke", os.path.join(work, "will.json"), "will.temp"], capture_output=True, text=True)
-        check("mailnode revoke", p.returncode == 0 and "revoked will.temp" in p.stdout, (p.stdout + p.stderr)[-160:])
-        rc, out = cl("will", "--as", "will.temp", "whoami", user="temp")
+        # Revocation by ops's node: sign-in ends there at once, and other hosts learn it.
+        rc, out = cl("ops", "--as", "ops.temp", "whoami", user="temp")
+        check("a second agent on ops's host", rc == 0, out[-120:])
+        p = subprocess.run([bin_, "revoke", os.path.join(work, "ops.json"), "ops.temp"], capture_output=True, text=True)
+        check("mailnode revoke", p.returncode == 0 and "revoked ops.temp" in p.stdout, (p.stdout + p.stderr)[-160:])
+        rc, out = cl("ops", "--as", "ops.temp", "whoami", user="temp")
         check("the revoked agent cannot sign in", rc != 0 and "403" in out, out[-160:])
         tok = lambda: cl("mac", "selftoken", "--ttl", "60")[1]
         gone, t = wait_for(lambda: not [x for x in req("GET", api["mac"], "/api/agents", token=tok())[1].get("agents", [])
-                                        if x["name"] == "will.temp"], timeout=15)
+                                        if x["name"] == "ops.temp"], timeout=15)
         check("the revocation replicates", bool(gone), "%.1fs" % t)
 
         # Trust-file reload on its own timer: drop "s." from the mac's names while the ghost peer is offline; an idle

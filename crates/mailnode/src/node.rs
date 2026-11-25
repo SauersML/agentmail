@@ -388,7 +388,7 @@ impl Node {
         if to_v.is_none() || to_v == Some(&Value::Null) || to_v == Some(&json!("")) {
             return Err(ApiError::new(
                 400,
-                "to is required: names (sauersml.glead), a team prefix ending in a dot (will.), or all",
+                "to is required: names (sauersml.glead), a team prefix ending in a dot (ops.), or all",
             ));
         }
         let to = field(to_v.unwrap(), "to", valid_to)?;
@@ -703,7 +703,7 @@ pub fn field(v: &Value, name: &str, ok: impl Fn(&str) -> bool) -> Result<String,
     let s: String = v.as_str().map(|s| s.nfc().filter(|c| !is_format_char(*c)).collect::<String>()).unwrap_or_default();
     let s = s.trim().to_string();
     if s.is_empty() || s.encode_utf16().count() > MAX_FIELD || !ok(&s) {
-        return Err(ApiError::new(400, format!("{name} must be 1-{MAX_FIELD} characters, like sauersml.glead or will.")));
+        return Err(ApiError::new(400, format!("{name} must be 1-{MAX_FIELD} characters, like sauersml.glead or ops.")));
     }
     Ok(s)
 }
@@ -1164,17 +1164,17 @@ mod tests {
 
     /* Node-certified agents */
 
-    /// Nodes "mac" (names hypha, h.) and "pod" (names hypha), a third node "will" (names will.); one network.
+    /// Nodes "mac" (names hypha, h.) and "pod" (names hypha), a third node "ops" (names ops.); one network.
     fn homes() -> (Node, Node, Seed, MemberList) {
-        let (mac, pod, will) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let names = [vec!["hypha".to_string(), "h.".into()], vec!["hypha".into()], vec!["will.".into()]];
+        let (mac, pod, ops) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let names = [vec!["hypha".to_string(), "h.".into()], vec!["hypha".into()], vec!["ops.".into()]];
         let list = MemberList {
             v: 2,
             network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1,
             members: vec![],
-            nodes: [&mac, &pod, &will].iter().zip(names).enumerate()
-                .map(|(i, (s, names))| NodeEntry { name: ["mac", "pod", "will"][i].into(), key: fmt_key(&s.public()), addrs: vec![], names })
+            nodes: [&mac, &pod, &ops].iter().zip(names).enumerate()
+                .map(|(i, (s, names))| NodeEntry { name: ["mac", "pod", "ops"][i].into(), key: fmt_key(&s.public()), addrs: vec![], names })
                 .collect(),
         };
         list.validate().unwrap();
@@ -1183,7 +1183,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(32);
             Node::new(Store::open(&path).unwrap(), list.clone(), seed, Opts { public_url: "http://x".into(), ..Default::default() }, tx)
         };
-        (mk(mac), mk(pod), will, list)
+        (mk(mac), mk(pod), ops, list)
     }
 
     fn proof(agent: &Seed, name: &str, node: &Node) -> Value {
@@ -1231,7 +1231,7 @@ mod tests {
         bad["name"] = json!("h.x");
         assert_eq!(status(mac.certify(&bad)), 400, "proof signed for another name");
         assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &pod))), 400, "proof for another node");
-        let e = mac.certify(&proof(&hypha, "will.x", &mac)).unwrap_err();
+        let e = mac.certify(&proof(&hypha, "ops.x", &mac)).unwrap_err();
         assert_eq!(e.status, 403);
         assert!(e.message.contains("hypha, h."), "{}", e.message);
         assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
@@ -1259,30 +1259,30 @@ mod tests {
 
     #[test]
     fn certs_are_keyed_by_node_and_key() {
-        let (mac, pod, will, list) = homes();
+        let (mac, pod, ops, list) = homes();
         let hypha = Seed::generate();
         // A trusted node squatting on hypha's key under a name of its own does not block the mac's cert.
-        let squat = Cert::issue(&will, "will.hypha", &hypha.public(), &now_ts());
+        let squat = Cert::issue(&ops, "ops.hypha", &hypha.public(), &now_ts());
         assert!(list.accepts(&squat));
         assert!(mac.take_cert(&squat).unwrap());
         assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
         assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
         assert_eq!(mac.store.certs().unwrap().len(), 2);
         // Out of namespace, or from an untrusted node: refused, never stored.
-        assert!(pod.take_cert(&Cert::issue(&will, "hypha", &Seed::generate().public(), &now_ts())).is_err());
-        assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "will.x", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&ops, "hypha", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "ops.x", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.store.certs().unwrap().is_empty());
         // No trusted node can crowd out the others: at most MAX_CERTS_PER_NODE from each.
         for i in 0..crate::store::MAX_CERTS_PER_NODE {
-            pod.store.put_cert(&Cert::issue(&will, &format!("will.a{i}"), &Seed::generate().public(), &now_ts())).unwrap();
+            pod.store.put_cert(&Cert::issue(&ops, &format!("ops.a{i}"), &Seed::generate().public(), &now_ts())).unwrap();
         }
-        assert!(pod.take_cert(&Cert::issue(&will, "will.more", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&ops, "ops.more", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.take_cert(&Cert::issue(&mac.seed, "hypha", &hypha.public(), &now_ts())).unwrap());
     }
 
     #[test]
     fn revocation_is_scoped_to_its_node_and_its_time() {
-        let (mut mac, pod, will, _) = homes();
+        let (mut mac, pod, ops, _) = homes();
         let hypha = Seed::generate();
         mac.opts.identities.push(("hypha".into(), hypha.clone()));
         let (_, c) = mac.certify(&proof(&hypha, "hypha", &mac)).unwrap();
@@ -1291,7 +1291,7 @@ mod tests {
         let before = mac.post(&who, &json!({"to": "all", "text": "before"})).unwrap();
         let env_before: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&before.row.env_id)).unwrap()[0]).unwrap();
         // Another node's revocation of the same key does not touch the mac's cert.
-        let foreign = Revocation::sign(&will, "hypha", &hypha.public(), &now_ts());
+        let foreign = Revocation::sign(&ops, "hypha", &hypha.public(), &now_ts());
         assert!(mac.take_revocation(&foreign).unwrap());
         assert!(mac.active(&who));
         assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
