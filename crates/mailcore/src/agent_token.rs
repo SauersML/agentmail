@@ -65,16 +65,14 @@ fn bad(s: impl Into<String>) -> Refusal {
 }
 
 fn rfc3339(ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    crate::ts_from_millis(ms)
 }
 
 fn parse_time(s: &str, what: &str) -> Result<i64, Refusal> {
     if s.len() > 40 {
         return Err(bad(format!("{what} is not an RFC 3339 time")));
     }
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|t| t.timestamp_millis())
-        .map_err(|_| bad(format!("{what} is not an RFC 3339 time")))
+    crate::parse_rfc3339(s).ok_or_else(|| bad(format!("{what} is not an RFC 3339 time")))
 }
 
 fn valid_jti(j: &str) -> bool {

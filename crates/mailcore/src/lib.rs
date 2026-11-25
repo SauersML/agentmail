@@ -32,12 +32,14 @@ pub fn b64u_decode(s: &str) -> Option<Vec<u8>> {
 
 /// Envelope timestamps are always this shape (UTC, milliseconds, `Z`), so string order is time order.
 pub fn ts_from_millis(ms: i64) -> String {
-    let t = chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
-    t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    let t = time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    t.format(time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"))
+        .expect("UTC timestamp")
 }
 
 pub fn now_millis() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
 pub fn now_ts() -> String {
@@ -49,9 +51,13 @@ pub fn parse_ts(ts: &str) -> Option<i64> {
     if ts.len() != 24 || !ts.ends_with('Z') {
         return None;
     }
-    let t = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
-    let ms = t.timestamp_millis();
+    let ms = parse_rfc3339(ts)?;
     (ts_from_millis(ms) == ts).then_some(ms)
+}
+
+fn parse_rfc3339(s: &str) -> Option<i64> {
+    let t = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()?;
+    Some(t.unix_timestamp_nanos().div_euclid(1_000_000) as i64)
 }
 
 pub fn random_bytes<const N: usize>() -> [u8; N] {
