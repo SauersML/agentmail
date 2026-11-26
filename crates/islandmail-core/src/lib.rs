@@ -104,6 +104,10 @@ pub fn id_prefix_range(prefix: &str) -> Option<(String, String)> {
         let v = B32.iter().position(|&x| x == c.to_ascii_lowercase())?;
         bits.extend((0..5).rev().map(|i| (v >> i) & 1 == 1));
     }
+    // A full 52-character id spends only one bit of its last character: any other bit set there names no id.
+    if bits[256.min(bits.len())..].contains(&true) {
+        return None;
+    }
     bits.truncate(256);
     let hex = |fill: bool| {
         let mut all = bits.clone();

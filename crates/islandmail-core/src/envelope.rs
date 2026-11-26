@@ -696,6 +696,9 @@ mod tests {
         let (lo, hi) = crate::id_prefix_range("abcdefgi").unwrap();
         assert!(env < lo || env > hi);
         assert!(crate::id_prefix_range("ab1").is_none() && crate::id_prefix_range("").is_none());
+        // Fuzz find (codecs): a 52nd character with any of its 4 unused bits set used to resolve to another id.
+        assert!(crate::id_prefix_range(&format!("{}b", &id[..51])).is_none());
+        assert!(crate::id_prefix_range("ggijjjjjjjj666g2uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu6g").is_none());
     }
 
     #[test]
