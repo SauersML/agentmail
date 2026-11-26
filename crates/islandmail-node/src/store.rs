@@ -1066,6 +1066,31 @@ impl Store {
         Ok(())
     }
 
+    /// Rows stored as plain mail with no room fields whose content key this node holds: `(env_id, envelope, ck)`.
+    /// A build that did not know one of a message's room fields (say a newer membership event) stored it this way.
+    pub fn plain_readable(&self) -> Result<Vec<(String, String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT env_id, env, ck FROM messages WHERE kind = 'mail' AND meta IS NULL AND ck IS NOT NULL")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Give a row stored as plain mail the room fields its signed body carries. Ok(true) when the row changed.
+    pub fn set_room_fields(&self, env_id: &str, extra: &Extra) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        Ok(db.execute("UPDATE messages SET kind = ?, meta = ?, mentions = ?, reply_to = ? \
+                       WHERE env_id = ? AND kind = 'mail' AND meta IS NULL",
+                      params![extra.kind, extra.meta, extra.mentions, extra.reply_to, env_id])? > 0)
+    }
+
+    /// Test only: store a row the way a build that could not read its room fields did.
+    #[cfg(test)]
+    pub fn forget_room_fields(&self, env_id: &str) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("UPDATE messages SET kind = 'mail', meta = NULL, mentions = NULL, reply_to = NULL WHERE env_id = ?", [env_id])?;
+        Ok(())
+    }
+
     pub fn count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
