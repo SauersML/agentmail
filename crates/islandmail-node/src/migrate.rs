@@ -32,7 +32,7 @@ fn backup_path(path: &Path, from: impl std::fmt::Display) -> PathBuf {
 /// together, so a failure leaves the store as it was.
 pub fn store_with(db: &mut Connection, path: &Path, version: i64, current: i64, steps: &[(i64, &str)]) -> Result<bool> {
     ensure!(version <= current, "{}: {}", path.display(), versions::too_new("store", version, current));
-    ensure!(version >= 1, "{} is not an Islandmail store", path.display());
+    ensure!(version >= 1, "{} has no store version: it is not an Islandmail store, or {}", path.display(), versions::PRE_RELEASE);
     if version == current {
         return Ok(false);
     }
@@ -85,6 +85,11 @@ pub fn json_with(what: &str, value: &mut Value, current: u32, steps: &[(u32, Jso
 }
 
 pub fn trust(value: &mut Value) -> Result<bool> {
+    // Pre-release builds numbered the trust file 2: not "newer", and upgrading would not help.
+    if let Some(v) = value.get("v").and_then(Value::as_u64) {
+        ensure!(!versions::PRE_RELEASE_TRUST_FILE.iter().any(|p| u64::from(*p) == v),
+                "trust file version {v} is not one this build reads: {}", versions::PRE_RELEASE);
+    }
     json_with("trust file", value, versions::TRUST_FILE, TRUST_STEPS)
 }
 
@@ -175,6 +180,29 @@ mod tests {
         assert!(!backup_path(&path, 1).exists());
         std::fs::write(&path, br#"{"v":9,"seq":1}"#).unwrap();
         assert!(format!("{:#}", file(&path, trust).unwrap_err()).contains("upgrade islandmail-node"));
+    }
+
+    #[test]
+    fn pre_release_files_get_the_rejoin_advice_not_upgrade() {
+        let path = tmp("members.json");
+        std::fs::write(&path, br#"{"v":2,"network":"NET","seq":1,"members":[],"nodes":[]}"#).unwrap();
+        let e = format!("{:#}", file(&path, trust).unwrap_err());
+        assert!(e.contains("pre-release") && e.contains("join again") && !e.contains("upgrade islandmail-node"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"v":2,"network":"NET","seq":1,"members":[],"nodes":[]}"#.to_vec());
+        // Any other unknown version is still from a newer build.
+        let mut newer = serde_json::json!({"v": 3});
+        assert!(trust(&mut newer).unwrap_err().to_string().contains("upgrade islandmail-node"));
+        // A store with data but no version (pre-release builds never set one).
+        let path = tmp("mail.sqlite");
+        let mut db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE messages (x TEXT)").unwrap();
+        let e = store(&mut db, &path, 0).unwrap_err().to_string();
+        assert!(e.contains("pre-release") && e.contains("join again"), "{e}");
+    }
+
+    #[test]
+    fn a_later_trust_file_version_never_reuses_a_pre_release_number() {
+        assert!(!versions::PRE_RELEASE_TRUST_FILE.contains(&versions::TRUST_FILE));
     }
 
     #[test]

@@ -1115,9 +1115,12 @@ def node_exe(a):
 
 def read_invite(exe, invite):
     # The node binary checks the invite (signature, expiry) and says what it holds, before anything is set up from it.
-    p = subprocess.run([exe, "invite-info", invite.strip()], capture_output=True, text=True)
+    # No backtrace (RUST_BACKTRACE in an agent sandbox): the refusal is the last line of the error, not a stack frame.
+    env = dict(os.environ, RUST_BACKTRACE="0", RUST_LIB_BACKTRACE="0")
+    p = subprocess.run([exe, "invite-info", invite.strip()], capture_output=True, text=True, env=env)
     if p.returncode != 0:
-        raise Fail((p.stderr.strip().splitlines() or ["invite refused"])[-1].removeprefix("Error: "))
+        lines = p.stderr.split("Stack backtrace:")[0].strip().splitlines()
+        raise Fail((lines or ["invite refused"])[-1].strip().removeprefix("Error: "))
     return json.loads(p.stdout)
 
 
@@ -1933,8 +1936,7 @@ def cmd_watch(a):
                         or any(m["from"].startswith(x) for x in a.also_from or []))
                     if print_it:
                         show(m)
-                        for hook in hooks:
-                            hook(ident, m)
+                        run_hooks(hooks, ident, m, a.name)
                     after = m["seq"]
                     write_private(resume, str(after))
                     if print_it and a.until:
@@ -1954,6 +1956,22 @@ def cmd_watch(a):
 
 
 HOOK_TIMEOUT = 120
+HOOK_RETRIES = (1, 3, 10)  # seconds before each retry of a failed hook
+
+
+def run_hooks(hooks, ident, m, name):
+    # At least once: the cursor moves past a message only after every hook took it. A failed hook is retried (only
+    # that hook); if it still fails, watch exits non-zero with the cursor before the message, so the next watch with
+    # this --name delivers it again. Hooks dedupe on the message id (ISLANDMAIL_ID).
+    pending = hooks
+    for wait in HOOK_RETRIES + (None,):
+        pending = [hook for hook in pending if not hook(ident, m)]
+        if not pending or wait is None:
+            break
+        time.sleep(wait)
+    if pending:
+        raise Fail("the arrival hook failed for %s %d times; the cursor stays before it, so the next watch --name %s "
+                   "delivers it again" % (m["id"], len(HOOK_RETRIES) + 1, name))
 
 
 def hook_payload(ident, m):
@@ -1984,12 +2002,14 @@ def arrival_hooks(a):
                        ISLANDMAIL_MENTION="1" if p["mention"] else "0")
             try:
                 r = subprocess.run(argv, input=json.dumps(p).encode(), env=env, timeout=HOOK_TIMEOUT)
-                if r.returncode:
-                    sys.stderr.write("watch: --exec exited %d for %s\n" % (r.returncode, m["id"]))
+                if r.returncode == 0:
+                    return True
+                sys.stderr.write("watch: --exec exited %d for %s\n" % (r.returncode, m["id"]))
             except subprocess.TimeoutExpired:
                 sys.stderr.write("watch: --exec still running after %d s for %s; stopped it\n" % (HOOK_TIMEOUT, m["id"]))
             except OSError as e:
                 sys.stderr.write("watch: --exec failed for %s: %s\n" % (m["id"], e))
+            return False
         hooks.append(run_exec)
     if a.post:
         url = urllib.parse.urlsplit(a.post)
@@ -2011,8 +2031,10 @@ def arrival_hooks(a):
         def run_post(ident, m):
             try:
                 http("POST", a.post, json.dumps(hook_payload(ident, m)).encode(), headers, raw=True, timeout=10)
+                return True
             except Fail as e:
                 sys.stderr.write("watch: --post failed for %s: %s\n" % (m["id"], e))
+                return False
         hooks.append(run_post)
     return hooks
 

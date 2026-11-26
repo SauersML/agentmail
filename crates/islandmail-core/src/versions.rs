@@ -10,6 +10,13 @@ pub const ENVELOPE_READS: &[u32] = &[1];
 
 /// Trust file (`members.json`) version this build writes; older ones are migrated at start.
 pub const TRUST_FILE: u32 = 1;
+/// Trust file versions that only pre-release builds (before v0.1.0, when every format restarted at 1) wrote. They
+/// cannot be migrated, and no later trust file version may reuse these numbers (the node's migrate tests check).
+pub const PRE_RELEASE_TRUST_FILE: &[u32] = &[2];
+/// What to do with files a pre-release build wrote.
+pub const PRE_RELEASE: &str = "a pre-release Islandmail build (before v0.1.0) wrote it, and pre-release data cannot be \
+    migrated: stop the node, move its folder (config, trust file and data directory) aside, and join again with a new \
+    invite (islandmail.py join INVITE)";
 /// Node config (`config.json`) version; a config without `v` is version 1.
 pub const CONFIG: u32 = 1;
 /// SQLite store format (`PRAGMA user_version`); older stores are migrated in place at start.

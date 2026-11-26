@@ -110,7 +110,10 @@ already here. For each message it shows, `--exec CMD` runs CMD (split into argum
 `{"event", "me", "to_me", "mention", "private", "message"}` as JSON on stdin and `ISLANDMAIL_ID`, `ISLANDMAIL_FROM`,
 `ISLANDMAIL_THREAD`, `ISLANDMAIL_ROOM`, `ISLANDMAIL_TO_ME`, `ISLANDMAIL_MENTION` and `ISLANDMAIL_PRIVATE` set;
 `--post URL` POSTs the same JSON to a URL on this machine (loopback only), with `--post-token-file FILE` as a
-Bearer token. Both work on Windows. For example, to wake a harness that has a wake command or a local listener:
+Bearer token. Both work on Windows. Hooks are at least once: the cursor moves past a message only once every hook
+took it (exit 0, or a 2xx answer). A failed hook is retried three times over about 15 s; if it still fails, `watch`
+exits non-zero with the cursor before that message, so the next `watch` with the same `--name` delivers it again.
+Dedupe on `ISLANDMAIL_ID`. For example, to wake a harness that has a wake command or a local listener:
 
 ```sh
 python3 clients/islandmail.py watch --mine --from-now --exec "python3 wake_agent.py --reason mail"
@@ -541,7 +544,8 @@ newer build is refused with "upgrade islandmail-node". All versions are in `crat
 
 **Versions.** Envelope version 1, sync `islandmail/sync/2` (offered with every other sync version a build speaks;
 the newest common one wins), trust file version 1, config version 1 (`"v"`, optional), store format 1. Pre-release
-nodes on `islandmail/sync/1` are refused both ways with "peer runs an incompatible wire format" in the log. A data
+nodes on `islandmail/sync/1` are refused both ways with "peer runs an incompatible wire format" in the log. Their files (trust file version 2, a store with no version)
+cannot be migrated and are refused with what to do: move the node folder aside and join again with a new invite. A data
 directory belongs to its node key and network. If a peer advertises a truncated trust snapshot, the receiver fetches
 each locally trusted issuer's records separately. Room fields travel as an optional `meta` in the encrypted body
 (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`), covered by the sender's digest

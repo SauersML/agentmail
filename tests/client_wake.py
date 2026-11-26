@@ -21,6 +21,11 @@ from two_nodes import RESULTS, Node, check, free_port, run, work_directory  # no
 
 HOOK = r'''import json, os, sys
 event = json.load(sys.stdin)
+if os.environ.get("FAILS_FILE"):  # a hook that is down: exits 75 while FAILS_FILE counts down
+    fails = int(open(os.environ["FAILS_FILE"]).read() or 0)
+    if fails:
+        open(os.environ["FAILS_FILE"], "w").write(str(fails - 1))
+        sys.exit(75)
 env = {k: v for k, v in os.environ.items() if k.startswith("ISLANDMAIL_")}
 with open(sys.argv[1], "a") as f:
     f.write(json.dumps({"argv": sys.argv[2:], "event": event, "env": env}) + "\n")
@@ -152,6 +157,36 @@ def main():
         events = [json.loads(line) for line in open(got)]
         check("private mail is flagged", rc_s == 0 and rc == 0 and len(events) == 2
               and events[1]["env"].get("ISLANDMAIL_PRIVATE") == "1" and events[1]["event"]["private"] is True, err[-200:])
+
+        # A failed hook does not lose the wake (issue #23): it is retried, and if it stays down watch exits non-zero
+        # with the cursor before the message, so the next watch with that --name delivers it again.
+        fails = os.path.join(work, "fails")
+        open(fails, "w").write("1")
+        env["FAILS_FILE"] = fails
+        got2 = os.path.join(work, "hook2.jsonl")
+        p = background_watch("--name", "hooks", "--from-now", "--exec", "%s %s %s" % (sys.executable, hook, got2))
+        m_flaky = send("hook down once")
+        rc, out, err = finish(p, timeout=40)
+        events = [json.loads(line) for line in open(got2)] if os.path.exists(got2) else []
+        check("a hook that fails once is retried and gets the mail once", rc == 0 and len(events) == 1
+              and events[0]["env"].get("ISLANDMAIL_ID") == str(m_flaky) and "exited 75" in err, err[-300:])
+        check("and the cursor moves past it", open(cursor("hooks")).read().strip() == str(seq(m_flaky)))
+        open(fails, "w").write("100")
+        p = background_watch("--name", "hooks", "--exec", "%s %s %s" % (sys.executable, hook, got2))
+        m_down = send("hook stays down")
+        rc, out, err = finish(p, timeout=60)
+        check("a hook that stays down: watch exits non-zero and says so", rc != 0 and "delivers it again" in err
+              and str(m_down) in err, err[-300:])
+        check("and the cursor stays before that mail", open(cursor("hooks")).read().strip() == str(seq(m_flaky)))
+        del env["FAILS_FILE"]
+        rc, out, err = cl("alice", "watch", "--mine", "--until", "--name", "hooks", "--exec",
+                          "%s %s %s" % (sys.executable, hook, got2), timeout=30)
+        events = [json.loads(line) for line in open(got2)]
+        check("re-armed without --from-now, the working hook gets the mail it missed", rc == 0 and len(events) == 2
+              and events[1]["env"].get("ISLANDMAIL_ID") == str(m_down), err[-300:])
+        check("and now the cursor moves past it", open(cursor("hooks")).read().strip() == str(seq(m_down)))
+        with open(cursor("main"), "w") as f:
+            f.write(str(seq(m_down)))  # the default watcher below starts after these
 
         # --post: the same JSON to a loopback listener, with a bearer token from a file; other hosts refused.
         posts = []

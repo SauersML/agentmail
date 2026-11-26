@@ -97,7 +97,9 @@ def main():
 
     def cl(host, *args, timeout=150):
         api = a_api if host == "a" else fresh[host][2]
-        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, host, "client"), ISLANDMAIL_URL="http://127.0.0.1:%d" % api)
+        # RUST_BACKTRACE as many agent sandboxes set it: refusals must still say why (issue #22).
+        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, host, "client"), ISLANDMAIL_URL="http://127.0.0.1:%d" % api,
+                   RUST_BACKTRACE="1")
         env.pop("ISLANDMAIL_AS", None)
         env.pop("ISLANDMAIL_NODE_KEY", None)
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
