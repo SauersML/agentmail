@@ -4,6 +4,7 @@ description = "Islandmail node: iroh transport, gossip + anti-entropy replicatio
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 islandmail-core = { path = "../islandmail-core" }
@@ -32,3 +33,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 iroh-relay = { version = "1", default-features = false, features = ["server"] }
+
+[lints.rust]
+# Set by cargo fuzz for the fuzz/ targets.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

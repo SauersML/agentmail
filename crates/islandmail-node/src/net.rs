@@ -274,7 +274,7 @@ impl std::fmt::Debug for Node {
 }
 
 /// `peer`: the asking node's key (its iroh endpoint id is its Ed25519 node key).
-fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(node.members.read().unwrap().is_node(peer), "peer removed from membership");
     let (network, req): (String, Req) = serde_json::from_slice(req).context("bad sync request")?;
     anyhow::ensure!(network == node.members.read().unwrap().network, "different network");
@@ -634,7 +634,7 @@ pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) 
 }
 
 /// A gossiped certificate ({"cert": …}) or revocation ({"revocation": …}); None for anything else (an envelope).
-fn trust_message(node: &Node, raw: &[u8]) -> Option<Result<bool>> {
+pub(crate) fn trust_message(node: &Node, raw: &[u8]) -> Option<Result<bool>> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Msg { cert: Option<islandmail_core::Cert>, revocation: Option<islandmail_core::Revocation> }

@@ -612,6 +612,8 @@ pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
 
 /// At most `max` events per key in the last minute.
 fn allow(key: &str, max: usize) -> bool {
+    // The fuzz targets (fuzz/) drive the handshake far past any real rate.
+    if cfg!(fuzzing) { return true; }
     static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<i64>>>> = std::sync::OnceLock::new();
     let now = now_millis();
     let mut m = SEEN.get_or_init(Default::default).lock().unwrap();
