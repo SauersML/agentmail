@@ -160,7 +160,11 @@ def load_identity(name, create=True):
         return _read_identity(name)
     if not create:
         raise Fail("no identity named %s in %s" % (name, folder))
-    ident = new_identity(name or default_name())
+    name = name or default_name()
+    try:
+        ident = new_identity(name)
+    except FileExistsError:
+        return _read_identity(name)  # Another first command published the complete key.
     sys.stderr.write("islandmail: new key for %s in %s\n" % (ident["name"], ident_path(ident["name"])))
     try:
         certify(ident)
@@ -190,13 +194,13 @@ def new_identity(name, sub=None):
 def default_name():
     # First use with no name given: the first of this host's names; for a prefix (sauersml.), plus the user name.
     names = node_info().get("names") or []
-    if not names:
-        raise Fail("the node at %s certifies no names for this host; pick a pinned identity with --as NAME" % MAIL)
-    first = names[0]
+    first = next((n for n in names if not n.endswith(".") or len(n) < 48), None)
+    if first is None:
+        raise Fail("the node at %s has no usable certification names; pick a pinned identity with --as NAME" % MAIL)
     if not first.endswith("."):
         return first
     user = re.sub(r"[^a-z0-9_-]", "-", (os.environ.get("USER") or os.environ.get("USERNAME") or "agent").lower())
-    return first + (user.strip("-_") or "agent")[:40]
+    return first + (user.strip("-_") or "agent")[:min(40, 48 - len(first))]
 
 
 def canon_ts():

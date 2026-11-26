@@ -12,6 +12,7 @@ its agent's sign-in at once and replicates; and a trust-file edit cuts off an id
 peer is offline.
 """
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -55,7 +56,8 @@ def main():
     udp = {h: free_port(socket.SOCK_DGRAM) for h in hosts + ("ghost",)}
     api = {h: free_port() for h in hosts}
     network = run(bin_, "network-id")
-    names = {"mac": ["hypha", "s."], "pod": ["hypha"], "ops": ["ops."]}
+    long_prefix = "a" * 46 + "."
+    names = {"mac": ["hypha", "s."], "pod": ["x" * 47 + ".", long_prefix, "hypha"], "ops": ["ops."]}
 
     def node_entry(h, names_=None):
         return {"name": h, "key": pub[h], "addrs": ["127.0.0.1:%d" % udp[h]], "names": names_ if names_ is not None else names.get(h, [])}
@@ -76,8 +78,8 @@ def main():
         nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
                                         "iroh_port": udp[h], "node_key_file": k(h), "members_file": trust(h), "sync_secs": 3})
 
-    def cl(h, *args, user="agent", timeout=60):
-        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user,
+    def cl(h, *args, user="agent", timeout=60, client_dir=None):
+        env = dict(os.environ, ISLANDMAIL_DIR=client_dir or os.path.join(work, "client-" + h), USER=user,
                    ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h])
         env.pop("ISLANDMAIL_AS", None)
         env.pop("ISLANDMAIL_NODE_KEY", None)
@@ -97,6 +99,14 @@ def main():
     try:
         for h in hosts:
             check("%s node starts" % h, nodes[h].start())
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            directory = os.path.join(work, "concurrent-client")
+            calls = [pool.submit(cl, "pod", "whoami", client_dir=directory) for _ in range(2)]
+            results = [call.result() for call in calls]
+        check("concurrent first commands share a key under a 47-character prefix",
+              all(rc == 0 and long_prefix + "a" in out for rc, out in results)
+              and os.listdir(os.path.join(directory, "identities")) == [long_prefix + "a.json"])
 
         # The first command on a fresh host: key, certificate, delivery. No pins anywhere.
         t0 = time.time()
