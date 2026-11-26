@@ -18,13 +18,21 @@ jobs:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
+            asset: aarch64-macos
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: x86_64-macos
+          # Linux binaries link the runner's glibc: build on 22.04 so they run on 22.04 and newer.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
+            asset: x86_64-linux
+          - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+            asset: aarch64-linux
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             exe: .exe
+            asset: x86_64-windows.exe
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -72,6 +80,33 @@ jobs:
           cd out
           host_python=$(command -v python3 || command -v python)
           "$host_python" -c 'import hashlib, sys; n = sys.argv[1]; print(hashlib.sha256(open(n, "rb").read()).hexdigest() + "  " + n)' "islandmail-node$EXE" > "islandmail-node$EXE.sha256"
+      # The installers against this build's own files laid out as a release, twice (the second run is an upgrade).
+      - name: Install from this build (install.sh)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/islandmail-node" "dist/islandmail-node-${{ matrix.asset }}"
+          cp clients/islandmail.py clients/requirements.txt dist/
+          (cd dist && shasum -a 256 -- * > SHA256SUMS)
+          bash install.sh --from dist
+          bash install.sh --from dist
+          ~/.local/bin/islandmail-node --version
+          ~/.local/bin/islandmail --help > /dev/null
+      - name: Install from this build (install.ps1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\islandmail-node.exe" "dist\islandmail-node-${{ matrix.asset }}"
+          Copy-Item clients\islandmail.py, clients\requirements.txt dist\
+          $sums = foreach ($f in Get-ChildItem dist -File) { (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLower() + "  " + $f.Name }
+          Set-Content -Path dist\SHA256SUMS -Value $sums
+          .\install.ps1 -From dist
+          .\install.ps1 -From dist
+          & "$HOME\.local\bin\islandmail-node.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$HOME\.local\bin\islandmail.cmd" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: islandmail-node-${{ matrix.target }}
@@ -85,6 +120,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -92,17 +129,64 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+      - name: Assemble
         run: |
           mkdir dist
           cp artifacts/islandmail-node-x86_64-unknown-linux-gnu/islandmail-node dist/islandmail-node-x86_64-linux
           cp artifacts/islandmail-node-aarch64-unknown-linux-gnu/islandmail-node dist/islandmail-node-aarch64-linux
           cp artifacts/islandmail-node-aarch64-apple-darwin/islandmail-node dist/islandmail-node-aarch64-macos
+          cp artifacts/islandmail-node-x86_64-apple-darwin/islandmail-node dist/islandmail-node-x86_64-macos
           cp artifacts/islandmail-node-x86_64-pc-windows-msvc/islandmail-node.exe dist/islandmail-node-x86_64-windows.exe
           cp clients/islandmail.py clients/requirements.txt dist/
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Islandmail $TAG" \
+      # A signed build-provenance attestation per file (Sigstore, no key to manage); install.sh and install.ps1
+      # check SHA256SUMS against it with gh attestation verify when gh is logged in.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A tag with a hyphen (v0.2.0-rc1) is a prerelease.
+          pre=()
+          case "$TAG" in *-*) pre=(--prerelease) ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Islandmail $TAG" "${pre[@]}" \
             --notes-file ".github/release-notes/$TAG.md" dist/*
+
+  # The published release through the installers as a user runs them (main's installer body, attestation check).
+  install-release:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, macos-15-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          bash install.sh --tag "$TAG" | tee install.log
+          grep -q "attested by" install.log
+          ~/.local/bin/islandmail-node --version
+          ~/.local/bin/islandmail --help > /dev/null
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          .\install.ps1 -Tag $env:TAG 6>&1 | Tee-Object -FilePath install.log
+          if (-not (Select-String -Quiet "attested by" install.log)) { exit 1 }
+          & "$HOME\.local\bin\islandmail-node.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$HOME\.local\bin\islandmail.cmd" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit 1 }

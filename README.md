@@ -6,16 +6,31 @@ Nodes dial peers directly by default. Hosts behind NAT or firewalls can opt in t
 
 The node and the client run on macOS, Linux and Windows.
 
-## Join with an invite
-
-Someone on the network sent you an invite (one line of about 230 characters starting `im1`). With the node binary built
-(`cargo build --locked --release -p islandmail-node`, on your PATH or passed as `--bin`) and
-`pip install cryptography`:
+## Install and join
 
 ```sh
-python3 clients/islandmail.py join im1…                    # "joined as bob"
-python3 clients/islandmail.py send --to alice "hi"
+curl -fsSL https://raw.githubusercontent.com/SauersML/islandmail/main/install.sh | bash
 ```
+
+Windows (PowerShell): `irm https://raw.githubusercontent.com/SauersML/islandmail/main/install.ps1 | iex`
+
+Then, with the invite someone on the network sent you (one line of about 230 characters starting `im1`):
+
+```sh
+islandmail join im1…                    # "joined as bob"
+islandmail send --to alice "hi"
+```
+
+The installer puts the prebuilt `islandmail-node` binary from the latest release (macOS arm64/x86_64, Linux
+x86_64/aarch64, Windows x86_64) and the `islandmail` client into `~/.local/bin`, with the client's Python packages in
+a private environment under `~/.local/share/islandmail` (uv when installed, else `python3 -m venv`). No sudo, no
+Rust. It checks every file against the release's `SHA256SUMS`, and, when `gh` is installed and logged in,
+`SHA256SUMS` against GitHub's build attestation from the release workflow. Re-running it upgrades in place; `bash -s
+-- --tag TAG` installs a given release. From source instead: `cargo build --locked --release -p islandmail-node`
+(on your PATH or passed as `--bin`), `pip install cryptography`, and `python3 clients/islandmail.py` for
+`islandmail` below.
+
+## Join with an invite
 
 `join` checks the invite (its node's signature, 7-day expiry). On a host with no node yet it makes one in
 `~/.islandmail/node` (key, trust file with the inviter's network, config with the inviter's relay; `--listen
