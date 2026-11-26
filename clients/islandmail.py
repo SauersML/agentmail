@@ -33,7 +33,8 @@ it; nothing else to set up.
 
 Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
 readable only by you (the client refuses identity files other users can read).
-Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). ISLANDMAIL_NODE_KEY pins the token audience.
+Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). Before anything is sent the node signs a nonce with its key:
+ISLANDMAIL_NODE_KEY pins that key; otherwise the first key seen at the URL is kept in nodes.json.
 Addressing: names separated by commas, a team prefix ending in a dot (ops.), or all.
 """
 import argparse
@@ -71,7 +72,8 @@ MAX_EVENT_LINE = 1024 * 1024
 
 try:
     from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 except ImportError:
     sys.exit("Install the client dependency with: python3 -m pip install cryptography")
 
@@ -83,6 +85,16 @@ def ed25519_public(seed):
 
 def ed25519_sign(seed, msg):
     return Ed25519PrivateKey.from_private_bytes(seed).sign(msg)
+
+
+def ed25519_verify(key, sig, msg):
+    # key is "ed25519:" + base64url of the 32 raw bytes; False for anything that does not verify.
+    try:
+        raw = base64.urlsafe_b64decode(key[len("ed25519:"):] + "=" * (-len(key) % 4)) if key.startswith("ed25519:") else b""
+        Ed25519PublicKey.from_public_bytes(raw).verify(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), msg)
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
 
 
 def b64u(b):
@@ -540,14 +552,39 @@ def checked_node_url(value):
     raise Fail("plain HTTP requires a loopback IP address; use HTTPS for a remote node")
 
 
+def known_nodes_path():
+    return os.path.join(DIR, "nodes.json")
+
+
 def node_info():
+    # Before any token, seed or message goes out: the node signs a fresh nonce with the key we expect it to have
+    # (ISLANDMAIL_NODE_KEY, else the key this client saw at this URL first, kept in nodes.json). Whoever binds the port
+    # while the node is down cannot sign, so the client stops. Checked once per process.
     if MAIL not in _node_info:
-        info = http("GET", MAIL + "/api/node")
+        nonce = b64u(os.urandom(24))
+        info = http("GET", MAIL + "/api/node?nonce=" + nonce)
         if info.get("envelope_version") != 1 or "agent-token" not in info.get("auth", []):
             raise Fail("node must support envelope version 1 and agent tokens")
+        key, proof = info.get("node"), info.get("proof") or {}
         pin = os.environ.get("ISLANDMAIL_NODE_KEY", "").strip()
-        if pin and info.get("node") != pin:
-            raise Fail("node public key does not match ISLANDMAIL_NODE_KEY")
+        known = {}
+        if not pin and os.path.exists(known_nodes_path()):
+            try:
+                with open(known_nodes_path()) as f:
+                    known = json.load(f)
+            except ValueError:
+                raise Fail("%s is not JSON; fix or remove it" % known_nodes_path())
+        expected = pin or known.get(MAIL)
+        if expected and key != expected:
+            raise Fail("the node at %s says its key is %s, not %s (%s). Another process may hold its port; if the "
+                       "node's key really changed, remove that entry from %s" % (
+                           MAIL, key, expected, "ISLANDMAIL_NODE_KEY" if pin else "seen here before", known_nodes_path()))
+        if not (isinstance(key, str) and isinstance(proof.get("ts"), str) and isinstance(proof.get("sig"), str)
+                and ed25519_verify(key, proof["sig"], ("islandmail-node-proof|v1|%s|%s" % (nonce, proof["ts"])).encode())):
+            raise Fail("the server at %s does not prove it holds the node key %s; not sending anything to it" % (MAIL, key))
+        if not expected:
+            known[MAIL] = key
+            write_private(known_nodes_path(), json.dumps(known, indent=1))
         _node_info[MAIL] = info
     return _node_info[MAIL]
 

@@ -257,6 +257,11 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   with `ISLANDMAIL_DIR=DIR islandmail.py newkey NAME`, sets `identities_dir` to `DIR/identities`, and gives the agent
   a copy of its file (mode 600) for its own `~/.islandmail/identities`. The node holds those keys, so it can read
   their private mail. The default, `"certify": "open"`, is self-service as described above.
+- **Is that the node?** On a shared host another user could bind the API port while the node restarts. Before it
+  sends a token, a seed (`ui --post`) or any mail, the client sends a random nonce and the node signs
+  `islandmail-node-proof|v1|NONCE|TS` with its key; the client checks it against `ISLANDMAIL_NODE_KEY`, or else the
+  key it first saw at that URL (kept in `~/.islandmail/nodes.json`), and stops on a mismatch. Set
+  `ISLANDMAIL_NODE_KEY` (the operator's `islandmail-node pubkey`) so even the first contact is checked.
 - **What a trusted node can do.** A node trusted for a name can certify any key under it, so it can impersonate
   that agent and read mail encrypted to it. Give a node only the names its host owns. Two nodes given the same name
   are both its homes.
@@ -370,9 +375,10 @@ the encrypted body (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`)
 
 **HTTP API** (loopback). Every request except `GET /api/node`, `POST /api/agents`, `POST /api/revocations` and the invite steps carries a fresh single-use agent token: PASETO
 v4.public, signed by the agent key, audience the node key, from `islandmail.py selftoken`, in the Authorization bearer
-header. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
+header. Set `ISLANDMAIL_NODE_KEY` to pin the node key.
 
-- `GET /api/node`: node key, network, versions, this node's `names`.
+- `GET /api/node`: node key, network, versions, this node's `names`. With `?nonce=N` (16-128 base64url characters)
+  also `proof {ts, sig}`, the node key's signature over `islandmail-node-proof|v1|N|ts`.
 - `POST /api/agents` `{name, key, ts, sig}`, sig by the agent key over
   `islandmail-certify|v1|NAME|KEY|NODE_KEY|TS`: 201 new certificate, 200 already certified with this key, 400 bad
   proof, 403 not in this host's names or a revoked key, 409 name or key taken, 429 rate limit. JSON only. A home name

@@ -144,18 +144,39 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
 }
 
 /// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
-async fn node_info(State(s): State<AppState>) -> Response {
+/// With `?nonce=` (16-128 base64url characters) the node also proves it holds that key: `proof` is its signature over
+/// `islandmail-node-proof|v1|NONCE|TS`, so a process that took the port while the node was down cannot pass for it.
+async fn node_info(State(s): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    let proof = params(&raw).get("nonce").map(|n| {
+        if !(16..=128).contains(&n.len()) || !n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return Err(());
+        }
+        let ts = islandmail_core::now_ts();
+        let sig = s.node.seed.sign(node_proof_statement(n, &ts).as_bytes());
+        Ok(json!({ "ts": ts, "sig": islandmail_core::b64u(&sig) }))
+    });
+    let proof = match proof {
+        Some(Err(())) => return ApiError::new(400, "nonce must be 16-128 base64url characters").into_response(),
+        Some(Ok(p)) => Some(p),
+        None => None,
+    };
     let members = s.node.members.read().unwrap();
-    json_resp(
-        json!({ "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": islandmail_core::b64u(&members.topic()),
+    let mut info = json!({ "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": islandmail_core::b64u(&members.topic()),
                 "envelope_version": islandmail_core::envelope::VERSION,
                 "encryption_key": s.node.current_encryption_key(),
                 "members_seq": members.seq, "auth": ["agent-token"],
                 "names": members.node_by_key(&s.node.seed.public()).map(|n| n.names.clone()).unwrap_or_default(),
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "islandmail-auth-v1",
-                                 "max_lifetime_s": islandmail_core::agent_token::MAX_LIFETIME_S } }),
-        200,
-    )
+                                 "max_lifetime_s": islandmail_core::agent_token::MAX_LIFETIME_S } });
+    if let Some(p) = proof {
+        info["proof"] = p;
+    }
+    json_resp(info, 200)
+}
+
+/// What a node signs to show a client it holds its key (GET /api/node?nonce=).
+pub fn node_proof_statement(nonce: &str, ts: &str) -> String {
+    format!("islandmail-node-proof|v1|{nonce}|{ts}")
 }
 
 /// Return the exact key set the local node would use. A trust-file change before posting invalidates the signature.

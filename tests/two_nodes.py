@@ -309,7 +309,7 @@ def main():
         mismatch = subprocess.run([sys.executable, a.islandmail, "whoami"], env=wrong_pin,
                                   capture_output=True, text=True, timeout=10)
         check("an online command detects a mismatched public key before sign-in",
-              mismatch.returncode == 1 and "does not match ISLANDMAIL_NODE_KEY" in mismatch.stderr)
+              mismatch.returncode == 1 and "(ISLANDMAIL_NODE_KEY)" in mismatch.stderr, mismatch.stderr[-200:])
         def watch():
             return subprocess.Popen([sys.executable, a.islandmail, "watch", "--mine", "--until", "--name", "it"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)
