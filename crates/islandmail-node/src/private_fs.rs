@@ -49,10 +49,13 @@ pub fn sync_dir(path: &Path) -> Result<()> {
     imp::sync_dir(path)
 }
 
+// The access list check runs on Windows; its parser is tested everywhere.
+#[cfg(any(windows, test))]
 const PRIVILEGED: [&str; 8] = ["SY", "S-1-5-18", "BA", "S-1-5-32-544", "OW", "S-1-3-4", "CO", "S-1-3-0"];
 
 /// Check an SDDL string (owner and DACL). Err names the first trustee, other than `user` (a SID string), the owner,
 /// SYSTEM or Administrators, that an allow entry grants access to. A missing (NULL) DACL grants everyone.
+#[cfg(any(windows, test))]
 pub fn sddl_private(sddl: &str, user: &str) -> std::result::Result<(), String> {
     let owner = sddl.strip_prefix("O:").map(|rest| match rest.strip_prefix("S-") {
         Some(tail) => format!("S-{}", tail.split(|c: char| !(c.is_ascii_digit() || c == '-')).next().unwrap_or("")),
@@ -274,9 +277,6 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
-pub use imp::set_dacl;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,7 +315,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
         }
         #[cfg(windows)]
-        set_dacl(&path, &format!("D:P(A;;FA;;;{})(A;;FR;;;WD)", imp::user_sid()?))?;
+        imp::set_dacl(&path, &format!("D:P(A;;FA;;;{})(A;;FR;;;WD)", imp::user_sid()?))?;
         let f = options().read(true).open(&path)?;
         assert!(check_file(&f, &path).is_err());
         drop(f);
