@@ -30,6 +30,8 @@ jobs:
         shell: bash
     env:
       EXE: ${{ matrix.exe }}
+      # The test harnesses read the client's UTF-8 output and print it; Windows defaults to cp1252.
+      PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

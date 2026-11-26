@@ -1398,6 +1398,10 @@ def arrival_hooks(a):
 
 def main():
     global MAIL
+    # Output is UTF-8 everywhere (room views use · and ↳); a Windows pipe would otherwise be cp1252 and fail.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
