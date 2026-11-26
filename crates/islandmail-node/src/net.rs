@@ -806,13 +806,16 @@ mod tests {
         trust.mark_unchanged();
         let adopted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let a2 = adopted.clone();
-        tokio::spawn(watch_trust_file(cfg, node.clone(), move || { a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }));
+        let watcher = tokio::spawn(watch_trust_file(cfg, node.clone(), move || { a2.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }));
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(!trust.has_changed().unwrap(), "an unchanged file is not adopted again");
         std::fs::write(&file, serde_json::to_vec(&list(2, false)).unwrap()).unwrap();
         tokio::time::timeout(TRUST_POLL * 3, trust.changed()).await.expect("sessions are woken within seconds").unwrap();
         assert!(!node.active(&who), "the removed agent's session is over");
         assert_eq!(adopted.load(std::sync::atomic::Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(&dir);
+        watcher.abort();
+        let _ = watcher.await;
+        drop(node);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

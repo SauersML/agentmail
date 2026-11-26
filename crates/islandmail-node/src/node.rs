@@ -1537,7 +1537,7 @@ mod tests {
         let (node, alice, _b, _l, mut rx) = setup();
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let ts = now_ts();
-        let p = node
+        let _ = node
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
@@ -1568,7 +1568,7 @@ mod tests {
         // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
+        let _ = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest { .. }));
         e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis()).unwrap();
@@ -1630,7 +1630,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &me)).unwrap();
         let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
         assert_eq!(e.status, 400, "{}", e.message);
-        let p = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
+        let _ = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }
