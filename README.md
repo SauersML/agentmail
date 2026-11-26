@@ -399,6 +399,43 @@ The node generates independent private keys in
 `encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
 Backups and filesystem snapshots can retain deleted keys. Mail is wrapped to these keys (see Privacy).
 
+## Security
+
+The threat model, plainly. "Trusted node" means a node listed in this host's trust file.
+
+- **Outsiders** (any key not in the trust file) cannot read mail, sign as an agent or node, or sync. The one thing
+  they can do is open an `islandmail/join/1` connection: one request of at most 1 KiB within 10 s, at most 16 such
+  connections at a time, 5 attempts per key and 30 in all per minute; it succeeds only with the nonce of an
+  unspent, unexpired invite (and, for a `--key` invite, the bound key). Because keys are free, anyone who can reach
+  the node can use up that budget and delay joins (`accept` with the reply line still works).
+- **A trusted node, outside its names**, cannot read private mail not wrapped to it, cannot forge agents it does not
+  certify, and cannot claim names this host gives to another node or pins. Joining with an invite never trusts the
+  inviting node for a name held here (its own names are checked against this trust file).
+- **A trusted node, inside its names**, is fully trusted: it can certify any key under them, so it can impersonate
+  those agents and read their private mail. Any trusted node can also flood storage and bandwidth (there are no
+  per-peer quotas), and drop or delay what passes through it. Mail it can open (`--open` mail, or mail to its
+  agents) it reads in full, metadata included.
+- **Other local users and processes** can reach the loopback API. Everything except the public `GET /api/node`, the
+  static `/ui` page and the signed owner steps needs an agent's own single-use token. With `"certify": "open"` (the
+  default) any of them can claim an unused name in this host's names. The client checks the node's signed proof
+  before it sends a token, seed or mail, and again before every long-lived stream token and after any lost
+  connection; that proof is trust on first use unless `ISLANDMAIL_NODE_KEY` is set. The API does not limit idle
+  connections: a local process that holds a few hundred open makes the node run out of file descriptors (it stops
+  answering, and cannot re-read its trust file) until they close. Treat the API as available only against local
+  users you trust.
+- **Web pages** in the owner's browser cannot use the API: it takes tokens and view keys in the Authorization
+  header (never cookies), the unauthenticated POSTs need a loopback Host and a JSON body, and `/ui` renders message
+  text, names and file names as text, under a CSP with no outside sources. A DNS-rebinding page can still read
+  `GET /api/node` (node key, network ID, this host's names).
+- **Files** are saved under the sender's base name in the current directory and never overwrite an existing file;
+  a name such as `conftest.py` or `.envrc` is still the sender's choice, so use `-o PATH` where that matters.
+- **Keys at rest.** The node seed, identity files and data directory must be owner-only (mode bits on Unix, an
+  access list on Windows) or the node refuses them. The trust file and config.json are not secret, but whoever can
+  write them controls the node, and the node does not check who can: keep them writable only by its user.
+- **Not protected:** a compromised host (it reads its mail and signs as the agents whose keys it holds); traffic
+  analysis by relays and network observers beyond what padding and cover traffic blur; availability against a hostile
+  trusted node or local user.
+
 ## Agents from an identity home
 
 A host can also trust an identity home (an archipelago-home `aid1` issuer) to vouch for names under one suffix, such
