@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use islandmail_core::addr::norm;
 use crate::node::Caller;
+use islandmail_core::envelope::Header;
 use islandmail_core::{Envelope, Verified};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
@@ -45,7 +46,10 @@ CREATE TABLE IF NOT EXISTS messages (
   kind TEXT NOT NULL DEFAULT 'mail',
   meta TEXT,
   mentions TEXT,
-  reply_to TEXT);
+  reply_to TEXT,
+  audience TEXT NOT NULL DEFAULT '[]',
+  agent_key TEXT,
+  ck TEXT);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread, id);
 CREATE INDEX IF NOT EXISTS messages_kind ON messages (kind, thread);
 CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages(agent_sig) WHERE agent_sig IS NOT NULL;
@@ -107,6 +111,14 @@ pub struct Row {
     pub reply_to: Option<String>,
     /// When this node received the envelope (ms).
     pub received: i64,
+}
+
+/// What a node that opened an envelope knows of it.
+#[derive(Clone, Copy)]
+pub struct Read<'a> {
+    pub header: &'a Header,
+    pub v: &'a Verified,
+    pub ck: &'a [u8; 32],
 }
 
 /// Room fields of a row, from its decrypted body.
@@ -217,7 +229,7 @@ pub struct Store {
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
                     length(text) AS len, files, readers, \
-                    (SELECT group_concat(k) FROM (SELECT rtrim(value->>'to', '=') AS k FROM json_each(env, '$.keys') \
+                    (SELECT group_concat(k) FROM (SELECT value AS k FROM json_each(messages.audience) \
                      UNION SELECT key FROM grants WHERE grants.env_id = messages.env_id)), \
                     kind, meta, mentions, reply_to, received";
 
@@ -226,7 +238,7 @@ const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode,
 fn visible_sql() -> &'static str {
     "(text IS NOT NULL AND kind != 'grant' \
       AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
-      AND (EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE rtrim(value->>'to', '=') = ?) \
+      AND (EXISTS (SELECT 1 FROM json_each(audience) WHERE value = ?) \
            OR EXISTS (SELECT 1 FROM grants g WHERE g.env_id = messages.env_id AND g.key = ?)))"
 }
 
@@ -362,13 +374,13 @@ impl Store {
     pub fn insert(
         &self,
         env: &Envelope,
-        v: &Verified,
+        read: Option<Read<'_>>,
         text: Option<&str>,
         files: &str,
         readers: Option<&str>,
         received_ms: i64,
     ) -> Result<Option<Row>> {
-        self.insert_with(env, v, text, files, readers, received_ms, &Extra { kind: "mail", ..Default::default() })
+        self.insert_with(env, read, text, files, readers, received_ms, &Extra { kind: "mail", ..Default::default() })
     }
 
     /// `insert` with the body's room fields.
@@ -376,7 +388,7 @@ impl Store {
     pub fn insert_with(
         &self,
         env: &Envelope,
-        v: &Verified,
+        read: Option<Read<'_>>,
         text: Option<&str>,
         files: &str,
         readers: Option<&str>,
@@ -385,22 +397,33 @@ impl Store {
     ) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
-        let parents = serde_json::to_string(&env.parents)?;
-        let islandmail_core::Attest { sig, .. } = &env.attest;
+        // A row this node cannot open keeps only what the wire shows (time, size, writer): no sender, thread or text.
+        let Some(Read { header: h, v, ck }) = read else {
+            let n = db.execute(
+                "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, parents, env, \
+                 received, blobs) VALUES (?,?,?,'','','','','sealed','[]',?,?,?)",
+                params![env.id, env.day(), env.ts, json, received_ms, serde_json::to_string(&env.blobs)?])?;
+            if n == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(db.query_row(&format!("SELECT {COLS} FROM messages WHERE env_id = ?"), params![MAX_TEXT, env.id], read_row)?));
+        };
+        let parents = serde_json::to_string(&h.parents)?;
+        let islandmail_core::Attest { sig, key, .. } = &h.attest;
         let replay = db.prepare("SELECT 1 FROM messages WHERE agent_sig = ?")?.exists([sig])?;
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, parents, env, received, blobs, files, agent_sig, kind, meta, mentions, reply_to) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             readers, parents, env, received, blobs, files, agent_sig, kind, meta, mentions, reply_to, audience, agent_key, ck) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 env.id,
                 env.day(),
                 env.ts,
-                env.from,
+                h.from,
                 v.sender_sub,
-                env.to,
-                env.thread,
-                if replay { "dup" } else { env.mode.as_str() },
+                h.to,
+                h.thread,
+                if replay { "dup" } else { h.mode.as_str() },
                 if replay { None } else { text },
                 if replay { None } else { readers },
                 parents,
@@ -413,6 +436,9 @@ impl Store {
                 if replay { None } else { extra.meta.as_deref() },
                 if replay { None } else { extra.mentions.as_deref() },
                 if replay { None } else { extra.reply_to.as_deref() },
+                if replay { "[]".to_string() } else { serde_json::to_string(&h.audience)? },
+                key.trim_end_matches('='),
+                (!replay).then(|| islandmail_core::b64u(ck)),
             ],
         )?;
         if n == 0 || replay {
@@ -630,7 +656,7 @@ impl Store {
         Ok(db
             .query_row(
                 &format!(
-                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND rtrim(env->>'$.attest.key', '=') = ? AND ts > ? AND recipient = ? AND thread = ? \
+                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND agent_key = ? AND ts > ? AND recipient = ? AND thread = ? \
                      AND text = ? AND files = '[]' ORDER BY id DESC LIMIT 1"
                 ),
                 params![MAX_TEXT, who.sub, who.name, who.key, since_ts, to, thread, text],
@@ -963,16 +989,16 @@ impl Store {
             .optional()?.filter(|r| r.visible_to(viewer)))
     }
 
-    /// Envelopes (raw JSON) of a room's private rows the viewer can see, oldest first, for re-wrapping their keys,
-    /// with any content key this node holds from a grant.
-    pub fn room_envelopes(&self, thread: &str, viewer: &Caller, events_only: bool) -> Result<Vec<(String, String, Option<String>)>> {
+    /// Content keys of a room's private rows the viewer can see, oldest first, for re-wrapping (key grants): the key
+    /// this node opened the row with, or one it holds from a grant.
+    pub fn room_keys(&self, thread: &str, viewer: &Caller, events_only: bool) -> Result<Vec<(String, String)>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(&format!(
-            "SELECT env_id, env, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1) FROM messages \
-             WHERE thread = ? AND mode = 'private' AND {} {} ORDER BY ts, env_id", visible_sql(),
+            "SELECT env_id, COALESCE(ck, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1)) AS k FROM messages \
+             WHERE thread = ? AND mode = 'private' AND {} {} AND k IS NOT NULL ORDER BY ts, env_id", visible_sql(),
             if events_only { "AND kind = 'event'" } else { "" }))?;
         let rows = st.query_map(params![thread, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key],
-                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                                |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1012,12 +1038,17 @@ impl Store {
                         [env_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
     }
 
-    /// A row this node could not read, opened through a grant: fill in its body.
-    pub fn fill_body(&self, env_id: &str, text: &str, files: &str, extra: &Extra) -> Result<()> {
+    /// A row this node could not open, opened through a grant: fill in its header and body. A row whose sender
+    /// signature is already here under another envelope stays sealed (a replay).
+    pub fn fill_opened(&self, env_id: &str, read: Read<'_>, readers: &str, text: &str, files: &str, extra: &Extra) -> Result<()> {
         let db = self.db.lock().unwrap();
-        db.execute("UPDATE messages SET text = ?, files = ?, kind = ?, meta = ?, mentions = ?, reply_to = ? \
-                    WHERE env_id = ? AND text IS NULL AND mode != 'dup'",
-                   params![text, files, extra.kind, extra.meta, extra.mentions, extra.reply_to, env_id])?;
+        let Read { header: h, v, .. } = read;
+        db.execute("UPDATE OR IGNORE messages SET sender = ?, sender_sub = ?, recipient = ?, thread = ?, mode = ?, \
+                    parents = ?, audience = ?, agent_key = ?, agent_sig = ?, readers = ?, text = ?, files = ?, kind = ?, \
+                    meta = ?, mentions = ?, reply_to = ? WHERE env_id = ? AND mode = 'sealed'",
+                   params![h.from, v.sender_sub, h.to, h.thread, h.mode.as_str(), serde_json::to_string(&h.parents)?,
+                           serde_json::to_string(&h.audience)?, h.attest.key.trim_end_matches('='), h.attest.sig, readers,
+                           text, files, extra.kind, extra.meta, extra.mentions, extra.reply_to, env_id])?;
         Ok(())
     }
 

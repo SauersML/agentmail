@@ -44,6 +44,19 @@ impl EncryptionKeys {
         let secret = crate::config::read_or_create_seed(&self.dir.join(format!("{epoch}.seed")))?;
         Ok(NodeEncryptionKey::issue(identity, network, epoch, &secret))
     }
+
+    /// Every encryption seed still kept (epoch, seed), newest first: what opens mail wrapped to this node's keys.
+    pub fn retained(&self) -> Result<Vec<(i64, Seed)>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            let Some(epoch) = entry.file_name().to_str().and_then(|n| n.strip_suffix(".seed")).and_then(|n| n.parse::<i64>().ok())
+                else { continue };
+            out.push((epoch, crate::config::read_seed(&entry.path())?));
+        }
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -67,6 +80,7 @@ mod tests {
         keys.rotate(&identity, "net", 4 * ROTATION_MS)?;
         assert!(!old.exists() && !keys.dir.join(".islandmail-node-interrupted.tmp").exists());
         assert!(keys.dir.join("1.seed").is_file());
+        assert_eq!(keys.retained()?.iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![4, 3, 1], "newest first, expired gone");
         fs::remove_dir_all(dir)?;
         Ok(())
     }

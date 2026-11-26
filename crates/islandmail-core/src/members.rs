@@ -238,7 +238,8 @@ impl MemberList {
     }
 
     pub fn topic(&self) -> [u8; 32] {
-        blake3::derive_key("islandmail/local-trust/v1", self.network.as_bytes())
+        // v2: sealed envelopes. Nodes on the old wire format gossip on another topic (sync says why they fail).
+        blake3::derive_key("islandmail/local-trust/v2", self.network.as_bytes())
     }
 }
 

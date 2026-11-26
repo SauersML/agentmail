@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::Result;
 use islandmail_core::addr::{addressed_to, is_broadcast, norm};
-use islandmail_core::envelope::{Draft, PostStatement};
+use islandmail_core::envelope::{Draft, Header, Opened, PostStatement};
 use islandmail_core::keys::{fmt_key, parse_key, PublicKey, Seed};
 use islandmail_core::members::{self, Agent};
 use islandmail_core::{now_millis, now_ts, ts_from_millis, Attest, Body, Cert, Envelope, MemberList, Mode, Revocation};
@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, watch};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::store::{Row, Store, MAX_TEXT};
+use crate::store::{Read, Row, Store, MAX_TEXT};
 
 pub const MAX_FIELD: usize = 120;
 const REPEAT_MS: i64 = 10 * 60 * 1000;
@@ -99,6 +99,9 @@ pub struct Node {
     /// Certificates and revocations to gossip (JSON, tagged {"cert": …} or {"revocation": …}).
     pub trust_out: broadcast::Sender<String>,
     pub encryption_key: RwLock<Option<islandmail_core::node_key::NodeEncryptionKey>>,
+    /// The rotating encryption seeds this node still holds (epoch, seed), newest first: they open mail wrapped to
+    /// this node's published keys until they expire.
+    pub epoch_keys: RwLock<Vec<(i64, Seed)>>,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<i64>,
@@ -128,6 +131,7 @@ impl Node {
         let node = Node {
             store,
             encryption_key: RwLock::new(None),
+            epoch_keys: RwLock::new(Vec::new()),
             roster: RwLock::new(Vec::new()),
             issuance: Mutex::new(()),
             trust: watch::channel(0).0,
@@ -183,6 +187,79 @@ impl Node {
             record.verify(&parse_key(&record.node)?, &members.network, now)?;
         }
         Ok(records)
+    }
+
+    /// The X25519 keys a message for `audience` is wrapped to (forward secrecy where possible): each node in the
+    /// audience, and this writing node, at its current six-hour key, or at its long-lived key while that node's
+    /// current record has not reached this host; an agent only when none of its home nodes is in the audience (a
+    /// pinned agent), at its own key. Home nodes read for their agents.
+    pub fn wrap_targets(&self, members: &MemberList, agents: &[Agent], audience: &[PublicKey]) -> Result<Vec<[u8; 32]>> {
+        let now = now_millis();
+        let node_keys: HashSet<PublicKey> = members.node_keys().into_iter().collect();
+        let listed: HashSet<&PublicKey> = audience.iter().collect();
+        let mut nodes: Vec<PublicKey> = audience.iter().filter(|k| node_keys.contains(*k)).copied().collect();
+        nodes.push(self.me());
+        nodes.sort();
+        nodes.dedup();
+        let epoch = now.div_euclid(islandmail_core::node_key::ROTATION_MS);
+        let records = self.store.peer_encryption_keys(&nodes.iter().map(fmt_key).collect::<Vec<_>>(), epoch)?;
+        let mut out = Vec::new();
+        for n in &nodes {
+            let record = if *n == self.me() { self.current_encryption_key() }
+                         else { records.iter().find(|r| r.node == fmt_key(n)).cloned() };
+            match record.and_then(|r| r.verify(n, &members.network, now).ok()) {
+                Some(x) => out.push(x),
+                None => {
+                    tracing::info!("no current encryption key from node {}: wrapping to its long-lived key", &fmt_key(n)[..12]);
+                    out.push(islandmail_core::keys::x25519_public(n)?);
+                }
+            }
+        }
+        for k in audience.iter().filter(|k| !node_keys.contains(*k)) {
+            let homed = agents.iter().filter(|a| a.key == *k).any(|a| a.homes.iter().any(|h| listed.contains(h)));
+            if !homed {
+                out.push(islandmail_core::keys::x25519_public(k)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keys that may open an envelope dated `ts_ms`: the node's identity key, held agent keys, and its rotating keys
+    /// for that interval and the ones beside it (clock differences).
+    pub fn opening_keys(&self, ts_ms: i64) -> Vec<Seed> {
+        let epoch = ts_ms.div_euclid(islandmail_core::node_key::ROTATION_MS);
+        let mut out: Vec<Seed> = self.epoch_keys.read().unwrap().iter()
+            .filter(|(e, _)| (e - epoch).abs() <= 1).map(|(_, s)| s.clone()).collect();
+        out.push(self.seed.clone());
+        out.extend(self.held().into_iter().map(|(_, s)| s));
+        out
+    }
+
+    /// The sealed header and body of `env` verified against who this host accepted as the sender at the envelope's
+    /// time: pins, stored certificates and the one the header carries. A revocation counts against mail dated at or
+    /// after it. Keeps the carried certificate.
+    fn verify_read(&self, env: &Envelope, o: &Opened, members: &MemberList) -> Result<islandmail_core::Verified> {
+        let h = &o.header;
+        let carried = h.attest.cert.as_ref().filter(|c| members.accepts(c)
+            && crate::homes::admit(&self.store, c, true).is_ok_and(|r| r.is_ok())).cloned();
+        let ts = env.ts_ms();
+        let mut certs = self.store.certs_at(Some(&h.from), ts)?;
+        if let Some(c) = &carried {
+            if self.store.revoked_at(&c.node, &c.key)?.is_none_or(|t| ts < t) {
+                certs.push(c.clone());
+            }
+        }
+        let certs = crate::homes::current(&self.store, certs, ts)?;
+        let at = members.agents(&certs, &|_| None, ts);
+        let v = env.verify_opened(o, members, &at)?;
+        anyhow::ensure!(o.body.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
+        // Keep the carried certificate (best effort: a node at its certificate cap still delivers the mail).
+        if let Some(c) = &carried {
+            if self.store.put_cert(c).unwrap_or(false) {
+                self.refresh();
+            }
+        }
+        Ok(v)
     }
 
     pub fn agents(&self) -> Vec<Agent> {
@@ -634,7 +711,8 @@ impl Node {
         };
         let parents = self.store.heads(&thread)?;
         let b = Body { text: text.clone(), files: files.clone(), salt, meta: meta_raw.clone() };
-        let env = Envelope::seal(
+        let targets = self.wrap_targets(&members, &agents, &recipients)?;
+        let env = Envelope::seal_to(
             Draft {
                 thread: &thread,
                 parents,
@@ -648,19 +726,20 @@ impl Node {
                 recipients: &recipients,
             },
             &self.seed,
+            &targets,
         )?;
         // Refuse to write what no other node would accept (e.g. this node is not on the member list).
-        let v = env
-            .verify(&members, &agents, now_millis())
-            .and_then(|v| env.check_body(&b).map(|_| v))
+        let (v, o) = env
+            .verify(&members, &agents, now_millis(), self.opening_keys(env.ts_ms()).iter())
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
-        let readers = (mode == Mode::Private).then(|| readers_of(&agents, &env));
+        let readers = (mode == Mode::Private).then(|| readers_of(&agents, &o.header));
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
         let extra = crate::store::Extra::of(&meta_raw, &meta);
-        let row = match self.store.insert_with(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), &extra)? {
+        let read = Read { header: &o.header, v: &v, ck: &o.ck };
+        let row = match self.store.insert_with(&env, Some(read), Some(&text), &files_json, readers.as_deref(), now_millis(), &extra)? {
             Some(row) => row,
             None => {
-                let Attest { sig, .. } = &env.attest;
+                let Attest { sig, .. } = &o.header.attest;
                 let row = self.store.by_agent_sig(sig)?.filter(|r| r.visible_to(who))
                     .ok_or_else(|| ApiError::new(409, "signed message already stored"))?;
                 let reaches = self.reaches(&to, &who.sub);
@@ -668,7 +747,7 @@ impl Node {
             }
         };
         if !meta.grant.is_empty() {
-            self.apply_grant(&env, &meta, &agents)?;
+            self.apply_grant(&env, &o.header, &meta, &agents)?;
         }
         let _ = self.events.send(row.id);
         let _ = self.outbound.try_send(env);
@@ -818,72 +897,59 @@ impl Node {
             return Ok(None);
         }
         let members = self.members.read().unwrap().clone();
-        // Who this host accepted as the sender at the envelope's time: pins, stored certificates and the one the
-        // envelope carries. A revocation counts against mail dated at or after it.
-        let carried = env.carried_cert().filter(|c| members.accepts(c)
-            && crate::homes::admit(&self.store, c, true).is_ok_and(|r| r.is_ok())).cloned();
-        let ts = env.ts_ms();
-        let mut certs = self.store.certs_at(Some(&env.from), ts)?;
-        if let Some(c) = &carried {
-            if self.store.revoked_at(&c.node, &c.key)?.is_none_or(|t| ts < t) {
-                certs.push(c.clone());
+        env.check(&members, now_millis())?;
+        // Open with a slot for one of this node's keys, or a key grant that arrived before the envelope. Mail this node
+        // cannot open (or that opens but does not verify) is kept and forwarded sealed: no sender, thread or text here.
+        let opened = match env.open_for(self.opening_keys(env.ts_ms()).iter()) {
+            Ok(Some(o)) => Some(o),
+            Ok(None) => self.checked_grants(&env)?.into_iter().next(),
+            Err(e) => {
+                tracing::warn!("message {} has a slot for this node but does not open; kept sealed: {e:#}", &env.id[..12]);
+                None
             }
-        }
-        let certs = crate::homes::current(&self.store, certs, ts)?;
-        let at = members.agents(&certs, &|_| None, ts);
-        let v = env.verify(&members, &at, now_millis())?;
-        let held = self.held();
-        let keys = std::iter::once(&self.seed).chain(held.iter().map(|(_, s)| s));
-        let mut body = env.open_for(keys)?;
-        if let Some(b) = &body {
-            env.check_body(b)?;
-            anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
-        }
-        // Key grants that arrived before the envelope: keep the ones whose key opens it, in its own room.
-        let grants = self.checked_grants(&env)?;
-        if body.is_none() {
-            if let Some((_, b)) = grants.first() {
-                env.check_body(b)?;
-                anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
-                body = Some(b.clone());
-            }
-        }
-        // Keep the carried certificate (best effort: a node at its certificate cap still delivers the mail).
-        if let Some(c) = &carried {
-            if self.store.put_cert(c).unwrap_or(false) {
-                self.refresh();
-            }
-        }
-        let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
-        let (meta_raw, meta) = match &body {
-            Some(b) => match islandmail_core::room::Meta::parse(&b.meta) {
-                Ok(m) => (b.meta.clone(), m),
+        };
+        let read = match opened {
+            Some(o) => match self.verify_read(&env, &o, &members) {
+                Ok(v) => Some((o, v)),
                 Err(e) => {
-                    tracing::warn!("message {} has invalid room fields, shown as plain mail: {e:#}", &env.id[..12]);
-                    (String::new(), Default::default())
+                    tracing::warn!("message {} opens here but does not verify; kept sealed: {e:#}", &env.id[..12]);
+                    None
                 }
             },
-            None => (String::new(), Default::default()),
+            None => None,
+        };
+        let Some((o, v)) = read else {
+            let extra = crate::store::Extra { kind: "mail", ..Default::default() };
+            return Ok(self.store.insert_with(&env, None, None, "[]", None, now_millis(), &extra)?.map(Arc::new));
+        };
+        let h = &o.header;
+        let files_json = serde_json::to_string(&o.body.files)?;
+        let (meta_raw, meta) = match islandmail_core::room::Meta::parse(&o.body.meta) {
+            Ok(m) => (o.body.meta.clone(), m),
+            Err(e) => {
+                tracing::warn!("message {} has invalid room fields, shown as plain mail: {e:#}", &env.id[..12]);
+                (String::new(), Default::default())
+            }
         };
         let extra = crate::store::Extra::of(&meta_raw, &meta);
-        let text = body.map(|b| b.text);
         let agents = self.agents();
-        let readers = (env.mode == Mode::Private).then(|| readers_of(&agents, &env));
+        let readers = (h.mode == Mode::Private).then(|| readers_of(&agents, h));
+        let read = Read { header: h, v: &v, ck: &o.ck };
         let Some(row) =
-            self.store.insert_with(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis(), &extra)?
+            self.store.insert_with(&env, Some(read), Some(&o.body.text), &files_json, readers.as_deref(), now_millis(), &extra)?
         else {
             return Ok(None);
         };
-        if env.mode == Mode::Private {
+        if h.mode == Mode::Private {
             let granted: Vec<String> = self.store.grants_for(&env.id)?.into_iter().flat_map(|g| g.2).collect();
             if !granted.is_empty() {
                 self.store.add_readers(&env.id, &names_with_keys(&agents, &granted))?;
             }
         }
         if !meta.grant.is_empty() {
-            self.apply_grant(&env, &meta, &agents)?;
+            self.apply_grant(&env, h, &meta, &agents)?;
         }
-        let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
+        let _ = self.store.seen(&h.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
         let _ = self.events.send(row.id);
         Ok(Some(row))
@@ -915,15 +981,14 @@ impl Node {
 
 }
 
-/// ",name,…," readers of a private envelope. A room post (`to` = room:…) is for the agents its content key was
-/// wrapped to (the room's members when it was sent); other private mail for the sender and whom `to` addresses.
-pub fn readers_of(agents: &[Agent], env: &Envelope) -> String {
-    if !env.to.starts_with("room:") {
-        return readers_for(agents, &env.to, &env.from);
+/// ",name,…," readers of a private envelope. A room post (`to` = room:…) is for the agents in its signed audience
+/// (the room's members when it was sent); other private mail for the sender and whom `to` addresses.
+pub fn readers_of(agents: &[Agent], h: &Header) -> String {
+    if !h.to.starts_with("room:") {
+        return readers_for(agents, &h.to, &h.from);
     }
-    let wrapped: Vec<String> = env.keys.iter().map(|w| w.to.trim_end_matches('=').to_string()).collect();
-    let mut names = names_with_keys(agents, &wrapped);
-    names.push(norm(&env.from));
+    let mut names = names_with_keys(agents, &h.audience);
+    names.push(norm(&h.from));
     names.sort();
     names.dedup();
     format!(",{},", names.join(","))
@@ -1063,10 +1128,6 @@ pub fn clean_text(v: Option<&Value>, allow_empty: bool) -> Result<String, ApiErr
 }
 
 impl Node {
-    fn local_keys(&self) -> Vec<Seed> {
-        std::iter::once(self.seed.clone()).chain(self.held().into_iter().map(|(_, s)| s)).collect()
-    }
-
     /// The held identities as they are now.
     pub fn held(&self) -> Vec<(String, Seed)> {
         self.opts.identities.read().unwrap().clone()
@@ -1140,45 +1201,46 @@ impl Node {
         out
     }
 
-    /// Grants held for `env` whose key opens it in its own room, with the bodies they open; others are dropped.
-    fn checked_grants(&self, env: &Envelope) -> Result<Vec<(String, Body)>> {
+    /// Grants held for `env` whose key opens it in its own room, opened; others are dropped.
+    fn checked_grants(&self, env: &Envelope) -> Result<Vec<Opened>> {
         let mut out = Vec::new();
         for (ck, thread, _) in self.store.grants_for(&env.id)? {
             let key: Option<[u8; 32]> = islandmail_core::b64u_decode(&ck).and_then(|k| k.try_into().ok());
-            match key.filter(|_| thread == env.thread).map(|k| env.open_with(&k)) {
-                Some(Ok(b)) if env.check_body(&b).is_ok() => out.push((ck, b)),
+            match key.map(|k| env.open_with(&k)) {
+                Some(Ok(o)) if o.header.thread == thread && env.check_body(&o.header, &o.body).is_ok() => out.push(o),
                 _ => self.store.drop_grant(&env.id, &ck)?,
             }
         }
         Ok(out)
     }
 
-    /// A key grant this node can read: the grant envelope's recipients may now read each listed envelope of the
-    /// same room. Grants for envelopes not here yet wait for them (`ingest` checks them on arrival).
-    fn apply_grant(&self, grant: &Envelope, meta: &islandmail_core::room::Meta, agents: &[Agent]) -> Result<()> {
-        let keys: Vec<String> = grant.keys.iter().map(|w| w.to.trim_end_matches('=').to_string()).collect();
+    /// A key grant this node can read: the grant's audience may now read each listed envelope of the same room.
+    /// Grants for envelopes not here yet wait for them (`ingest` checks them on arrival).
+    fn apply_grant(&self, grant: &Envelope, gh: &Header, meta: &islandmail_core::room::Meta, agents: &[Agent]) -> Result<()> {
+        let keys: Vec<String> = gh.audience.clone();
         let names = names_with_keys(agents, &keys);
+        let members = self.members.read().unwrap().clone();
         for item in &meta.grant {
             let Some((raw, has_text, _)) = self.store.env_state(&item.env)? else {
-                self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &grant.thread)?;
+                self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
                 self.resync.notify_one();
                 continue;
             };
             let env: Envelope = serde_json::from_str(&raw)?;
             let Some(ck) = islandmail_core::b64u_decode(&item.ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
-            if env.thread != grant.thread || env.mode != Mode::Private {
+            let Ok(o) = env.open_with(&ck) else { continue };
+            if o.header.thread != gh.thread || o.header.mode != Mode::Private || env.check_body(&o.header, &o.body).is_err() {
                 continue;
             }
-            let Ok(b) = env.open_with(&ck) else { continue };
-            if env.check_body(&b).is_err() {
-                continue;
-            }
-            self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &grant.thread)?;
+            self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
             if !has_text {
-                let meta = islandmail_core::room::Meta::parse(&b.meta).unwrap_or_default();
-                let raw_meta = if meta.is_empty() { String::new() } else { b.meta.clone() };
-                let files = serde_json::to_string(&b.files)?;
-                self.store.fill_body(&item.env, &b.text, &files, &crate::store::Extra::of(&raw_meta, &meta))?;
+                let Ok(v) = self.verify_read(&env, &o, &members) else { continue };
+                let meta = islandmail_core::room::Meta::parse(&o.body.meta).unwrap_or_default();
+                let raw_meta = if meta.is_empty() { String::new() } else { o.body.meta.clone() };
+                let files = serde_json::to_string(&o.body.files)?;
+                let readers = readers_of(agents, &o.header);
+                self.store.fill_opened(&item.env, Read { header: &o.header, v: &v, ck: &o.ck }, &readers, &o.body.text,
+                                       &files, &crate::store::Extra::of(&raw_meta, &meta))?;
             }
             self.store.add_readers(&item.env, &names)?;
         }
@@ -1197,12 +1259,7 @@ impl Node {
         }
         let events_only = state.history == islandmail_core::room::History::SinceJoin;
         let mut out = Vec::new();
-        for (env_id, raw, granted) in self.store.room_envelopes(room, who, events_only)? {
-            let env: Envelope = serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
-            let ck = match env.content_key(self.local_keys().iter())? {
-                Some(k) => islandmail_core::b64u(&k),
-                None => match granted { Some(k) => k, None => continue },
-            };
+        for (env_id, ck) in self.store.room_keys(room, who, events_only)? {
             out.push(json!({ "env": env_id, "ck": ck }));
         }
         Ok(out)
@@ -1401,13 +1458,7 @@ mod tests {
     #[test]
     fn padded_wire_keys_work_in_mailbox_lookups() {
         let (node, alice, writer, list, _rx) = setup();
-        let mut env = envelope(&writer, &list, &alice, "padded keys");
-        for wrap in &mut env.keys {
-            wrap.to.push('=');
-        }
-        let Attest { key, .. } = &mut env.attest;
-        key.push('=');
-        env.sig = islandmail_core::b64u(&writer.sign(&env.signing_bytes()));
+        let env = envelope(&writer, &list, &alice, "padded keys");
         let row = node.ingest(env).unwrap().unwrap();
         let viewer = Caller {
             name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()), exp_ms: i64::MAX,
@@ -1504,8 +1555,10 @@ mod tests {
         let (rows, _) = node.store.query(&crate::store::Query::default(), &who, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
         // The same signature in another base64 spelling is refused outright.
+        // The same signature in another base64 spelling is kept sealed: never shown.
         let padded = seal(vec![], format!("{sig}=="));
-        assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
+        let row = node.ingest(padded).unwrap().unwrap();
+        assert!(row.text.is_none() && row.mode == "sealed" && row.sender.is_empty());
     }
 
     #[test]
@@ -1535,11 +1588,16 @@ mod tests {
         let f = node.upload(&alice, "a.txt", "text/plain", b"real bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         // An earlier members-mode row (as a member node could write) naming alice's blob with a wrong key.
-        let mut decoy = envelope(&node_b, &list, &agent, "decoy");
+        let decoy_body = Body { text: "decoy".into(), ..Default::default() };
+        let decoy = Envelope::seal(Draft { thread: "t", parents: vec![], ts: now_ts(), from: "a.alice", to: "all",
+            mode: Mode::Members, body: &decoy_body, blobs: vec![id.clone()],
+            attest: Attest { key: fmt_key(&agent.public()), digest: String::new(), sig: "decoy".into(), cert: None },
+            recipients: &list.all_keys() }, &node_b).unwrap();
         let v = islandmail_core::Verified { sender_sub: "agent:alice@t".into() };
-        decoy.blobs.push(id.clone());
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": islandmail_core::b64u(&[7u8; 32]) }]);
-        node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
+        let opened = decoy.open(&node.seed).unwrap().unwrap();
+        let read = Read { header: &opened.header, v: &v, ck: &opened.ck };
+        node.store.insert(&decoy, Some(read), Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
         node.post(&alice, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
             "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
@@ -1610,7 +1668,8 @@ mod tests {
             assert!(node.post(&who, &invalid).is_err());
         }
         let p3 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "next" })).unwrap();
-        assert_eq!(rx.try_recv().unwrap().parents, vec![p.row.env_id.clone()], "parents = thread heads");
+        assert_eq!(rx.try_recv().unwrap().open(&node.seed).unwrap().unwrap().header.parents, vec![p.row.env_id.clone()],
+                   "parents = thread heads");
         assert!(p3.row.id > p.row.id);
     }
 
@@ -1634,7 +1693,6 @@ mod tests {
             .post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
-        assert!(matches!(e.attest, Attest { .. }));
         assert_eq!(e.ts, ts);
         // A signature over other text, or by another key, is refused.
         let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
@@ -1663,9 +1721,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let _ = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "no token inside" })).unwrap();
         let e = rx.try_recv().unwrap();
-        assert!(matches!(e.attest, Attest { .. }));
-        e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis()).unwrap();
-        e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
+        e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis(), [&node_b]).unwrap();
         let (node, _) = mk(vec![("a.alice".into(), Seed::generate())]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         assert_eq!(node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "x" })).err().unwrap().status, 400);
@@ -1683,11 +1739,11 @@ mod tests {
                                  "signed": signed(&_l, &alice, "all", "t", "see file", std::slice::from_ref(&f), &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
-        let body = e.open(&node.seed).unwrap().unwrap();
+        let o = e.open(&node.seed).unwrap().unwrap();
         for (field, replacement) in [("name", json!("different.txt")), ("type", json!("application/json")), ("size", json!(1))] {
-            let mut changed = body.clone();
+            let mut changed = o.body.clone();
             changed.files[0][field] = replacement;
-            assert!(e.check_body(&changed).is_err());
+            assert!(e.check_body(&o.header, &changed).is_err());
         }
         assert_eq!(e.blobs, vec![id.clone()]);
         let m = p.row.to_message();
@@ -1896,7 +1952,8 @@ mod tests {
         assert!(pod.take_revocation(&revoked[0]).unwrap());
         assert!(pod.ingest(env_before).unwrap().is_some(), "mail dated before the revocation is still accepted");
         let late = envelope_from(&mac, &dana, "dana", "after", Some(cert));
-        assert!(pod.ingest(late).is_err(), "mail dated after it is refused");
+        let row = pod.ingest(late).unwrap().unwrap();
+        assert!(row.text.is_none() && row.mode == "sealed", "mail dated after it is kept sealed, never shown");
         assert_eq!(status(mac.certify(&proof(&dana, "dana", &mac))), 403, "a revoked key stays revoked");
         let fresh = Seed::generate();
         assert_eq!(mac.certify(&proof(&fresh, "dana", &mac)).unwrap().0, 201, "the name takes a new key");
@@ -1917,6 +1974,64 @@ mod tests {
         let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: String::new() };
         Envelope::seal(Draft { thread: "t", parents: vec![], ts, from: name, to: "all", mode: Mode::Members, body: &body,
                                blobs: vec![], attest, recipients: &keys }, &writer.seed).unwrap()
+    }
+
+    /// The two-home network with `dana` held at the pod and `h.bob` at the mac, both certified on both, and the
+    /// third member node (ops) running too.
+    fn sealed_net() -> (Node, Node, Node, Caller) {
+        let (mut mac, mut pod, ops_seed, list) = homes();
+        let (dana, h_bob) = (Seed::generate(), Seed::generate());
+        pod.opts.identities.get_mut().unwrap().push(("dana".into(), dana));
+        mac.opts.identities.get_mut().unwrap().push(("h.bob".into(), h_bob.clone()));
+        mac.certify_identities();
+        pod.certify_identities();
+        let path = std::env::temp_dir().join(format!("islandmail-node-test-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
+        let ops = Node::new(Store::open(&path).unwrap(), list, ops_seed, Opts::default(), mpsc::channel(32).0);
+        let certs: Vec<Cert> = [&mac, &pod].iter().flat_map(|n| n.store.certs_at(None, i64::MAX).unwrap()).collect();
+        for n in [&mac, &pod, &ops] {
+            for c in &certs { n.take_cert(c).unwrap(); }
+        }
+        let bob = mac.verify(&token(&h_bob, "h.bob", &mac)).unwrap();
+        (mac, pod, ops, bob)
+    }
+
+    #[test]
+    fn a_node_outside_the_audience_learns_only_time_size_and_writer() {
+        let (mac, pod, ops, bob) = sealed_net();
+        let p = mac.post(&bob, &json!({"to": "dana", "thread": "secret-plans", "mode": "private", "text": "the quiet words"})).unwrap();
+        let raw = mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0].clone();
+        for leak in ["dana", "bob", "secret-plans", "quiet", "private", "\"to\"", "\"from\"", "thread", "attest"] {
+            assert!(!raw.contains(leak), "the wire form shows {leak}");
+        }
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(pod.ingest(env.clone()).unwrap().unwrap().text.as_deref(), Some("the quiet words"), "dana's home reads it");
+        let row = ops.ingest(env.clone()).unwrap().expect("kept for sync");
+        assert!(row.text.is_none() && row.sender.is_empty() && row.thread.is_empty() && row.recipient.is_empty());
+        assert_eq!((row.mode.as_str(), ops.store.count().unwrap()), ("sealed", 1));
+        assert_eq!(ops.store.envelopes(std::slice::from_ref(&env.id)).unwrap()[0], raw, "and forwards it unchanged");
+        assert!(ops.ingest(env).unwrap().is_none());
+    }
+
+    #[test]
+    fn mail_is_wrapped_to_the_six_hour_key_so_the_identity_key_alone_does_not_open_it() {
+        let (mac, pod, _ops, bob) = sealed_net();
+        let network = pod.members.read().unwrap().network.clone();
+        let epoch = now_millis().div_euclid(islandmail_core::node_key::ROTATION_MS);
+        let secret = Seed::generate();
+        let record = islandmail_core::node_key::NodeEncryptionKey::issue(&pod.seed, &network, epoch, &secret);
+        *pod.epoch_keys.write().unwrap() = vec![(epoch, secret)];
+        mac.store.remember_encryption_key(&record).unwrap();
+        let p = mac.post(&bob, &json!({"to": "dana", "mode": "private", "text": "for now"})).unwrap();
+        let env: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0]).unwrap();
+        assert!(env.open(&pod.seed).unwrap().is_none(), "the pod's long-lived key has no slot");
+        assert_eq!(pod.ingest(env.clone()).unwrap().unwrap().text.as_deref(), Some("for now"));
+        // Once the pod's rotating seed is gone (expired and deleted), its own copy of the ciphertext stays shut.
+        pod.epoch_keys.write().unwrap().clear();
+        assert!(env.open_for(pod.opening_keys(env.ts_ms()).iter()).unwrap().is_none());
+        // And rooms and grants keep working there: the row keeps the content key it was opened with.
+        let at_pod = pod.store.query(&Default::default(), &Caller { name: "dana".into(), sub: "agent:dana".into(),
+            key: fmt_key(&pod.held()[0].1.public()), exp_ms: i64::MAX }, MAX_TEXT).unwrap().0;
+        assert_eq!(at_pod.len(), 1);
     }
 
     #[test]
@@ -1948,7 +2063,8 @@ mod tests {
         // dana writes from the pod; the mac accepts it (pod's cert travels in the envelope) and can read the reply.
         let r = pod.post(&at_pod, &json!({"to": "h.bob", "mode": "private", "text": "reply"})).unwrap();
         let env: Envelope = serde_json::from_str(&pod.store.envelopes(std::slice::from_ref(&r.row.env_id)).unwrap()[0]).unwrap();
-        assert!(env.carried_cert().is_some_and(|c| c.node == fmt_key(&pod.seed.public())));
+        let carried = env.open(&mac.seed).unwrap().unwrap().header.attest.cert;
+        assert!(carried.is_some_and(|c| c.node == fmt_key(&pod.seed.public())));
         let row = mac.ingest(env).unwrap().unwrap();
         assert!(mac.store.get(row.id, &bob).unwrap().is_some());
     }

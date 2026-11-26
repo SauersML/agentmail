@@ -24,13 +24,17 @@ use tokio::sync::{broadcast, mpsc};
 use crate::config::Config;
 use crate::node::Node;
 
-pub const SYNC_ALPN: &[u8] = b"islandmail/sync/1";
+pub const SYNC_ALPN: &[u8] = b"islandmail/sync/2";
+/// The sync protocol of nodes from before sealed envelopes: answered only with a clear refusal, both ways.
+const OLD_SYNC_ALPN: &[u8] = b"islandmail/sync/1";
+/// Closing code (and reason) for a peer on the old wire format.
+const INCOMPATIBLE: u32 = 426;
 /// The one protocol a key that is not on the trust file may use: present a reply to this node's invite (invite.rs).
 pub const JOIN_ALPN: &[u8] = b"islandmail/join/1";
 const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 /// Large enough for a `blob` answer: an encrypted attachment (MAX_FILE + 40 bytes) in base64 inside JSON.
-const MAX_RESP: usize = 4 * (crate::node::MAX_FILE + 40).div_ceil(3) + (1 << 20);
+const MAX_RESP: usize = 4 * islandmail_core::crypto::blob_len(crate::node::MAX_FILE).div_ceil(3) + (1 << 20);
 const IDS_PER_GET: usize = 200;
 /// A `get` answer stops adding envelopes past this many bytes (it always carries at least one), so it stays under
 /// 64 MiB even when every envelope is near the size limit (200 of those are ~110 MiB); the asker requests the rest.
@@ -192,6 +196,33 @@ struct SyncProto {
     node: Arc<Node>,
 }
 
+const INCOMPATIBLE_REASON: &[u8] = b"peer runs an incompatible wire format: this node speaks islandmail/sync/2 (sealed envelopes)";
+
+/// Logs (at most every ten minutes per peer) that `peer` is on the old wire format.
+fn warn_incompatible(peer: &EndpointId) {
+    static LAST: std::sync::Mutex<Option<std::collections::HashMap<EndpointId, std::time::Instant>>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    let last = last.get_or_insert_with(Default::default);
+    if last.get(peer).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+        return;
+    }
+    last.insert(*peer, std::time::Instant::now());
+    tracing::warn!("peer {} runs an incompatible wire format (islandmail/sync/1, before sealed envelopes); \
+                    it must upgrade to this build (islandmail/sync/2)", peer.fmt_short());
+}
+
+/// OLD_SYNC_ALPN: a node on the old wire format dialed us. Log it and close with a reason its log shows.
+#[derive(Debug, Clone)]
+struct OldSyncProto;
+
+impl ProtocolHandler for OldSyncProto {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        warn_incompatible(&conn.remote_id());
+        conn.close(INCOMPATIBLE.into(), INCOMPATIBLE_REASON);
+        Ok(())
+    }
+}
+
 impl ProtocolHandler for SyncProto {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         loop {
@@ -288,6 +319,30 @@ async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
         bytes.extend_from_slice(&chunk);
     }
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Mean seconds between cover messages.
+const COVER_MEAN_SECS: f64 = 120.0;
+
+/// An exponential wait (a Poisson process), capped at ten means.
+fn cover_delay() -> Duration {
+    let u = (u64::from_le_bytes(islandmail_core::random_bytes::<8>()) >> 11) as f64 / (1u64 << 53) as f64;
+    Duration::from_secs_f64((-(1.0 - u).ln() * COVER_MEAN_SECS).min(10.0 * COVER_MEAN_SECS))
+}
+
+/// `{"cover":"…"}` with random content of a 1 or 4 KiB envelope's size (ciphertext, slots and signature).
+fn cover_message() -> Vec<u8> {
+    let bucket = if islandmail_core::random_bytes::<1>()[0] < 192 { 1 << 10 } else { 4 << 10 };
+    let mut filled = vec![0u8; bucket + 40 + 4 * 64 + 220];
+    for chunk in filled.chunks_mut(32) {
+        let r = islandmail_core::random_bytes::<32>();
+        chunk.copy_from_slice(&r[..chunk.len()]);
+    }
+    serde_json::to_vec(&serde_json::json!({ "cover": islandmail_core::b64u(&filled) })).expect("json")
+}
+
+fn is_cover(msg: &[u8]) -> bool {
+    msg.starts_with(br#"{"cover":"#)
 }
 
 /// Kept alive for the node's lifetime (dropping the router stops accepting).
@@ -424,8 +479,19 @@ impl Ctx {
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
     async fn sync_with(&self, peer: EndpointId, blob_after: &mut String) -> Result<usize> {
         let node = &self.node;
-        let conn = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN))
-            .await.context("connect timed out")??;
+        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN))
+            .await.context("connect timed out")? {
+            Ok(c) => c,
+            Err(e) => {
+                // A peer that refused our protocol but speaks the old one is on the old wire format: say so.
+                if let Ok(Ok(old)) = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), OLD_SYNC_ALPN)).await {
+                    old.close(INCOMPATIBLE.into(), INCOMPATIBLE_REASON);
+                    warn_incompatible(&peer);
+                    anyhow::bail!("peer runs an incompatible wire format (islandmail/sync/1)");
+                }
+                return Err(e.into());
+            }
+        };
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
         if let Some(record) = &trust.encryption_key {
@@ -497,7 +563,7 @@ impl Ctx {
                 blob_after.clone_from(&id);
                 let Some(b64) = call(&conn, &network, &Req::Blob { id: id.clone() }).await?.blob else { continue };
                 match islandmail_core::b64u_decode(&b64) {
-                    Some(data) if (40..=crate::node::MAX_FILE + 40).contains(&data.len()) && blake3::hash(&data).to_hex().as_str() == id => {
+                    Some(data) if (40..=islandmail_core::crypto::blob_len(crate::node::MAX_FILE)).contains(&data.len()) && blake3::hash(&data).to_hex().as_str() == id => {
                         node.store.put_blob(&id, &data, islandmail_core::now_millis())?;
                         tracing::info!("blob {} ({} bytes) from {}", &id[..12], data.len(), peer.fmt_short());
                     }
@@ -593,6 +659,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let keys = crate::encryption_keys::EncryptionKeys::new(&cfg.data_dir, cfg.encryption_key_retention_days)?;
     let network = node.members.read().unwrap().network.clone();
     *node.encryption_key.write().unwrap() = Some(keys.rotate(&node.seed, &network, islandmail_core::now_millis())?);
+    *node.epoch_keys.write().unwrap() = keys.retained()?;
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
     let mode = relay_mode(&relay_entries(&node.members.read().unwrap(), &cfg.relay))?;
@@ -616,6 +683,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(SYNC_ALPN, SyncProto { node: node.clone() })
+        .accept(OLD_SYNC_ALPN, OldSyncProto)
         .accept(JOIN_ALPN, JoinProto { node: node.clone() })
         .spawn();
     *node.dialer.lock().unwrap() = Some(Dialer { endpoint: endpoint.clone(), lookup: lookup.clone(), relays: relays.clone() });
@@ -635,6 +703,9 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         while let Some(ev) = receiver.next().await {
             match ev {
                 Ok(Event::Received(msg)) => {
+                    if is_cover(&msg.content) {
+                        continue;
+                    }
                     if let Some(r) = trust_message(&c.node, &msg.content) {
                         match r {
                             Ok(true) => tracing::info!("gossip: new certificate or revocation"),
@@ -675,6 +746,18 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             }
             if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
                 tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
+            }
+        }
+    }));
+
+    // Cover traffic: at random times (on average every COVER_MEAN_SECS) a dummy the size of a small envelope, so
+    // an observer of one link cannot tell from activity alone when this node wrote mail. Receivers drop it.
+    let c = ctx.clone();
+    tasks.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(cover_delay()).await;
+            if let Err(e) = c.sender.broadcast(Bytes::from(cover_message())).await {
+                tracing::debug!("cover traffic: {e}");
             }
         }
     }));
@@ -722,8 +805,11 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             let now = islandmail_core::now_millis();
             let epoch = now.div_euclid(islandmail_core::node_key::ROTATION_MS);
             if rotating.encryption_key.read().unwrap().as_ref().is_some_and(|k| k.epoch == epoch) { continue; }
-            match keys.rotate(&rotating.seed, &network, now) {
-                Ok(record) => *rotating.encryption_key.write().unwrap() = Some(record),
+            match keys.rotate(&rotating.seed, &network, now).and_then(|r| Ok((r, keys.retained()?))) {
+                Ok((record, retained)) => {
+                    *rotating.encryption_key.write().unwrap() = Some(record);
+                    *rotating.epoch_keys.write().unwrap() = retained;
+                }
                 Err(e) => tracing::error!("rotating node encryption key: {e:#}"),
             }
         }
@@ -781,6 +867,17 @@ mod tests {
     use islandmail_core::envelope::Draft;
     use islandmail_core::keys::{fmt_key, Seed};
     use islandmail_core::{Attest, Body, Mode, NodeEntry, Verified};
+
+    #[test]
+    fn cover_messages_look_like_small_envelopes_and_are_dropped() {
+        let sizes: std::collections::HashSet<usize> = (0..200).map(|_| cover_message().len()).collect();
+        assert!(sizes.len() <= 2 && sizes.iter().all(|&n| (1500..7000).contains(&n)), "{sizes:?}");
+        let m = cover_message();
+        assert!(is_cover(&m));
+        assert!(serde_json::from_slice::<Envelope>(&m).is_err(), "never taken for mail");
+        let mean = (0..2000).map(|_| cover_delay().as_secs_f64()).sum::<f64>() / 2000.0;
+        assert!((80.0..160.0).contains(&mean), "mean wait {mean}");
+    }
 
     #[test]
     fn relay_selection_is_opt_in() {
@@ -876,6 +973,10 @@ mod tests {
         let issuer = fmt_key(&reader.seed.public());
         let page = call(&peer, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;
         assert!(!page.more_trust && page.certs.len() == 1 && page.certs[0].node == issuer);
+        // A member on the old wire format is told why, in the close reason, not silently dropped.
+        let old = hosts[0].1.endpoint.connect(remote.id(), OLD_SYNC_ALPN).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(10), old.closed()).await?;
+        assert!(closed.to_string().contains("incompatible wire format"), "{closed}");
         let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
             .relay_mode(relay_mode(std::slice::from_ref(&url))?).bind().await?;
         let attempt = tokio::time::timeout(Duration::from_secs(10), async {
@@ -885,6 +986,7 @@ mod tests {
         assert!(attempt.is_err(), "an unpinned node got a sync response through the relay");
         outsider.close().await;
         drop(peer);
+        drop(old);
         // Windows cannot delete open files: release every node (and its store) before removing the directory.
         for (node, net) in hosts {
             net.shutdown().await?;
@@ -938,7 +1040,9 @@ mod tests {
                 &node.seed,
             )
             .unwrap();
-            node.store.insert(&e, &v, Some("x"), "[]", None, 0).unwrap().unwrap();
+            let o = e.open(&node.seed).unwrap().unwrap();
+            let read = crate::store::Read { header: &o.header, v: &v, ck: &o.ck };
+            node.store.insert(&e, Some(read), Some("x"), "[]", None, 0).unwrap().unwrap();
             ids.push(e.id);
         }
         ids.insert(2, "0".repeat(64)); // one id the peer does not have

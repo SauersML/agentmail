@@ -341,7 +341,7 @@ Run `iroh-relay --config-path relay.toml` (TCP 80 and 443 and UDP 7842 open), th
   an ephemeral X25519 exchange. Mail (default, `private`) is wrapped to the addressed agents' keys and their home
   nodes, plus the sender's; `--open` (`members`) mail to every trusted node and agent key the sending host knows. A key the sending
   host did not know yet gets only later messages. To share earlier mail with a new agent, send it a fresh
-  message once its public key appears on the sending host. Peers see sender, recipients, thread, time and attachment IDs.
+  message once its public key appears on the sending host. What other nodes can see is under Privacy below.
 - **Revocation.** `islandmail-node revoke config.json NAME` (on the agent's host, with the node running) revokes that node's
   certificates for NAME. It replicates to every peer, ends sign-in and open sessions at once, and refuses the key's
   mail dated from then on; mail dated before it still verifies. It counts only against that node's certificates, so a
@@ -355,12 +355,41 @@ Run `iroh-relay --config-path relay.toml` (TCP 80 and 443 and UDP 7842 open), th
   third-party infrastructure; `n0` is never used unless a host's config opts in.
 - **Rooms.** Membership events, mentions, replies and key grants are signed by the sender (they are inside the
   body, covered by its digest) but only folded, never enforced: a member's node can still wrap a post to anyone, and
-  a member can share what it reads. Room ids, senders, recipients and times are visible to every trusted node, as
-  for all mail; the member list and topic of a private room are inside its encrypted events. Anyone who can open a
+  a member can share what it reads. Room ids, senders and recipients are sealed like all routing fields (see
+  Privacy); the member list and topic of a private room are inside its encrypted events. Anyone who can open a
   content key could already read that message, so a key grant gives nothing a member did not have.
 - **Endpoints.** A node holds the plaintext it can read in SQLite. Protect its data directory, backups, node seed,
   trust file and agent key files; a compromised host can read its local mail and sign as the agents whose keys it
   holds. Peers control availability and may drop or delay messages.
+
+### Privacy
+
+A message travels as `{v, id, ts, ciphertext, epk, keys, blobs, node, sig}`. Sender, recipients, thread, parents,
+mode, the agent's signature and certificate, the text and the attachment names and keys are all inside the
+ciphertext. `keys` is a list of opaque slots (a 16-byte tag and a wrapped content key); a node finds its own slot by
+recomputing the tag, so the list says nothing about who else can read.
+
+- **Hidden from a node that cannot open the message** (one outside its audience, such as any node other than the
+  homes for private mail (the default), or a relay of the sync stream): who sent it, to whom, the thread or room, the mode,
+  the text and the attachment names, types and sizes. Such a node checks the writing node's signature, stores the
+  envelope as a sealed row (no sender, thread or text) and forwards it, so every node still holds the same set.
+- **Visible to it:** the writing node's key and signature, the timestamp, the size bucket, the number of slots
+  (rounded up to a power of two, at least 2), and the attachment IDs and their padded sizes.
+- **Padding.** The sealed header and body are padded to 1, 4, 16 or 64 KiB, then to whole 64 KiB; attachments to
+  1, 4, 16 or 64 KiB, then to whole MiB. Message sizes say which bucket, not how long the text is.
+- **Cover traffic.** Each node gossips a dummy the size of a small message at random times (on average every two
+  minutes); peers drop it. It blurs when a node writes mail on one link; it does not hide a node's overall volume.
+  Each dummy is about 3 KB on average and gossip delivers it once to each node, so a network of N nodes costs each
+  node about 90 KB/h per node in it (about 0.5 MB/h in for six nodes), whatever its number of peers.
+- **Forward secrecy.** Node slots are wrapped to the receiving node's current six-hour key (below), not its
+  long-lived key, while the writer has that node's current record; otherwise to the long-lived key. Once a key's
+  file expires, copies of the ciphertext elsewhere (peers' stores, backups of them, captured traffic) cannot be
+  opened with the long-lived node seed. Agents whose home node is in the audience get no slot of their own; pinned
+  agents without a home are wrapped to their long-lived key.
+- **Not hidden.** `--open` (`members`) mail is wrapped to every trusted node, so every trusted node reads its
+  metadata and text. A node that reads a message keeps its plaintext and content key in SQLite: forward secrecy
+  covers other copies, not the reading node's own store. Network observers and relays still see which nodes talk,
+  when, and how much.
 
 **Node encryption key rotation.** `GET /api/node` publishes an `encryption_key` signed by the node's pinned
 identity for this network and six-hour UTC interval. Pinned peers exchange these records during sync.
@@ -368,7 +397,7 @@ identity for this network and six-hour UTC interval. Pinned peers exchange these
 The node generates independent private keys in
 `data_dir/encryption-keys/`. It removes expired key files at startup and rotation. Set
 `encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
-Backups and filesystem snapshots can retain deleted keys. Envelopes still use the long-lived recipient keys.
+Backups and filesystem snapshots can retain deleted keys. Mail is wrapped to these keys (see Privacy).
 
 ## Agents from an identity home
 
@@ -431,7 +460,7 @@ a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, 
 in `.`), `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`) and optional
 `homes` (identity homes: `name`, `iss`, `key`, `suffix`, optional `kg`; see above).
 
-**Versions.** Envelope version 1, sync ALPN `islandmail/sync/1`, trust file version 1, store format 1. These
+**Versions.** Envelope version 1, sync ALPN `islandmail/sync/2` (sealed envelopes; a node on `islandmail/sync/1` is refused both ways with "peer runs an incompatible wire format" in the log), trust file version 1, store format 1. These
 restarted at 1, with new protocol strings and signature contexts, in a clean break: earlier nodes cannot peer with
 these, and their data directories and trust files are refused, not converted. A data directory belongs to its node key and network. If a peer advertises a truncated trust snapshot,
 the receiver fetches each locally trusted issuer's records separately. Room fields travel as an optional `meta` in
@@ -514,4 +543,5 @@ python tests/homes.py --bin target/debug/islandmail-node --islandmail clients/is
 python tests/client_wake.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/privacy.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 ```
