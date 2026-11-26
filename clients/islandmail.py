@@ -1091,9 +1091,9 @@ def first_run(config, inv, a):
                      % (key, folder, inv["network"], json.dumps(inv["relay"]), proc.pid, exe, config))
 
 
-def make_invite(ident, name, room=None, config=None, ttl=7 * 86400):
-    # A signed invite for NAME (and optionally a room of ident's) from this host's node: the line `join` takes.
-    # Needs the node's config and key file (default ~/.islandmail/node/config.json); Fail when they are not here.
+def make_invite(ident, name, room=None, config=None, ttl=INVITE_TTL):
+    # {invite, exp}: a signed invite for NAME (and optionally a room of ident's) from this host's node, the line `join`
+    # takes. Needs the node's config and key file (default ~/.islandmail/node/config.json); Fail when they are not here.
     global MAIL
     saved = MAIL
     try:
@@ -1105,8 +1105,8 @@ def make_invite(ident, name, room=None, config=None, ttl=7 * 86400):
         frm = ident["name"] if ident else ""
         out = owner_step("invite", config, "%s|%s|%s|%d" % (name, room, frm, ttl),
                          {"name": name, "room": room, "from": frm, "ttl_s": ttl})
-        return out["invite"]
-    except OSError as e:
+        return out
+    except (OSError, KeyError) as e:
         raise Fail("cannot read this node's config or key (%s)" % e)
     finally:
         MAIL = saved
@@ -1119,11 +1119,11 @@ def cmd_invite(a):
     except Fail:
         if a.room:
             raise
-    invite = make_invite(ident, a.name, a.room, a.config, a.ttl)
-    print(invite)
-    sys.stderr.write("islandmail: invite for %s%s, valid for %d s. They run: islandmail.py join INVITE; "
+    out = make_invite(ident, a.name, a.room, a.config, a.ttl)
+    print(out["invite"])
+    sys.stderr.write("islandmail: invite for %s%s, valid until %s. They run: islandmail.py join INVITE; "
                      "you then run: islandmail.py accept REPLY with what join prints.\n"
-                     % (a.name, " (joins room %s)" % a.room if a.room else "", a.ttl))
+                     % (a.name, " (joins room %s)" % a.room if a.room else "", out["exp"]))
 
 
 def cmd_join(a):
@@ -1344,21 +1344,6 @@ def network_names(ident):
     return [x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])]
 
 
-def join_link(ident, name, room, config=None):
-    # A ready invite for NAME into ROOM, signed with this host's node key, when the caller can read that key (the node
-    # operator); else None. owner_step points MAIL at the configured node, so it is put back afterwards.
-    global MAIL
-    mail = MAIL
-    try:
-        out = owner_step("invite", config, "%s|%s|%s|%d" % (name, room, ident["name"], INVITE_TTL),
-                         {"name": name, "room": room, "from": ident["name"], "ttl_s": INVITE_TTL})
-        return out["invite"], out["exp"]
-    except (Fail, OSError, KeyError):
-        return None
-    finally:
-        MAIL = mail
-
-
 def cmd_room_new(a):
     # One line to a group chat: a private room YOU/NAME with these members, full history for anyone added later.
     ident = load_identity(a.as_)
@@ -1376,12 +1361,12 @@ def cmd_room_new(a):
     room_post(ident, room, text, event=event, quiet=True)
     print("created %s%s" % (room, " with " + ", ".join("@" + w for w in members) if members else ""))
     for w in outside:
-        inv = join_link(ident, w, room, a.config)
-        if inv:
+        try:
+            inv = make_invite(ident, w, room, a.config)
             print("  @%s is not on this network yet; send them this invite (valid until %s):\n    %s\n"
                   "  they run: islandmail.py join INVITE; you then run: islandmail.py accept REPLY, and they are in %s"
-                  % (_one_line(w), inv[1], inv[0], room))
-        else:
+                  % (_one_line(w), inv["exp"], inv["invite"], room))
+        except Fail:
             print("  @%s is not on this network yet; the node operator invites them with:\n"
                   "    islandmail.py invite --name %s --room %s" % (_one_line(w), _one_line(w), room))
     print("  chat: islandmail.py chat %s" % room)
