@@ -121,6 +121,8 @@ pub struct Node {
     /// Envelopes refused at the trust generation (`trust`) they were refused at: sync skips them until trust,
     /// certificates, held identities or a room vouch change, and each is logged once.
     refused: Mutex<HashMap<String, u64>>,
+    /// Writing nodes whose sealed envelopes were logged (`note_sealed`).
+    sealed_seen: Mutex<HashSet<String>>,
 }
 
 impl Node {
@@ -153,6 +155,7 @@ impl Node {
             auth_seen: Mutex::new(HashSet::new()),
             lent: Mutex::new(HashMap::new()),
             refused: Mutex::new(HashMap::new()),
+            sealed_seen: Mutex::new(HashSet::new()),
         };
         node.refresh();
         node
@@ -173,12 +176,15 @@ impl Node {
         self.trust.send_modify(|g| *g += 1);
     }
 
-    /// Read again the messages stored as plain mail because the build that received them did not know one of their
-    /// room fields (it logged "invalid room fields, shown as plain mail"): a vouch that arrived before this host was
-    /// upgraded, say. Sync never offers an envelope the store already has, so without this the room event stays
-    /// invisible for good. Each body is opened with the stored content key and checked against the signed digest;
-    /// a row changes only when this build can parse its room fields. Run once at start. Returns the rows changed.
-    pub fn reread_plain(&self) -> Result<usize> {
+    /// Run once at start: what an older build stored but could not use. (1) Room traffic stored as plain mail
+    /// because that build did not know one of its room fields (it logged "invalid room fields, shown as plain mail"):
+    /// a vouch that arrived before this host was upgraded, say. Sync never offers an envelope the store already has,
+    /// so without this the event stays invisible for good. Each body is opened with the stored content key and
+    /// checked against the signed digest; a row changes only when this build can parse its room fields. (2) Key
+    /// grants of an open room's membership events, which builds before this one skipped: applied now, newest first,
+    /// for a room that is still unknown here. Returns the rows changed and the rooms repaired. After Morel's #20.
+    pub fn reread_stored(&self) -> Result<(usize, usize)> {
+        let agents = self.agents();
         let mut changed = 0;
         for (id, raw, ck) in self.store.plain_readable()? {
             let Ok(env) = serde_json::from_str::<Envelope>(&raw) else { continue };
@@ -190,6 +196,9 @@ impl Node {
             let Ok(meta) = islandmail_core::room::Meta::parse(&o.body.meta) else { continue };
             if self.store.set_room_fields(&id, &crate::store::Extra::of(&o.body.meta, &meta))? {
                 changed += 1;
+                if !meta.grant.is_empty() {
+                    self.apply_grant(&env, &o.header, &meta, &agents)?;
+                }
             }
         }
         if changed > 0 {
@@ -197,7 +206,28 @@ impl Node {
             // Membership and vouches decide which refused envelopes may now be taken.
             self.trust.send_modify(|g| *g += 1);
         }
-        Ok(changed)
+        let mut repaired = 0;
+        let mut done: HashSet<String> = HashSet::new();
+        for (raw, ck, thread) in self.store.open_room_grants()? {
+            if done.contains(&thread) || self.room_state(&thread)?.is_some_and(|s| s.created) {
+                done.insert(thread);
+                continue;
+            }
+            let Ok(env) = serde_json::from_str::<Envelope>(&raw) else { continue };
+            let Some(ck) = islandmail_core::b64u_decode(&ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
+            let Ok(o) = env.open_with(&ck) else { continue };
+            let Ok(meta) = islandmail_core::room::Meta::parse(&o.body.meta) else { continue };
+            if o.header.thread != thread || meta.grant.is_empty() || env.check_body(&o.header, &o.body).is_err() {
+                continue;
+            }
+            self.apply_grant(&env, &o.header, &meta, &agents)?;
+            if self.room_state(&thread)?.is_some_and(|s| s.created) {
+                tracing::warn!("{thread}: opened its membership events from a key grant an older build stored unused");
+                repaired += 1;
+                done.insert(thread);
+            }
+        }
+        Ok((changed, repaired))
     }
 
     /// Whether `id` was refused and nothing that could change the answer has happened since.
@@ -976,9 +1006,27 @@ impl Node {
         };
         let Some((o, v)) = read else {
             let extra = crate::store::Extra { kind: "mail", ..Default::default() };
-            return Ok(self.store.insert_with(&env, None, None, "[]", None, now_millis(), &extra)?.map(Arc::new));
+            let row = self.store.insert_with(&env, None, None, "[]", None, now_millis(), &extra)?.map(Arc::new);
+            if row.is_some() {
+                self.note_sealed(&env);
+            }
+            return Ok(row);
         };
         self.store_opened(&env, o, v)
+    }
+
+    /// An envelope kept sealed for lack of a key: logged once per writing node (info), later ones at debug. Most
+    /// are mail for others; one that should open here waits for a key grant.
+    fn note_sealed(&self, env: &Envelope) {
+        let short = &env.id[..12];
+        let writer = env.node.chars().take(10).collect::<String>();
+        if self.sealed_seen.lock().unwrap().insert(env.node.clone()) {
+            tracing::info!("kept sealed: no key here for envelope {short} written by node {writer} (mail for others, or \
+                            a room message sent before this host was trusted, until a key grant opens it; later ones \
+                            from that node are logged at debug)");
+        } else {
+            tracing::debug!("kept sealed: no key here for envelope {short} written by node {writer}");
+        }
     }
 
     /// An envelope from a trusted node: opened and verified, or None to keep it sealed.
@@ -1009,7 +1057,10 @@ impl Node {
     /// changes. A vouch never comes from such a node, and a vouched node gains nothing outside R.
     fn open_vouched(&self, env: &Envelope, members: &MemberList) -> Result<(Opened, islandmail_core::Verified)> {
         let not_member = || anyhow::anyhow!("written by a node that is not a member");
-        let o = env.open_for(self.opening_keys(env.ts_ms()).iter()).ok().flatten().ok_or_else(not_member)?;
+        let o = match env.open_for(self.opening_keys(env.ts_ms()).iter()).ok().flatten() {
+            Some(o) => o,
+            None => self.checked_grants(env)?.into_iter().next().ok_or_else(not_member)?,
+        };
         let meta = islandmail_core::room::Meta::parse(&o.body.meta).map_err(|_| not_member())?;
         let room = meta.room.clone().filter(|r| *r == o.header.thread).ok_or_else(not_member)?;
         anyhow::ensure!(!matches!(meta.event, Some(islandmail_core::room::Event::Vouch { .. })),
@@ -1142,6 +1193,20 @@ pub struct Plan {
     pub mode: Mode,
     pub keys: Vec<PublicKey>,
     pub names: Option<Vec<String>>,
+}
+
+/// Whether a key grant in `thread` may open `o`: Some(true) for private mail of that room, Some(false) for a
+/// membership event of that (open) room, None otherwise. An open room's events are members-mode envelopes sealed to
+/// the hosts their writer trusted then; a host trusted later needs a grant to read them (the create above all).
+fn grantable(o: &Opened, thread: &str) -> Option<bool> {
+    if o.header.thread != thread {
+        return None;
+    }
+    match o.header.mode {
+        Mode::Private => Some(true),
+        Mode::Members => islandmail_core::room::Meta::parse(&o.body.meta).ok()
+            .filter(|m| m.event.is_some() && m.room.as_deref() == Some(thread)).map(|_| false),
+    }
 }
 
 /// ",name1,name2," of the member names a private envelope is for: the sender and every member `to` addresses.
@@ -1332,15 +1397,39 @@ impl Node {
         Ok(out)
     }
 
-    /// Post the creator's vouch for `room`'s current members (after it created the room or changed who is in it).
-    fn send_vouch(&self, who: &Caller, room: &str) -> Result<(), ApiError> {
+    /// Post the creator's vouch for `room`'s current members (after it created the room or changed who is in it), then
+    /// (open room) the grant of its membership events.
+    pub fn send_vouch(&self, who: &Caller, room: &str) -> Result<(), ApiError> {
         let entries = self.vouch_entries(room)?;
-        if entries.is_empty() {
-            return Ok(());
+        if !entries.is_empty() {
+            let text = format!("vouched for the nodes of {}", entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
+            self.room_send(who, room, &text, None, Some(&islandmail_core::room::Event::Vouch { members: entries }))?;
         }
-        let text = format!("vouched for the nodes of {}", entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
-        self.room_send(who, room, &text, None, Some(&islandmail_core::room::Event::Vouch { members: entries }))?;
+        self.grant_open_events(who, room)?;
         Ok(())
+    }
+
+    /// An open CREATOR/NAME room: one key grant, posted in the room like any post there (members mode, so it reaches
+    /// every host this one trusts now and every vouched member), of the content keys of the room's membership events.
+    /// Each event was sealed to the hosts its writer trusted when it was sent, so a host trusted later has no slot for
+    /// the create event and no room at all. Posts are not granted. Sent after each add and vouch, so a host that was
+    /// stuck gets the keys the next time. Returns how many keys it granted. After Morel's #26.
+    pub fn grant_open_events(&self, who: &Caller, room: &str) -> Result<usize, ApiError> {
+        use islandmail_core::room::{creator_of, GrantItem, Meta, MAX_GRANTS};
+        if creator_of(room).is_none() || !self.room_state(room)?.is_some_and(|s| s.created && !s.private()) {
+            return Ok(0);
+        }
+        let keys = self.store.room_event_keys(room)?;
+        let members = self.members.read().unwrap().clone();
+        let plan = self.room_plan(room, &who.name, None, &members, &self.agents())?;
+        for chunk in keys.chunks(MAX_GRANTS / 2) {
+            let grant = chunk.iter().map(|(env, ck)| GrantItem { env: env.clone(), ck: ck.clone() }).collect();
+            let meta = serde_json::to_string(&Meta { room: Some(room.to_string()), grant, ..Default::default() })
+                .map_err(|e| ApiError::from(anyhow::Error::from(e)))?;
+            self.post(who, &json!({ "to": plan.to, "thread": room, "mode": plan.mode.as_str(), "meta": meta,
+                                    "text": format!("key grant: {} membership events of {room}", chunk.len()) }))?;
+        }
+        Ok(keys.len())
     }
 
     /// Where a post in `room` by `from` goes, with an optional membership event.
@@ -1401,7 +1490,7 @@ impl Node {
         for (ck, thread, _) in self.store.grants_for(&env.id)? {
             let key: Option<[u8; 32]> = islandmail_core::b64u_decode(&ck).and_then(|k| k.try_into().ok());
             match key.map(|k| env.open_with(&k)) {
-                Some(Ok(o)) if o.header.thread == thread && env.check_body(&o.header, &o.body).is_ok() => out.push(o),
+                Some(Ok(o)) if grantable(&o, &thread).is_some() && env.check_body(&o.header, &o.body).is_ok() => out.push(o),
                 _ => self.store.drop_grant(&env.id, &ck)?,
             }
         }
@@ -1409,7 +1498,9 @@ impl Node {
     }
 
     /// A key grant this node can read: the grant's audience may now read each listed envelope of the same room.
-    /// Grants for envelopes not here yet wait for them (`ingest` checks them on arrival).
+    /// Grants for envelopes not here yet wait for them (`ingest` checks them on arrival). Besides a private room's
+    /// mail, a grant may open the membership events of an open room (`grantable`); a members-mode grant, which every
+    /// trusted host reads, opens only those.
     fn apply_grant(&self, grant: &Envelope, gh: &Header, meta: &islandmail_core::room::Meta, agents: &[Agent]) -> Result<()> {
         let keys: Vec<String> = gh.audience.clone();
         let names = names_with_keys(agents, &keys);
@@ -1417,20 +1508,16 @@ impl Node {
         let mut learned = false;
         for item in &meta.grant {
             let Some((raw, has_text, _)) = self.store.env_state(&item.env)? else {
-                self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
+                // Retried on arrival, and an envelope refused before (written by a vouched node) is offered again.
+                learned |= self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
                 self.resync.notify_one();
                 continue;
             };
             let env: Envelope = serde_json::from_str(&raw)?;
             let Some(ck) = islandmail_core::b64u_decode(&item.ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
             let Ok(o) = env.open_with(&ck) else { continue };
-            // Besides private mail, a grant may carry a membership event of the same open room: its members-mode
-            // envelope was wrapped to the hosts its writer trusted then, so a host trusted later has no slot for it.
-            let private = o.header.mode == Mode::Private;
-            let open_event = o.header.mode == Mode::Members
-                && islandmail_core::room::Meta::parse(&o.body.meta)
-                    .is_ok_and(|m| m.event.is_some() && m.room.as_deref() == Some(gh.thread.as_str()));
-            if o.header.thread != gh.thread || !(private || open_event) || env.check_body(&o.header, &o.body).is_err() {
+            let Some(private) = grantable(&o, &gh.thread) else { continue };
+            if (private && gh.mode != Mode::Private) || env.check_body(&o.header, &o.body).is_err() {
                 continue;
             }
             self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
@@ -1466,8 +1553,8 @@ impl Node {
         }
         let state = self.room_state(room)?.ok_or_else(|| ApiError::new(404, format!("no room {room} here")))?;
         if !state.private() && state.created && islandmail_core::room::creator_of(room).is_some() {
-            // An open CREATOR/NAME room: the keys of its membership events only, for a member whose host was not
-            // trusted yet when they were sent. Without the create event that host has no room at all.
+            // An open CREATOR/NAME room: the keys of its membership events only, for hosts trusted after they were
+            // sent (`grant_open_events`). Every host this one trusts can read these envelopes already.
             return Ok(self.store.room_event_keys(room)?.into_iter().map(|(env, ck)| json!({ "env": env, "ck": ck })).collect());
         }
         if !state.private() || !state.is_member(&who.name) {
@@ -1612,21 +1699,26 @@ mod tests {
     }
 
     fn envelope_at(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str) -> Envelope {
+        envelope_in(writer, list, agent, text, ts, meta, "all", "t")
+    }
+
+    fn envelope_in(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str, to: &str,
+                   thread: &str) -> Envelope {
         let salt = islandmail_core::random_bytes::<16>();
         let digest = islandmail_core::envelope::post_digest_meta(&salt, text, &[], meta).unwrap();
         let st = PostStatement {
-            from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
+            from: "a.alice", sub: "agent:alice@t", to, thread, mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(list);
         let attest = Attest { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert: None };
         let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: meta.into() };
         Envelope::seal(
             Draft {
-                thread: "t",
+                thread,
                 parents: vec![],
                 ts,
                 from: "a.alice",
-                to: "all",
+                to,
                 mode: Mode::Members,
                 body: &body,
                 blobs: vec![],
@@ -1645,16 +1737,16 @@ mod tests {
             name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()), exp_ms: i64::MAX,
         };
         let first = node.ingest(envelope(&writer, &list, &alice, "first")).unwrap().unwrap();
-        let meta = format!(r#"{{"reply_to":"{}"}}"#, first.env_id);
-        let reply = node.ingest(envelope_at(&writer, &list, &alice, "re first", now_ts(), &meta)).unwrap().unwrap();
+        let meta = format!(r#"{{"reply_to":"{}","room":"t"}}"#, first.env_id);
+        let reply = node.ingest(envelope_in(&writer, &list, &alice, "re first", now_ts(), &meta, "room:t", "t")).unwrap().unwrap();
         assert_eq!(reply.meta.as_deref(), Some(meta.as_str()));
         // What a build that could not parse these room fields left behind: plain mail, no meta.
         node.store.forget_room_fields(&reply.env_id).unwrap();
         assert_eq!(node.store.get(reply.id, &viewer).unwrap().unwrap().meta, None);
-        assert_eq!(node.reread_plain().unwrap(), 1, "the message with room fields, not the one without");
+        assert_eq!(node.reread_stored().unwrap(), (1, 0), "the room post with room fields, not the mail without");
         let row = node.store.get(reply.id, &viewer).unwrap().unwrap();
         assert_eq!(row.meta.as_deref(), Some(meta.as_str()));
-        assert_eq!(node.reread_plain().unwrap(), 0, "nothing left to read again");
+        assert_eq!(node.reread_stored().unwrap(), (0, 0), "nothing left to read again");
     }
 
     #[test]

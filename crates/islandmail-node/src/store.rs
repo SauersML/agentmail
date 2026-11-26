@@ -1005,11 +1005,13 @@ impl Store {
     }
 
     /// Content keys of an open room's membership events, oldest first: what a host trusted after they were sent
-    /// needs to know the room (its create event above all). Members-mode rows only, so nothing private is here.
+    /// needs to know the room (its create event above all). Members-mode rows only, so nothing private is here; the
+    /// key this node opened the row with, or one it holds from a grant (so a host that got them by grant passes them on).
     pub fn room_event_keys(&self, thread: &str) -> Result<Vec<(String, String)>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id, ck FROM messages WHERE thread = ? AND mode = 'members' AND kind = 'event' \
-                                 AND ck IS NOT NULL ORDER BY ts, env_id")?;
+        let mut st = db.prepare("SELECT env_id, COALESCE(ck, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1)) \
+                                 AS k FROM messages WHERE thread = ? AND mode = 'members' AND kind = 'event' \
+                                 AND text IS NOT NULL AND k IS NOT NULL ORDER BY ts, env_id")?;
         let rows = st.query_map([thread], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
@@ -1076,11 +1078,23 @@ impl Store {
         Ok(())
     }
 
-    /// Rows stored as plain mail with no room fields whose content key this node holds: `(env_id, envelope, ck)`.
-    /// A build that did not know one of a message's room fields (say a newer membership event) stored it this way.
+    /// Room traffic (to `room:…`, or in a DM room) stored as plain mail with no room fields, whose content key this
+    /// node holds: `(env_id, envelope, ck)`. A build that did not know one of a message's room fields (say a newer
+    /// membership event) stored it this way. Plain mail between agents is not read again, so a start stays cheap.
     pub fn plain_readable(&self) -> Result<Vec<(String, String, String)>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id, env, ck FROM messages WHERE kind = 'mail' AND meta IS NULL AND ck IS NOT NULL")?;
+        let mut st = db.prepare("SELECT env_id, env, ck FROM messages WHERE kind = 'mail' AND meta IS NULL AND ck IS NOT NULL \
+                                 AND (recipient LIKE 'room:%' OR thread LIKE 'dm:%')")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Members-mode key grants in a room (an open room's membership events), newest first: `(envelope, ck, thread)`.
+    /// Builds before these grants stored them unused.
+    pub fn open_room_grants(&self) -> Result<Vec<(String, String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT env, ck, thread FROM messages WHERE kind = 'grant' AND mode = 'members' \
+                                 AND ck IS NOT NULL AND thread IS NOT NULL ORDER BY id DESC")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }

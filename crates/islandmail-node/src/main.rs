@@ -172,7 +172,7 @@ async fn run(path: &Path) -> Result<()> {
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
-    if let Err(e) = node.reread_plain() {
+    if let Err(e) = node.reread_stored() {
         tracing::warn!("re-reading messages stored as plain mail: {e:#}");
     }
     node.certify_identities();

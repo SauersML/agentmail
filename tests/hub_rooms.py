@@ -131,12 +131,15 @@ def main():
         check("the hub starts again", nodes["hub"].start())
         got, t = wait_for(lambda: "after my removal" in texts("alice"), timeout=60)
         check("her post reaches the hub", got, "%.1fs" % t)
-        time.sleep(SYNC * 5)
+
+        def why():
+            with open(os.path.join(work, "north.log")) as f:
+                return [l for l in f.read()[before:].splitlines() if "refused envelope" in l and "s.carol" in l]
+        # After the hub's restart north may take a few sync rounds to be offered it.
+        got, t = wait_for(why, timeout=60)
+        time.sleep(SYNC * 3)
         check("north does not take it: carol's node is no longer vouched for there", "after my removal" not in texts("n.bob"))
-        with open(os.path.join(work, "north.log")) as f:
-            log = f.read()[before:]
-        why = [l for l in log.splitlines() if "refused envelope" in l and "s.carol" in l]
-        check("north says why, once", len(why) == 1, why[-2:])
+        check("north says why, once", len(why()) == 1, "%.1fs %s" % (t, why()[-2:]))
     finally:
         for n in nodes.values():
             n.stop()

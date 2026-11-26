@@ -214,6 +214,13 @@ you; plain room traffic wakes no one.
   message is sent again; the new member's nodes use the keys to open the envelopes they already hold. With
   `--history since-join` the grant carries only the membership events (who is in the room, its topic), never
   earlier messages. A node accepts a grant only for an envelope of the same room whose body the key opens.
+- **Open rooms reach hosts trusted later.** An open room's events are `members` mail, sealed to the hosts the
+  writer's node trusted when each was sent, so a host trusted after the room was made has no key for its create event
+  and, without it, no room. After every add and vouch in an open `creator/name` room, the client (or the node, for an
+  agent whose key it holds) posts one key grant in the room for the content keys of its membership events (create,
+  adds, removes, topic, vouches; never its posts). It reaches every host trusted now, so a host that joined late reads
+  the room's members from the start and can post at once; a host that was already stuck is repaired by the creator's
+  next add or `room vouch NAME`, with no rejoin. A grant sent before a host ran this build is applied when it starts.
 - **Message ids.** A message's id is the first 8 characters of its envelope hash in lowercase base32
   (`k3vq7d2a`), the same on every node. `get`, `reply`, `room send --reply-to` and `download MESSAGE[:N|:NAME]`
   take any unique prefix of it (or the full hash); an ambiguous prefix asks for more. Each node's local sequence
@@ -280,7 +287,8 @@ its creator *vouches* for its members.
 - **Refused envelopes** are skipped, not refetched: a node remembers each one (in memory) and fetches it again only
   after its trust changes: the trust file, a certificate or revocation, a held identity, or a room event such as a
   vouch. Each refused envelope is logged once. So a post that arrives before its room's vouch is taken as soon as
-  the vouch is in.
+  the vouch is in. An envelope from a trusted node with no key for this host is kept sealed (and forwarded); the first
+  one from each writing node is logged as "kept sealed: no key", until a key grant opens it.
 
 The client needs Python 3 and `cryptography` (`pip install -r clients/requirements.txt`). It talks to
 `http://127.0.0.1:8787` by default; set `ISLANDMAIL_URL` for another port (a remote API URL requires HTTPS),
@@ -661,5 +669,6 @@ python tests/notify.py --bin target/debug/islandmail-node --islandmail clients/i
 python tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/hub_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/late_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/privacy.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 ```

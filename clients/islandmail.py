@@ -919,10 +919,12 @@ def meta_json(meta):
     return json.dumps(meta, separators=(",", ":"), sort_keys=True)
 
 
-def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=False):
+def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=False, grant=None):
     # Post in a room: the node says where it goes (to, mode, exact keys) for this room and event; we sign that.
     text, room = norm_text(text), norm_field(room)
     meta = {"room": room}
+    if grant:
+        meta["grant"] = grant
     if mentions_in(text):
         meta["mentions"] = mentions_in(text)
     if reply_to:
@@ -978,10 +980,27 @@ def room_vouch(ident, room, quiet=True):
     if "/" not in room or _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
         return None
     entries = api(ident, "GET", "/api/room-vouch?" + urllib.parse.urlencode({"room": room}))["members"]
-    if not entries:
-        return None
-    text = "vouched for the nodes of " + ", ".join(e["name"] for e in entries)
-    return room_post(ident, room, text, event={"op": "vouch", "members": entries}, quiet=quiet)
+    m = None
+    if entries:
+        text = "vouched for the nodes of " + ", ".join(e["name"] for e in entries)
+        m = room_post(ident, room, text, event={"op": "vouch", "members": entries}, quiet=quiet)
+    if room_info(ident, room).get("kind") == "open":
+        grant_events(ident, room)
+    return m
+
+
+def grant_events(ident, room):
+    # An open CREATOR/NAME room: the content keys of its membership events, in one grant posted in the room (so it
+    # reaches every host our node trusts now). Each event was sealed to the hosts trusted when it was sent; a host
+    # trusted later has no slot for the create event, and no room, until it gets this. Posts are not granted.
+    try:
+        keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
+    except Fail:
+        return 0  # a node before these grants
+    for i in range(0, len(keys), 500):
+        chunk = keys[i:i + 500]
+        room_post(ident, room, "key grant: %d membership events of %s" % (len(chunk), room), grant=chunk, quiet=True)
+    return len(keys)
 
 
 def cmd_room_vouch(a):
@@ -1053,10 +1072,9 @@ def room_add(ident, room, names, grants=True):
             note = "; they can read its %d earlier messages" % n
         else:
             note = "; they see only messages from now on"
-    elif info["kind"] == "open" and "/" in room and grants:
-        # An open CREATOR/NAME room: its membership events were sealed to the hosts trusted when each was sent, so a
-        # host trusted later has no room until it gets their keys (the create event above all). Posts are not granted.
-        grant_history(ident, room, names)
+    elif info["kind"] == "open" and "/" in room and _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
+        # The creator's vouch sends these; another member's add sends them itself (see grant_events).
+        grant_events(ident, room)
     return note
 
 

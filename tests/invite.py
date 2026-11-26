@@ -328,9 +328,10 @@ def main():
         for n in ("dora", "dmitri"):
             got, t = wait_for(lambda: [r for r in js("d", "--as", n, "rooms") or [] if r.get("id") == "alice/plan"], timeout=120)
             check("A's node adds %s to alice/plan by itself" % n, bool(got), "%.1fs" % t)
-        got = [m for m in (js("d", "--as", "dmitri", "room", "read", "alice/plan") or {}).get("messages", [])
-               if m.get("text") == "before bob"]
-        check("dmitri reads the room's earlier post", bool(got))
+        # The history grants follow the add event, so the room can show up a moment before its earlier posts.
+        got, t = wait_for(lambda: [m for m in (js("d", "--as", "dmitri", "room", "read", "alice/plan") or {}).get("messages", [])
+                                   if m.get("text") == "before bob"], timeout=60)
+        check("dmitri reads the room's earlier post", bool(got), "%.1fs" % t)
         with open(os.path.join(adir, "config.log")) as f:
             check("A's node logs the add once", f.read().count("added dora, dmitri to alice/plan for alice") == 1)
         rc, out, err = cl("a", "rooms")

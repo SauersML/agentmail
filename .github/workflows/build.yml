@@ -80,6 +80,7 @@ jobs:
           "$py" tests/rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/rooms"
           "$py" tests/invite.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/invite"
           "$py" tests/hub_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/hub-rooms"
+          "$py" tests/late_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/late-rooms"
           "$py" tests/privacy.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/privacy"
       - name: Package
         run: |
