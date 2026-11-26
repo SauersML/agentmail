@@ -1091,25 +1091,39 @@ def first_run(config, inv, a):
                      % (key, folder, inv["network"], json.dumps(inv["relay"]), proc.pid, exe, config))
 
 
+def make_invite(ident, name, room=None, config=None, ttl=7 * 86400):
+    # A signed invite for NAME (and optionally a room of ident's) from this host's node: the line `join` takes.
+    # Needs the node's config and key file (default ~/.islandmail/node/config.json); Fail when they are not here.
+    global MAIL
+    saved = MAIL
+    try:
+        _, cfg, _, _ = node_config(config)
+        use_node(cfg)
+        room = room_id(ident, room) if room else ""
+        if room:
+            room_info(ident, room)
+        frm = ident["name"] if ident else ""
+        out = owner_step("invite", config, "%s|%s|%s|%d" % (name, room, frm, ttl),
+                         {"name": name, "room": room, "from": frm, "ttl_s": ttl})
+        return out["invite"]
+    except OSError as e:
+        raise Fail("cannot read this node's config or key (%s)" % e)
+    finally:
+        MAIL = saved
+
+
 def cmd_invite(a):
-    _, cfg, _, _ = node_config(a.config)
-    use_node(cfg)
     ident = None
     try:
         ident = load_identity(a.as_, create=False)
     except Fail:
         if a.room:
             raise
-    room = room_id(ident, a.room) if a.room else ""
-    if room:
-        room_info(ident, room)
-    frm = ident["name"] if ident else ""
-    out = owner_step("invite", a.config, "%s|%s|%s|%d" % (a.name, room, frm, a.ttl),
-                     {"name": a.name, "room": room, "from": frm, "ttl_s": a.ttl})
-    print(out["invite"])
-    sys.stderr.write("islandmail: invite for %s%s, valid until %s. They run: islandmail.py join INVITE; "
+    invite = make_invite(ident, a.name, a.room, a.config, a.ttl)
+    print(invite)
+    sys.stderr.write("islandmail: invite for %s%s, valid for %d s. They run: islandmail.py join INVITE; "
                      "you then run: islandmail.py accept REPLY with what join prints.\n"
-                     % (a.name, " (joins room %s)" % room if room else "", out["exp"]))
+                     % (a.name, " (joins room %s)" % a.room if a.room else "", a.ttl))
 
 
 def cmd_join(a):
