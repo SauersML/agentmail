@@ -214,6 +214,21 @@ async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
 pub struct Net {
     pub endpoint: Endpoint,
     pub router: Router,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Net {
+    /// Close the endpoint and stop every background task, so nothing here holds the node or its store afterwards.
+    pub async fn shutdown(self) -> Result<()> {
+        self.router.shutdown().await?;
+        for t in &self.tasks {
+            t.abort();
+        }
+        for t in self.tasks {
+            let _ = t.await;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -473,9 +488,12 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
     let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, relays, sender, gate };
 
+    // Background tasks; Net::shutdown stops them so none keeps the node (and its open store) alive.
+    let mut tasks = Vec::new();
+
     // Gossip delivers envelopes between periodic syncs.
     let c = ctx.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         while let Some(ev) = receiver.next().await {
             match ev {
                 Ok(Event::Received(msg)) => {
@@ -507,11 +525,11 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 }
             }
         }
-    });
+    }));
 
     // Gossip out: every envelope this node writes, and member lists it adopts.
     let c = ctx.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         while let Some(env) = outbound.recv().await {
             let Ok(bytes) = serde_json::to_vec(&env) else { continue };
             if bytes.len() > MAX_GOSSIP {
@@ -521,12 +539,12 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
             }
         }
-    });
+    }));
 
     // Certificates and revocations this node signs.
     let c = ctx.clone();
     let mut trust_out = node.trust_out.subscribe();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         loop {
             match trust_out.recv().await {
                 Ok(msg) => {
@@ -538,15 +556,15 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
-    });
+    }));
 
     // The local trust file, on its own timer: a slow or offline peer never delays a change (a removed agent or
     // node), and open sessions and connections are cut off as soon as it is adopted.
     let gate = ctx.gate.clone();
-    tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || { gate.close_removed(); }));
+    tasks.push(tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || { gate.close_removed(); })));
 
     let rotating = node.clone();
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let now = islandmail_core::now_millis();
@@ -557,13 +575,13 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 Err(e) => tracing::error!("rotating node encryption key: {e:#}"),
             }
         }
-    });
+    }));
 
     // Every sync_secs: anti-entropy with every member node, and re-join the topic so a restarted or new peer is
     // found again.
     let c = ctx.clone();
     let every = Duration::from_secs(cfg.sync_secs.max(1));
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         let mut blob_cursors = BTreeMap::<EndpointId, String>::new();
         loop {
             let peers = c.peers();
@@ -584,9 +602,9 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             let _ = c.sender.join_peers(peers).await;
             tokio::time::sleep(every).await;
         }
-    });
+    }));
 
-    Ok(Net { endpoint, router })
+    Ok(Net { endpoint, router, tasks })
 }
 
 #[cfg(test)]
@@ -685,7 +703,21 @@ mod tests {
         }).await?;
         assert!(attempt.is_err(), "an unpinned node got a sync response through the relay");
         outsider.close().await;
-        for (_, net) in hosts { net.router.shutdown().await?; }
+        drop(peer);
+        // Windows cannot delete open files: release every node (and its store) before removing the directory.
+        for (node, net) in hosts {
+            net.shutdown().await?;
+            let node = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut node = node;
+                loop {
+                    match Arc::try_unwrap(node) {
+                        Ok(node) => break node,
+                        Err(still) => { node = still; tokio::time::sleep(Duration::from_millis(50)).await; }
+                    }
+                }
+            }).await.context("a background task still holds the node after shutdown")?;
+            drop(node);
+        }
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

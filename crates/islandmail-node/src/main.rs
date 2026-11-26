@@ -149,7 +149,7 @@ async fn run(path: &Path) -> Result<()> {
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
     node.certify_identities();
-    let _net = net::start(&cfg, node.clone(), out_rx).await?;
+    let net = net::start(&cfg, node.clone(), out_rx).await?;
 
     let state = api::AppState {
         node: node.clone(),
@@ -163,5 +163,5 @@ async fn run(path: &Path) -> Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
-    Ok(())
+    net.shutdown().await
 }
