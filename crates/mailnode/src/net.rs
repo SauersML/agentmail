@@ -271,7 +271,7 @@ impl Ctx {
     }
 
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
-    async fn sync_with(&self, peer: EndpointId) -> Result<usize> {
+    async fn sync_with(&self, peer: EndpointId, blob_after: &mut String) -> Result<usize> {
         let node = &self.node;
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
         let network = node.members.read().unwrap().network.clone();
@@ -330,8 +330,13 @@ impl Ctx {
             }
         }
         // Attachments: blobs our envelopes name that we lack. The id is the hash, so any peer can supply a copy.
-        for id in node.store.missing_blobs()? {
-            if let Some(b64) = call(&conn, &network, &Req::Blob { id: id.clone() }).await?.blob {
+        loop {
+            let pending = node.store.missing_blobs(blob_after, IDS_PER_GET)?;
+            let last_page = pending.len() < IDS_PER_GET;
+            for id in pending {
+                // Remember the attempt even if this connection times out. Retry misses after wrapping around.
+                blob_after.clone_from(&id);
+                let Some(b64) = call(&conn, &network, &Req::Blob { id: id.clone() }).await?.blob else { continue };
                 match mailcore::b64u_decode(&b64) {
                     Some(data) if (40..=crate::node::MAX_FILE + 40).contains(&data.len()) && blake3::hash(&data).to_hex().as_str() == id => {
                         node.store.put_blob(&id, &data, mailcore::now_millis())?;
@@ -339,6 +344,10 @@ impl Ctx {
                     }
                     _ => tracing::warn!("blob {} from {} does not match its id", &id[..12], peer.fmt_short()),
                 }
+            }
+            if last_page {
+                blob_after.clear();
+                break;
             }
         }
         conn.close(0u32.into(), b"done");
@@ -522,19 +531,23 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let c = ctx.clone();
     let every = Duration::from_secs(cfg.sync_secs.max(1));
     tokio::spawn(async move {
+        let mut blob_cursors = BTreeMap::<EndpointId, String>::new();
         loop {
             let peers = c.peers();
-            futures::stream::iter(peers.iter().copied()).for_each_concurrent(4, |peer| {
+            let pulls = peers.iter().copied().map(|peer| {
                 let c = &c;
+                let mut after = blob_cursors.remove(&peer).unwrap_or_default();
                 async move {
-                    match tokio::time::timeout(Duration::from_secs(120), c.sync_with(peer)).await {
-                    Ok(Ok(k)) if k > 0 => tracing::info!("periodic sync with {}: {k} new", peer.fmt_short()),
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::debug!("periodic sync with {} failed: {e:#}", peer.fmt_short()),
-                    Err(_) => tracing::debug!("periodic sync with {} timed out", peer.fmt_short()),
+                    match tokio::time::timeout(Duration::from_secs(120), c.sync_with(peer, &mut after)).await {
+                        Ok(Ok(k)) if k > 0 => tracing::info!("periodic sync with {}: {k} new", peer.fmt_short()),
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) => tracing::debug!("periodic sync with {} failed: {e:#}", peer.fmt_short()),
+                        Err(_) => tracing::debug!("periodic sync with {} timed out", peer.fmt_short()),
                     }
+                    (peer, after)
                 }
-            }).await;
+            });
+            blob_cursors = futures::stream::iter(pulls).buffer_unordered(4).collect().await;
             let _ = c.sender.join_peers(peers).await;
             tokio::time::sleep(every).await;
         }

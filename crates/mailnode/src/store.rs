@@ -219,6 +219,20 @@ impl Store {
         anyhow::ensure!(!old_store, "existing database predates local trust; use a new data directory");
         let tx = db.transaction()?;
         tx.execute_batch(SCHEMA)?;
+        if !tx.prepare("SELECT 1 FROM sqlite_schema WHERE name='pending_blobs'")?.exists([])? {
+            tx.execute_batch("
+                CREATE TABLE pending_blobs (id TEXT PRIMARY KEY) WITHOUT ROWID;
+                INSERT OR IGNORE INTO pending_blobs SELECT b.value FROM messages m, json_each(m.blobs) b
+                    WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=b.value);
+                CREATE TRIGGER queue_missing_blobs AFTER INSERT ON messages WHEN NEW.blobs != '[]' BEGIN
+                    INSERT OR IGNORE INTO pending_blobs SELECT value FROM json_each(NEW.blobs)
+                        WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=value);
+                END;
+                CREATE TRIGGER finish_blob AFTER INSERT ON blobs BEGIN
+                    DELETE FROM pending_blobs WHERE id=NEW.id;
+                END;
+            ")?;
+        }
         tx.commit()?;
         use rusqlite::functions::FunctionFlags;
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
@@ -685,11 +699,10 @@ impl Store {
     }
 
     /// Blob ids some stored envelope references that this node does not hold yet.
-    pub fn missing_blobs(&self) -> Result<Vec<String>> {
+    pub fn missing_blobs(&self, after: &str, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT DISTINCT b.value FROM messages m, json_each(m.blobs) b
-            WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=b.value) ORDER BY b.value")?;
-        let rows = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = db.prepare("SELECT id FROM pending_blobs WHERE id > ? ORDER BY id LIMIT ?")?;
+        let rows = st.query_map(params![after, i64::try_from(limit)?], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
@@ -743,6 +756,35 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_attachments_survive_upgrade_and_page_past_missing_files() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("mail-blobs-{}", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("mail.sqlite");
+        let row = "INSERT INTO messages(env_id,day,ts,sender,sender_sub,recipient,thread,mode,parents,env,received,blobs)
+                   VALUES (?,'','','','','','','members','[]','{}',0,?)";
+        let old = Connection::open(&path)?;
+        old.execute_batch(SCHEMA)?;
+        old.execute("INSERT INTO blobs VALUES ('b',x'00',1,0)", [])?;
+        old.execute(row, ["one", r#"["c","a","b","a"]"#])?;
+        drop(old);
+
+        let store = Store::open(&path)?;
+        assert_eq!(store.missing_blobs("", 1)?, ["a"]);
+        assert_eq!(store.missing_blobs("a", 10)?, ["c"]);
+        store.db.lock().unwrap().execute(row, ["two", r#"["b","c","d"]"#])?;
+        assert_eq!(store.missing_blobs("", 10)?, ["a", "c", "d"]);
+        store.put_blob("c", b"c", 0)?;
+        drop(store);
+        let reopened = Store::open(&path)?;
+        assert_eq!(reopened.missing_blobs("a", 1)?, ["d"]);
+        assert!(reopened.missing_blobs("d", 1)?.is_empty());
+        assert_eq!(reopened.missing_blobs("", 1)?, ["a"]);
+        drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn bounded_trust_snapshots_report_truncation_and_cover_each_issuer() -> Result<()> {
