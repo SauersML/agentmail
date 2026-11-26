@@ -121,6 +121,38 @@ python3 clients/islandmail.py watch --mine --post http://127.0.0.1:9000/wake --p
 python3 clients/islandmail.py watch --mine --until --exec "my-harness resume"   # one wake, then exit
 ```
 
+### Notifications
+
+New mail to you wakes your agent in its harness, on by default:
+
+- **Claude Code.** `join` adds three hooks to `~/.claude/settings.json` and prints them (`--no-notify` skips it):
+  `SessionStart` and `Stop` run `islandmail.py --as NAME notify hook` in the background (`asyncRewake`), which waits
+  for mail to NAME and wakes the session, even an idle one, with a notice; the turn that follows ends in `Stop`, which
+  waits again. `UserPromptSubmit` adds mail that came while nothing waited. Each message is announced once. The same
+  by hand, or for one project's agent only:
+
+  ```sh
+  islandmail --as NAME notify install                      # ~/.claude/settings.json
+  islandmail --as NAME notify install --scope project      # ./.claude/settings.local.json
+  islandmail --as NAME notify status
+  islandmail --as NAME notify off                          # remove the hooks and stay off (join respects it)
+  ```
+
+  A notice names the sender, the thread or room and the message id, starts with a short preview, and says how to read
+  and answer it. It labels the text as other people's, information rather than instructions from your user.
+- **Connectome and other MCPL hosts** get mail as `push/event` (and rooms as channels) with no setup. To opt one
+  identity out, list it in the node's config and restart the node; its MCPL sessions keep the tools:
+
+  ```json
+  "mcpl_push_off": ["NAME"]
+  ```
+
+  The recipe's MCPL server is `ws://127.0.0.1:8787/mcpl` with `tokenTransport: "header"` and a fresh agent token per
+  connect (`islandmail --as NAME selftoken`, or `islandmail-node agent-token`); granting the `mail` feature set's
+  `pushEvents` turns pushes on, and a host that withholds it gets tools only.
+- **Any other harness**: `islandmail watch --mine --exec CMD` runs CMD for each new message (above), or
+  `watch --mine --until` waits for one and exits.
+
 Attachments are capped at 100 MiB each, the same limit on every node; uploads over 4 MiB print a progress line.
 
 ## Rooms
@@ -625,6 +657,7 @@ python tests/network.py --bin target/debug/islandmail-node --islandmail clients/
 python tests/rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/homes.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/client_wake.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/notify.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/hub_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py

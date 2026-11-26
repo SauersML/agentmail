@@ -99,7 +99,8 @@ def main():
         api = a_api if host == "a" else fresh[host][2]
         # RUST_BACKTRACE as many agent sandboxes set it: refusals must still say why (issue #22).
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, host, "client"), ISLANDMAIL_URL="http://127.0.0.1:%d" % api,
-                   RUST_BACKTRACE="1")
+                   RUST_BACKTRACE="1", CLAUDE_CONFIG_DIR=os.path.join(work, host, "claude"))
+        env.pop("CLAUDECODE", None)
         env.pop("ISLANDMAIL_AS", None)
         env.pop("ISLANDMAIL_NODE_KEY", None)
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
@@ -112,10 +113,10 @@ def main():
         except ValueError:
             return None
 
-    def join(host, invite, wait=60):
+    def join(host, invite, wait=60, *extra):
         cfg, udp, api = fresh[host]
         return cl(host, "join", invite, "--config", cfg, "--bin", bin_, "--api", "127.0.0.1:%d" % api,
-                  "--listen", "127.0.0.1:%d" % udp, "--wait", str(wait))
+                  "--listen", "127.0.0.1:%d" % udp, "--wait", str(wait), *extra)
 
     def trust_of(host):
         with open(os.path.join(work, host, "node", "members.json")) as f:
@@ -161,7 +162,16 @@ def main():
         check("and sets nothing up", not os.path.exists(fresh["b"][0]))
 
         # One command on B: node set up and started, presented to A, A trusts it for bob. No reply, no accept.
+        os.makedirs(os.path.join(work, "b", "claude"))  # B has Claude Code: join turns notifications on
         rc, out, err = join("b", inv)
+        try:
+            with open(os.path.join(work, "b", "claude", "settings.json")) as f:
+                b_hooks = json.load(f).get("hooks", {})
+        except (OSError, ValueError):
+            b_hooks = {}
+        check("join sets up Claude Code notifications for bob by default, and says so",
+              all(any("--as bob notify hook" in h["command"] for g in b_hooks.get(e, []) for h in g["hooks"])
+                  for e in ("SessionStart", "Stop", "UserPromptSubmit")) and "notifications on for bob" in err, err[-300:])
         check("join on a host with no node, no reply step", rc == 0 and out.startswith("joined as bob")
               and "alice/plan" in out and "imr1" not in out, (out + err)[-400:])
         check("join started B's node", pid("b") is not None)
@@ -283,8 +293,11 @@ def main():
         rc, out, err = join("e", kinv)
         check("nor a fresh host with no key", rc != 0 and "another node key" in err and not os.path.exists(fresh["e"][0]),
               err[-200:])
-        rc, out, err = join("d", kinv)
+        os.makedirs(os.path.join(work, "d", "claude"))
+        rc, out, err = join("d", kinv, 60, "--no-notify")
         check("the bound host joins as dora and dmitri", rc == 0 and out.startswith("joined as dora, dmitri"), (out + err)[-300:])
+        check("join --no-notify leaves Claude Code alone", not os.path.exists(os.path.join(work, "d", "claude", "settings.json"))
+              and "notifications" not in err, err[-300:])
         d_ent = [n for n in a_trust_now()["nodes"] if n["key"] == d_key]
         check("A trusts D's node for exactly dora and dmitri", d_ent and d_ent[0]["names"] == ["dora", "dmitri"],
               json.dumps(d_ent))
