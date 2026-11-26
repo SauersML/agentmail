@@ -262,9 +262,13 @@ def write_private(path, data, *, create=False, create_dirs=True):
             os.unlink(tmp)
 
 
+HOME_NAME = r"[A-Za-z0-9._-]{1,48}@[a-z0-9.-]{1,64}"
+
+
 def safe_name(name):
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
-        raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens")
+    # A local name, or a home name (name@home-suffix) vouched for by an identity home's aid1 token.
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name) and not re.fullmatch(HOME_NAME, name):
+        raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens (optionally @home-suffix)")
     return name
 
 
@@ -305,16 +309,17 @@ def load_identity(name, create=True):
     return ident
 
 
-def new_identity(name, sub=None):
+def new_identity(name, sub=None, path=None):
     name = safe_name(name)
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
+    local = name.split("@")[0]
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", local) or local.endswith(".") or local.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
     sub = sub or "agent:%s" % name
     if not re.fullmatch(r"[!-~]{1,120}", sub):
         raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     seed = os.urandom(32)
     ident = {"name": name, "sub": sub, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
-    write_private(ident_path(name), json.dumps(ident, indent=1), create=True)
+    write_private(path or ident_path(name), json.dumps(ident, indent=1), create=True)
     return ident
 
 
@@ -345,13 +350,59 @@ def certify(ident):
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
 
+# ---- homes: enroll a home name with a key-bound aid1 token from that home ----
+
+
+def pending_path(name):
+    return os.path.join(DIR, "pending", safe_name(name) + ".json")
+
+
+def aid1_payload(token):
+    # Read (not verify: the node does) the token's payload for its iss, aud and cnf.
+    parts = token.split(".")
+    if len(parts) != 3 or parts[0] != "aid1":
+        raise Fail("not an aid1 token")
+    try:
+        return json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except ValueError as e:
+        raise Fail("aid1 payload is not JSON") from e
+
+
+def enroll(ident, token, old=None):
+    # Proof of key for this node, plus a proof of possession of the token (archipelago-present|v1); with `old`, the
+    # old identity's signature handing the name to this key.
+    payload = aid1_payload(token)
+    node, ts = node_key(), canon_ts()
+    seed = bytes.fromhex(ident["seed"])
+    kid = "ed25519:" + b64u(ed25519_public(seed))
+    jti = b64u(os.urandom(16))
+    statement = "agent-mail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, node, ts)
+    present = "archipelago-present|v1|%s|%s|%s|%s|%s" % (
+        payload.get("iss"), payload.get("aud"), ts, jti, b64u(hashlib.sha256(token.encode()).digest()))
+    body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode())),
+            "aid1": token, "jti": jti, "pop": b64u(ed25519_sign(seed, present.encode()))}
+    if old:
+        rekey = "agent-mail-rekey|v1|%s|%s|%s" % (ident["name"].lower(), old["id"], kid)
+        body["rekey"] = {"key": old["id"], "sig": b64u(ed25519_sign(bytes.fromhex(old["seed"]), rekey.encode()))}
+    return http("POST", MAIL + "/api/agents", body)["cert"]
+
+
+def read_token(arg):
+    if arg == "-":
+        return sys.stdin.read().strip()
+    if arg.startswith("aid1."):
+        return arg.strip()
+    with open(arg, encoding="utf-8") as f:
+        return f.read().strip()
+
+
 # Windows has neither flag; there the access list check below does the work of mode 600.
 _IDENT_OPEN = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 
 
-def _read_identity(name):
+def _read_identity(name, path=None):
     try:
-        fd = os.open(ident_path(name), _IDENT_OPEN)
+        fd = os.open(path or ident_path(name), _IDENT_OPEN)
         with os.fdopen(fd) as f:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise Fail("identity must be a regular file")
@@ -570,6 +621,38 @@ def cmd_newkey(a):
     ident = new_identity(a.name, a.sub)
     sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(a.name))
     print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
+
+
+def cmd_enroll(a):
+    name = a.as_ or os.environ.get("ISLANDMAIL_AS")
+    if not name or "@" not in name:
+        raise Fail("enroll needs --as NAME@HOME-SUFFIX (make its key first with: newkey NAME@HOME-SUFFIX)")
+    ident = load_identity(name, create=False)
+    token = read_token(a.token)
+    cnf = aid1_payload(token).get("cnf")
+    if cnf == ident["id"]:
+        enroll(ident, token)
+        print("enrolled %s with key %s" % (name, ident["id"]))
+        return
+    if os.path.exists(pending_path(name)):
+        nxt = _read_identity(name, pending_path(name))
+        if cnf == nxt["id"]:
+            enroll(nxt, token, old=ident)
+            os.replace(pending_path(name), ident_path(name))
+            print("enrolled %s with its new key %s (handed over by %s)" % (name, nxt["id"], ident["id"]))
+            return
+    raise Fail("the token is bound to %s, which is neither this identity's key nor its pending new key (rekey)" % cnf)
+
+
+def cmd_rekey(a):
+    name = a.as_ or os.environ.get("ISLANDMAIL_AS")
+    ident = load_identity(name, create=False)
+    if "@" not in ident["name"]:
+        raise Fail("rekey is for home names (name@home-suffix)")
+    nxt = new_identity(ident["name"], ident["sub"], path=pending_path(ident["name"]))
+    sys.stderr.write("new key saved in %s; have your home issue a token for it, then run enroll with that token\n"
+                     % pending_path(ident["name"]))
+    print(nxt["id"])
 
 
 def cmd_selftoken(a):
@@ -1272,6 +1355,10 @@ def main():
     p.add_argument("--node-key", help="the node's key (default: ISLANDMAIL_NODE_KEY, or ask the node)")
     p.set_defaults(fn=cmd_selftoken)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
+    p = sub.add_parser("enroll", help="have the node certify NAME@HOME with a key-bound aid1 token from that home")
+    p.add_argument("token", help="the aid1 token, a file holding it, or - for stdin")
+    p.set_defaults(fn=cmd_enroll)
+    sub.add_parser("rekey", help="make a new key for a home name; enroll it with a token bound to it").set_defaults(fn=cmd_rekey)
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)
     p.add_argument("--thread", help="default general; --private to one agent with no thread: your DM room")

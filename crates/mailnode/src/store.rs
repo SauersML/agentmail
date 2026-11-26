@@ -313,7 +313,12 @@ impl Store {
         use rusqlite::functions::FunctionFlags;
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |c| Ok(mailcore::addr::addressed_to(c.get_raw(0).as_str()?, &[c.get_raw(1).as_str()?])))?;
+        crate::homes::init(&db)?;
         Ok(Store { db: Mutex::new(db), _exclusive: exclusive })
+    }
+
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.db.lock().unwrap()
     }
 
     /// A data directory belongs to one node and network. Keep the last accepted local revision across restarts.
@@ -1106,7 +1111,7 @@ mod tests {
         let key = mailcore::keys::Seed::generate().public();
         let mut list = mailcore::MemberList { v: 2, network: mailcore::b64u(&mailcore::random_bytes::<32>()),
             seq: 1, members: vec![], nodes: vec![mailcore::NodeEntry { name: "me".into(),
-                    key: mailcore::keys::fmt_key(&key), addrs: vec![], names: vec![] }] };
+                    key: mailcore::keys::fmt_key(&key), addrs: vec![], names: vec![] }], homes: vec![] };
         let path = std::env::temp_dir().join(format!("mailnode-store-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let store = Store::open(&path).unwrap();
         assert!(Store::open(&path).is_err(), "a second live node must not share the same store");

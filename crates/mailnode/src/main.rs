@@ -10,6 +10,7 @@
 mod api;
 mod config;
 mod encryption_keys;
+mod homes;
 mod mcpl;
 mod net;
 mod node;

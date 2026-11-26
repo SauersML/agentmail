@@ -629,6 +629,7 @@ mod tests {
             nodes: keys.iter().enumerate().map(|(i, key)| NodeEntry {
                 name: format!("n{i}"), key: fmt_key(&key.public()), addrs: vec![], names: vec![format!("a{i}")]
             }).collect(),
+            homes: vec![],
         };
         std::fs::write(&file, serde_json::to_vec(&list)?)?;
         let mut cfg: Config = serde_json::from_value(serde_json::json!({
@@ -694,6 +695,7 @@ mod tests {
             seq: 1,
             members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
+            homes: vec![],
         };
         let path = std::env::temp_dir().join(format!("mailnode-net-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
         let (tx, _rx) = mpsc::channel(32);
@@ -753,6 +755,7 @@ mod tests {
                 vec![mailcore::Member { name: "a.alice".into(), sub: "agent:a.alice".into(), key: fmt_key(&alice.public()) }]
             } else { vec![] },
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
+            homes: vec![],
         };
         std::fs::write(&file, serde_json::to_vec(&list(1, true)).unwrap()).unwrap();
         let cfg: Config = serde_json::from_value(serde_json::json!({

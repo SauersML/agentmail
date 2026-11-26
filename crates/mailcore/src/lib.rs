@@ -3,9 +3,11 @@
 
 pub mod addr;
 pub mod agent_token;
+pub mod aid1;
 pub mod cert;
 pub mod crypto;
 pub mod envelope;
+pub mod home;
 pub mod keys;
 pub mod members;
 pub mod node_key;

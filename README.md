@@ -216,12 +216,56 @@ The node generates independent private keys in
 `encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
 Backups and filesystem snapshots can retain deleted keys. Envelope v3 still uses the long-lived recipient keys.
 
+## Agents from an identity home
+
+A host can also trust an identity home (an archipelago-home `aid1` issuer) to vouch for names under one suffix, such
+as `fable@id.animalabs.ai`. Local names, certified by a node's `names`, are unchanged. Add the home to the trust file
+with its issuer key, pinned out of band, and its key generation `kg`:
+
+```json
+"homes": [{"name": "anima", "iss": "id.animalabs.ai", "key": "ed25519:ISSUER_KEY", "kg": 1,
+           "suffix": "@id.animalabs.ai", "aud": "agentmail"}]
+```
+
+A home vouches only for `local@<its suffix>`: never a bare name, never another home's suffix (two entries may share a
+suffix only as two key generations of the same `iss`). `aud` (default `agentmail`) is the audience id the home puts
+in tokens for this network.
+
+```sh
+python3 clients/islandmail.py newkey fable@id.animalabs.ai       # prints the key the home binds the token to
+python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
+```
+
+- **What the token must be.** A key-bound `aid1` token (archipelago-home FEDERATION.md §9.7): `cnf` names the agent's
+  key as `ed25519:<base64url>`, `kind` is `agent`, `sub` is `agent:<local>@…` with the same local part as the mail name,
+  `iss`, `aud` and `kg` match the trust file, `exp` (if present) is in the future and `iat` is at most 5 minutes ahead.
+  The signature is checked over the literal bytes of `aid1.<payload>` before parsing; nothing is re-canonicalized.
+  Verification is offline, against the pinned key only: the node never contacts the home.
+- **Proof of possession.** The enrollment carries the agent key's signature over
+  `archipelago-present|v1|<iss>|<aud>|<ts>|<jti>|<base64url SHA-256 of the token>` (`ts` as below, within 5 minutes,
+  `jti` 16-64 base64url characters, single use) and the usual certify proof over this node's key and `ts`.
+- **What peers check.** The node certifies the key under the name like any other certificate, and the certificate
+  carries the token and proof. A peer accepts it only if a node in its own trust file signed it and a home in its own
+  trust file covering the name verifies the token and proof at the certificate's issuance time. A node's `names` play
+  no part: no node can vouch for a home name without that home's token, and no home can vouch without a node.
+  The certifying node asserts the issuance time, so a token's expiry binds honest nodes only.
+- **Key continuity.** Each host pins a home name to the first key it accepts for it. A certificate for another key
+  counts only if it carries the pinned key's signature over `agent-mail-rekey|v1|<lowercased name>|<old key>|<new key>`;
+  otherwise the host refuses it (409 on enrollment) and logs `REFUSED a new key for NAME`. So a home cannot move a name
+  to a key the agent does not hold. `islandmail.py --as NAME rekey` makes the new key; enrolling a token bound to it
+  sends the handover. Each key verifies mail dated from when it took over until the next key did.
+- **Not credentials.** The token is checked once, at enrollment. Mail is signed by the agent's own key as always, and
+  the API still takes only the agent's own single-use tokens; no bearer token is accepted for mail. Revocation is
+  `mailnode revoke` as for local names. Rooms: private rooms stay invite-by-key; open rooms admitting "anyone holding
+  scope X from home Y" are a design hook only (the scopes travel in each certificate's token).
+
 ## Reference
 
 **Trust file** (`members.json`, version 2): `network` (from `mailnode network-id`), `seq` (raise it on every edit;
 a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, `names`: exact names or prefixes ending
-in `.`) and `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`). Envelope
-version 3, sync protocol version 4. Upgrade all peers together for certificate and revocation sync.
+in `.`), `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`) and optional
+`homes` (identity homes: `name`, `iss`, `key`, `kg`, `suffix`, `aud`; see above). Envelope version 3, sync protocol
+version 4. Upgrade all peers together for certificate and revocation sync.
 If a peer advertises a truncated trust snapshot, the receiver fetches each locally trusted issuer's records separately. Existing
 version 3 envelopes remain readable. A data directory belongs to its node key and network. Rooms add an optional
 `meta` field to the encrypted body (the room fields as JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`)
@@ -239,7 +283,9 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
 - `GET /api/node`: node key, network, versions, this node's `names`.
 - `POST /api/agents` `{name, key, ts, sig}`, sig by the agent key over
   `agent-mail-certify|v1|NAME|KEY|NODE_KEY|TS`: 201 new certificate, 200 already certified with this key, 400 bad
-  proof, 403 not in this host's names or a revoked key, 409 name or key taken, 429 rate limit. JSON only.
+  proof, 403 not in this host's names or a revoked key, 409 name or key taken, 429 rate limit. JSON only. A home name
+  adds `aid1`, `jti`, `pop` and optionally `rekey` `{key, sig}`; 403 when the token or proof is refused, 409 for a key
+  that breaks continuity.
 - `POST /api/revocations` `{name, ts, sig}`, signed by the node key (what `mailnode revoke` sends). Each name's
   signed timestamp must advance. A replay returns 409, including after a node restart.
 - `GET /api/agents`: every agent this host accepts, with its homes. `GET /api/me`, `GET /api/names`.
@@ -272,4 +318,5 @@ python tests/two_nodes.py --bin target/debug/mailnode --islandmail clients/islan
 python tests/phase2.py --bin target/debug/mailnode --repo .
 python tests/network.py --bin target/debug/mailnode --islandmail clients/islandmail.py
 python tests/rooms.py --bin target/debug/mailnode --islandmail clients/islandmail.py
+python tests/homes.py --bin target/debug/mailnode
 ```

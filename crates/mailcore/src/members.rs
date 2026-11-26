@@ -86,6 +86,9 @@ pub struct MemberList {
     pub seq: u64,
     pub members: Vec<Member>,
     pub nodes: Vec<NodeEntry>,
+    /// Identity homes trusted to vouch for names under their suffix (see `home`). Any listed node may certify them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub homes: Vec<crate::home::HomeEntry>,
 }
 
 impl MemberList {
@@ -122,6 +125,15 @@ impl MemberList {
                         "node {:?}: names entry {e:?} must be an agent name or a prefix ending in '.'", n.name);
             }
         }
+        ensure!(self.homes.len() <= MAX_NAMES, "at most {MAX_NAMES} homes");
+        for (i, h) in self.homes.iter().enumerate() {
+            h.validate()?;
+            // One suffix, one home; the same home may list a second key generation while it rotates.
+            for o in &self.homes[..i] {
+                ensure!(o.suffix != h.suffix || (o.iss == h.iss && o.kg != h.kg && o.aud == h.aud),
+                        "homes {:?} and {:?} share suffix {}", o.name, h.name, h.suffix);
+            }
+        }
         Ok(())
     }
 
@@ -143,9 +155,12 @@ impl MemberList {
     }
 
     /// Whether this host trusts `c`: well formed, signed by a node on this list whose namespace covers its name.
+    /// A home name instead needs any node on this list and a home proof one of this list's homes accepts.
     pub fn accepts(&self, c: &Cert) -> bool {
-        self.nodes.iter().any(|n| n.key == c.node && n.covers(&c.name))
+        let home = crate::home::is_home_name(&c.name);
+        self.nodes.iter().any(|n| n.key == c.node && (home || n.covers(&c.name)))
             && c.agent_key().is_ok_and(|k| self.permits_agent_key(&c.name, &k)) && c.check().is_ok()
+            && crate::home::check_cert(&self.homes, c).is_ok()
     }
 
     /// Every agent this host accepts at `at_ms`. `revoked_at(cert)` is when the cert's own node revoked its key, if
@@ -226,6 +241,7 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
+            homes: vec![],
         };
         l.validate().unwrap();
         l
