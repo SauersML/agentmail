@@ -1117,9 +1117,11 @@ def first_run(config, inv, a):
     port, addrs = 0, []
     if a.listen:
         port, addrs = int(a.listen.rsplit(":", 1)[1]), [a.listen]
+    # The network's relays go in the trust file; iroh's public relays (n0) only if the inviter opted in to them.
     trust = {"v": 1, "network": inv["network"], "seq": 1, "members": [],
+             "relays": [r for r in inv["relay"] if r != "n0"],
              "nodes": [{"name": inv["names"][0], "key": key, "addrs": addrs, "names": inv["names"]}]}
-    cfg = {"data_dir": "data", "api_listen": a.api, "iroh_port": port, "relay": inv["relay"],
+    cfg = {"data_dir": "data", "api_listen": a.api, "iroh_port": port, "relay": ["n0"] if "n0" in inv["relay"] else [],
            "node_key_file": "node.seed", "members_file": "members.json"}
     for name, obj in (("members.json", trust), ("config.json", cfg)):
         with open(os.path.join(folder, name), "x", encoding="utf-8") as f:
@@ -1206,10 +1208,9 @@ def cmd_join(a):
              % (n["name"], n["key"], ", ".join(n["names"]) or "none", out["seq"])]
     if out["added_name"]:
         notes.append("this node may now certify %s" % ", ".join(out["names"]))
-    if out["relay"]["invite"] != out["relay"]["node"]:
-        notes.append("relay: the inviter uses %s and this node %s; to match, set \"relay\": %s in %s and restart the node"
-                     % (json.dumps(out["relay"]["invite"]), json.dumps(out["relay"]["node"]),
-                        json.dumps(out["relay"]["invite"]), config))
+    if "n0" in out["relay"]["invite"] and "n0" not in out["relay"]["node"]:
+        notes.append("relay: the inviter also uses iroh's public relays; if this host cannot reach it directly, add "
+                     "\"relay\": [\"n0\"] to %s and restart the node" % config)
     # Each invited name gets its key now, so the inviter's node learns them as soon as the nodes sync.
     idents = []
     for name in out["names"]:

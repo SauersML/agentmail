@@ -89,6 +89,20 @@ pub struct MemberList {
     /// Identity homes trusted to vouch for names under their suffix (see `home`). Any listed node may certify them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub homes: Vec<crate::home::HomeEntry>,
+    /// The network's own relays: iroh relay origins (`https://relay.example.org`) every node uses and every invite
+    /// carries. iroh's public relays (`n0`) are not listed here; a node opts in to them in its config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+}
+
+pub const MAX_RELAYS: usize = 8;
+
+/// An iroh relay origin: http(s)://host[:port] with no credentials, path, query or fragment.
+pub fn valid_relay_url(u: &str) -> bool {
+    let Some(rest) = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) else { return false };
+    let host = rest.strip_suffix('/').unwrap_or(rest);
+    u.len() <= 200 && !host.is_empty()
+        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"-.:[]".contains(&b))
 }
 
 impl MemberList {
@@ -124,6 +138,12 @@ impl MemberList {
                 ensure!(cert::valid_namespace_entry(e),
                         "node {:?}: names entry {e:?} must be an agent name or a prefix ending in '.'", n.name);
             }
+        }
+        ensure!(self.relays.len() <= MAX_RELAYS, "at most {MAX_RELAYS} relays");
+        for (i, r) in self.relays.iter().enumerate() {
+            ensure!(valid_relay_url(r) && !self.relays[..i].contains(r),
+                    "relays entry {r:?} must be a distinct relay origin such as https://relay.example.org (n0 belongs in \
+                     a node's config.json \"relay\")");
         }
         ensure!(self.homes.len() <= MAX_NAMES, "at most {MAX_NAMES} homes");
         for (i, h) in self.homes.iter().enumerate() {
@@ -241,10 +261,26 @@ pub(crate) mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("node{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
         l.validate().unwrap();
         l
+    }
+
+    #[test]
+    fn relays_are_distinct_relay_origins_and_never_n0() {
+        let mut l = list(&[], &[&Seed::generate()]);
+        l.relays = vec!["https://relay.example.org".into(), "http://192.0.2.7:3340".into(), "https://[2001:db8::1]:443/".into()];
+        l.validate().unwrap();
+        for bad in ["n0", "relay.example.org", "https://", "https://u:p@relay.example.org", "https://relay.example.org/x",
+                    "https://relay.example.org?t=1", "ftp://relay.example.org"] {
+            l.relays = vec![bad.into()];
+            assert!(l.validate().is_err(), "{bad}");
+        }
+        l.relays = vec!["https://relay.example.org".into(); 2];
+        assert!(l.validate().is_err());
+        l.relays = (0..=MAX_RELAYS).map(|i| format!("https://r{i}.example.org")).collect();
+        assert!(l.validate().is_err());
     }
 
     #[test]

@@ -2,7 +2,8 @@
 
 Encrypted mail between agents, replicated between hosts over authenticated QUIC. Each host runs a node with
 a loopback HTTP, SSE and MCPL API. Each host chooses its trusted peers and agent namespaces locally.
-Nodes dial peers directly by default. Hosts behind NAT or firewalls can opt in to a shared QUIC relay.
+Nodes dial peers directly by default. Hosts behind NAT or firewalls reach each other through the network's own QUIC
+relays, listed in its trust file and carried by every invite; iroh's public relays are an opt-in fallback.
 
 The node and the client run on macOS, Linux and Windows.
 
@@ -43,7 +44,7 @@ islandmail accept imr1…         # only when bob's join could not reach this no
 
 `--name bob,bobby` invites several exact names for the one host (at most 8). `join` checks the invite (its node's
 signature, expiry, and with `--key`, that it is for this host's key). On a host with no node yet it makes one in
-`~/.islandmail/node` (the key `nodekey` made, trust file with the inviter's network, config with the inviter's relay;
+`~/.islandmail/node` (the key `nodekey` made, trust file with the inviter's network and relays, config opting in to iroh's public relays only if the inviter did;
 `--listen HOST:PORT` for a UDP address peers can dial, `--api` for another loopback port) and starts it; on a host
 with a node (`--config CONFIG.json`) it uses that one. Your node then dials the inviting node and presents itself; the
 inviting node checks the key (with `--key`), trusts it for exactly the invited names and spends the invite, and your
@@ -254,10 +255,12 @@ agents never need one.
     "node_key_file": "node.seed", "members_file": "members.json"}
    ```
 
-   If inbound UDP is unavailable, use `"addrs": []` for that host and set the same `relay` list in each
-   participating host's **config.json**. Use `"relay": ["n0"]` for iroh's public production relays or
-   `"relay": ["https://relay.example.org"]` for a self-hosted iroh-relay. Both hosts need outbound
-   access to the relay. An omitted or empty list disables relays. Restart the node after changing this setting.
+   If inbound UDP is unavailable, use `"addrs": []` for that host and list the network's relays in the trust file:
+   `"relays": ["https://relay.example.org"]` (up to 8 iroh relay origins, see [Run your own relay](#run-your-own-relay)).
+   Every node uses them, every invite carries them, and nodes follow a change within a few seconds, no restart.
+   A host may add its own in **config.json**: `"relay": ["n0"]` opts in to iroh's public relays, which see the same
+   metadata as any relay; `"relay": ["https://..."]` adds a relay only this host uses (restart after changing config).
+   With neither, nodes only dial each other directly.
 
 4. `islandmail-node run config.json`. Each peer adds your node entry to its own trust file and increases `seq`; nodes pick
    up a changed trust file within a second.
@@ -269,6 +272,40 @@ without `names` certifies nobody; its agents can still be pinned one by one (`me
 machine), give both nodes its name and copy its identity file (the same key) to the second host. Its first command
 there gets that node's certificate too. Private mail to the agent is then encrypted to its key and to both nodes.
 
+
+## Run your own relay
+
+A relay is [iroh-relay](https://crates.io/crates/iroh-relay), the server iroh's public relays run, at the same
+version as the node (1.4.1). It only forwards QUIC that both ends already encrypt and authenticate.
+
+```sh
+cargo install iroh-relay@1.4.1 --locked --features server
+iroh-relay --dev        # local test: plain HTTP on port 3340; list it as "http://HOST:3340"
+```
+
+For a real network, give it a public DNS name and a TLS certificate, and let only your network's nodes through.
+`islandmail-node relay-allowlist members.json` prints the access list for the trust file's nodes (re-run it when
+nodes change). `relay.toml`:
+
+```toml
+enable_relay = true
+http_bind_addr = "[::]:80"
+enable_quic_addr_discovery = true
+# paste the output of: islandmail-node relay-allowlist members.json
+access.allowlist = [
+  "NODE_ENDPOINT_ID_HEX", # mac
+]
+
+[tls]
+cert_mode = "LetsEncrypt"        # or "Manual", with manual_cert_path / manual_key_path
+hostname = ["relay.example.org"]
+contact = "admin@example.org"
+cert_dir = "/var/lib/iroh-relay"
+```
+
+Run `iroh-relay --config-path relay.toml` (TCP 80 and 443 and UDP 7842 open), then add
+`"relays": ["https://relay.example.org"]` to the trust file and bump `seq`. Invites made after that carry it, and
+`join` writes it into the joiner's trust file.
 ## How it stays secure
 
 - **Who can talk.** A node accepts an agent only if its host's trust file pins that name and key, or a node in that
@@ -314,8 +351,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   long-lived key can expose archived ciphertext encrypted to it.
 - **Relay privacy.** A relay forwards encrypted QUIC between peers authenticated by their pinned node keys.
   It can see node public keys, IP addresses, timing and traffic sizes, and can delay or drop traffic.
-  Mail contents and signatures remain protected end to end. Self-host the relay to keep that metadata off
-  third-party infrastructure.
+  Mail contents and signatures remain protected end to end. Run the network's own relay to keep that metadata off
+  third-party infrastructure; `n0` is never used unless a host's config opts in.
 - **Rooms.** Membership events, mentions, replies and key grants are signed by the sender (they are inside the
   body, covered by its digest) but only folded, never enforced: a member's node can still wrap a post to anyone, and
   a member can share what it reads. Room ids, senders, recipients and times are visible to every trusted node, as
@@ -430,7 +467,7 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the node key.
   port u16 or `6` + IPv6 16 + port u16. Left out because join derives them: the node's names when they are just
   `[from]`, its entry name (`from`, else its first name). Reply: `imr1` + base58(`flags`, network 32, joining node key 32, the invite's nonce
   16, names, addrs if flag 4, signature 64 by the joining node over `islandmail/invite-reply/v1\n` + those bytes).
-  A typical invite is about 230 characters (key-bound about 240), a reply about 190. **Join handshake**: ALPN `islandmail/join/1`, the one
+  A typical invite is about 230 characters (key-bound about 240) plus about 1.4 per relay URL character, a reply about 190. **Join handshake**: ALPN `islandmail/join/1`, the one
   protocol open to a key not on the trust file: one request (the reply, at most 1024 bytes, within 10 s), one JSON
   answer, then the connection closes; at most 5 attempts per key and 30 in all per minute. The connection's key must
   be the reply's.

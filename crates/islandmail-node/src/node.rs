@@ -1323,7 +1323,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
         let path = std::env::temp_dir().join(format!("islandmail-node-test-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let (tx, rx) = mpsc::channel(32);
@@ -1747,7 +1747,7 @@ mod tests {
             nodes: [&mac, &pod, &ops].iter().zip(names).enumerate()
                 .map(|(i, (s, names))| NodeEntry { name: ["mac", "pod", "ops"][i].into(), key: fmt_key(&s.public()), addrs: vec![], names })
                 .collect(),
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
         list.validate().unwrap();
         let mk = |seed: Seed| {

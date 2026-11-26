@@ -320,15 +320,62 @@ struct Ctx {
     endpoint: Endpoint,
     node: Arc<Node>,
     lookup: MemoryLookup,
-    relays: Vec<RelayUrl>,
+    /// The relays in use (the trust file's, then config "relay"), followed as the trust file changes.
+    relays: Arc<std::sync::RwLock<RelayMap>>,
+    /// Config "relay": this node's own additions ("n0" opts in to iroh's public relays).
+    local_relay: Vec<String>,
     sender: GossipSender,
     gate: MemberGate,
 }
 
 impl Ctx {
     fn peers(&self) -> Vec<EndpointId> {
-        peers(&self.node, &self.lookup, &self.relays)
+        let relays = self.relays.read().unwrap().urls::<Vec<_>>();
+        peers(&self.node, &self.lookup, &relays)
     }
+
+    /// Follow the trust file's relays: the endpoint gains relays newly listed and drops ones no longer listed.
+    async fn refresh_relays(&self) {
+        let entries = relay_entries(&self.node.members.read().unwrap(), &self.local_relay);
+        let want = match relay_mode(&entries) {
+            Ok(mode) => mode.relay_map(),
+            Err(e) => return tracing::warn!("relays {entries:?} refused: {e:#}"),
+        };
+        let have = self.relays.read().unwrap().clone();
+        let (old, new) = (have.urls::<Vec<RelayUrl>>(), want.urls::<Vec<RelayUrl>>());
+        if old.iter().all(|u| want.contains(u)) && new.iter().all(|u| have.contains(u)) {
+            return;
+        }
+        for url in old.iter().filter(|u| !want.contains(u)) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in new.iter().filter(|u| !have.contains(u)) {
+            if let Some(config) = want.get(url) {
+                self.endpoint.insert_relay(url.clone(), config).await;
+            }
+        }
+        tracing::info!("relays now {}", new.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
+        *self.relays.write().unwrap() = want;
+    }
+}
+
+/// An iroh-relay config line that serves only this trust file's nodes (iroh endpoint ids are the node keys, in hex).
+pub fn relay_allowlist(list: &islandmail_core::MemberList) -> String {
+    let ids: Vec<String> = list.nodes.iter().filter_map(|n| parse_key(&n.key).ok())
+        .map(|k| format!("  \"{}\", # {}\n", k.iter().map(|b| format!("{b:02x}")).collect::<String>(), n_name(list, &k))).collect();
+    format!("access.allowlist = [\n{}]\n", ids.concat())
+}
+
+fn n_name(list: &islandmail_core::MemberList, key: &[u8; 32]) -> String {
+    list.nodes.iter().find(|n| parse_key(&n.key).ok().as_ref() == Some(key)).map(|n| n.name.replace(['\n', '"'], " ")).unwrap_or_default()
+}
+
+/// The relays a node uses: its network's (trust file "relays"), then its own config "relay" ("n0" = iroh's public
+/// relays, only when the host opts in).
+pub fn relay_entries(list: &islandmail_core::MemberList, local: &[String]) -> Vec<String> {
+    let mut all = list.relays.clone();
+    all.extend(local.iter().filter(|r| !list.relays.contains(r)).cloned());
+    all
 }
 
 /// Other member nodes, with their listed addresses added to the address book.
@@ -548,8 +595,11 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     *node.encryption_key.write().unwrap() = Some(keys.rotate(&node.seed, &network, islandmail_core::now_millis())?);
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
-    let mode = relay_mode(&cfg.relay)?;
-    let relays = mode.relay_map().urls::<Vec<_>>();
+    let mode = relay_mode(&relay_entries(&node.members.read().unwrap(), &cfg.relay))?;
+    let relay_map = mode.relay_map();
+    let relays = relay_map.urls::<Vec<_>>();
+    // A custom map even when empty, so relays the trust file lists later can be added to the running endpoint.
+    let mode = match mode { RelayMode::Disabled => RelayMode::Custom(RelayMap::empty()), m => m };
     let endpoint = builder
         .relay_mode(mode)
         .secret_key(SecretKey::from_bytes(node.seed.bytes()))
@@ -573,7 +623,8 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let topic = TopicId::from_bytes(node.members.read().unwrap().topic());
     let first = peers(&node, &lookup, &relays);
     let (sender, mut receiver) = gossip.subscribe(topic, first).await?.split();
-    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, relays, sender, gate };
+    let ctx = Ctx { endpoint: endpoint.clone(), node: node.clone(), lookup, relays: Arc::new(std::sync::RwLock::new(relay_map)),
+                    local_relay: cfg.relay.clone(), sender, gate };
 
     // Background tasks; Net::shutdown stops them so none keeps the node (and its open store) alive.
     let mut tasks = Vec::new();
@@ -695,6 +746,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                     blob_cursors.insert(peer, after);
                 }
             }
+            c.refresh_relays().await;
             let peers = c.peers();
             for &peer in &peers {
                 if !busy.insert(peer) { continue; }
@@ -744,6 +796,16 @@ mod tests {
         for bad in ["", "garbage", "file:///tmp", "https://user:pass@relay.test", "https://relay.test/?secret"] {
             assert!(relay_mode(&[bad.into()]).is_err());
         }
+        // The network's relays come first; a node's config adds its own (n0 only when it opts in).
+        let me = Seed::generate();
+        let list = islandmail_core::MemberList { v: 1, network: islandmail_core::b64u(&[1u8; 32]), seq: 1, members: vec![],
+            nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
+            homes: vec![], relays: vec![custom.into()] };
+        assert_eq!(relay_entries(&list, &[]), vec![custom.to_string()]);
+        assert_eq!(relay_entries(&list, &["n0".into(), custom.into()]), vec![custom.to_string(), "n0".into()]);
+        // The relay's allowlist names each node by its iroh endpoint id.
+        let id = EndpointId::from_bytes(&me.public()).unwrap();
+        assert_eq!(relay_allowlist(&list), format!("access.allowlist = [\n  \"{id}\", # n\n]\n"));
     }
 
     #[tokio::test]
@@ -765,22 +827,27 @@ mod tests {
             nodes: keys.iter().enumerate().map(|(i, key)| NodeEntry {
                 name: format!("n{i}"), key: fmt_key(&key.public()), addrs: vec![], names: vec![format!("a{i}")]
             }).collect(),
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
+        // The relay is the network's, in the trust file, not in either node's config. Node 0 starts with it; node 1
+        // starts without and picks it up when its trust file gains it.
+        let with_relay = islandmail_core::MemberList { seq: 2, relays: vec![url.clone()], ..list.clone() };
         std::fs::write(&file, serde_json::to_vec(&list)?)?;
         let mut cfg: Config = serde_json::from_value(serde_json::json!({
-            "data_dir": dir, "members_file": file, "node_key_file": "unused", "relay": [url], "sync_secs": 1
+            "data_dir": dir, "members_file": file, "node_key_file": "unused", "sync_secs": 1
         }))?;
         let mut hosts = Vec::new();
         for (i, key) in keys.into_iter().enumerate() {
             cfg.data_dir = dir.join(format!("node-{i}"));
             let (tx, rx) = mpsc::channel(4);
             let opts = Opts { identities: std::sync::RwLock::new(vec![(format!("a{i}"), agents[i].clone())]), ..Opts::default() };
-            let node = Arc::new(Node::new(Store::open(&dir.join(format!("{i}.sqlite")))?, list.clone(), key, opts, tx));
+            let start = if i == 0 { with_relay.clone() } else { list.clone() };
+            let node = Arc::new(Node::new(Store::open(&dir.join(format!("{i}.sqlite")))?, start, key, opts, tx));
             node.certify_identities();
             let net = start_with(Endpoint::builder(presets::Minimal).clear_ip_transports(), &cfg, node.clone(), rx).await?;
             hosts.push((node, net));
         }
+        std::fs::write(&file, serde_json::to_vec(&with_relay)?)?;
         let (sender, _) = &hosts[0];
         let tok = islandmail_core::agent_token::mint(&agents[0], "a0", "agent:a0", &sender.seed.public(), islandmail_core::now_millis(), 60);
         let who = sender.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
@@ -810,7 +877,7 @@ mod tests {
         let page = call(&peer, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;
         assert!(!page.more_trust && page.certs.len() == 1 && page.certs[0].node == issuer);
         let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
-            .relay_mode(relay_mode(&cfg.relay)?).bind().await?;
+            .relay_mode(relay_mode(std::slice::from_ref(&url))?).bind().await?;
         let attempt = tokio::time::timeout(Duration::from_secs(10), async {
             let conn = outsider.connect(remote.addr(), SYNC_ALPN).await?;
             call(&conn, &network, &Req::Days).await
@@ -845,7 +912,7 @@ mod tests {
             seq: 1,
             members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
         let path = std::env::temp_dir().join(format!("islandmail-node-net-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let (tx, _rx) = mpsc::channel(32);
@@ -905,7 +972,7 @@ mod tests {
                 vec![islandmail_core::Member { name: "a.alice".into(), sub: "agent:a.alice".into(), key: fmt_key(&alice.public()) }]
             } else { vec![] },
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
-            homes: vec![],
+            homes: vec![], relays: vec![],
         };
         std::fs::write(&file, serde_json::to_vec(&list(1, true)).unwrap()).unwrap();
         let cfg: Config = serde_json::from_value(serde_json::json!({

@@ -24,6 +24,9 @@ from two_nodes import RESULTS, Node, check, client_module, free_port, run, wait_
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
+RELAY = "http://127.0.0.1:9"
+RELAY_CHARS = (len(RELAY) + 2) * 138 // 100  # what the relay adds to an invite: base58 of its bytes and count
+
 def b58(b):
     n, out = int.from_bytes(b, "big"), ""
     while n:
@@ -82,7 +85,8 @@ def main():
     network = run(bin_, "network-id")
     a_trust = os.path.join(adir, "members.json")
     with open(a_trust, "w") as f:
-        json.dump({"v": 1, "network": network, "seq": 1, "members": [],
+        # The network's own relay (nothing listens there; the hosts reach each other directly on loopback).
+        json.dump({"v": 1, "network": network, "seq": 1, "members": [], "relays": [RELAY],
                    "nodes": [{"name": "a", "key": a_key, "addrs": ["127.0.0.1:%d" % a_udp], "names": ["alice"]}]}, f)
     node_a = Node(bin_, adir, "config", {"data_dir": "data", "api_listen": "127.0.0.1:%d" % a_api, "iroh_port": a_udp,
                                          "node_key_file": "node.seed", "members_file": "members.json", "sync_secs": 3})
@@ -145,7 +149,7 @@ def main():
 
         rc, inv, err = cl("a", "invite", "--name", "bob", "--room", "plan", "--config", a_cfg)
         check("alice invites bob into alice/plan", rc == 0 and inv.startswith("im1"), err[-200:])
-        check("the invite is one short line", "\n" not in inv and len(inv) <= 260, "%d chars: %s" % (len(inv), inv))
+        check("the invite is one short line", "\n" not in inv and len(inv) <= 260 + RELAY_CHARS, "%d chars: %s" % (len(inv), inv))
         some_key = run(bin_, "keygen", os.path.join(work, "some.seed"))
         rc, kbob, err = cl("a", "invite", "--name", "bob", "--key", some_key, "--room", "plan", "--config", a_cfg)
         check("bound to a node key it is a few characters longer", rc == 0 and len(kbob) <= len(inv) + 8,
@@ -160,6 +164,10 @@ def main():
               and "alice/plan" in out and "imr1" not in out, (out + err)[-400:])
         check("join started B's node", pid("b") is not None)
         bt = trust_of("b")
+        with open(fresh["b"][0]) as f:
+            b_conf = json.load(f)
+        check("B's trust file lists the network's relay from the invite", bt.get("relays") == [RELAY], json.dumps(bt)[:300])
+        check("B's config opts in to no public relays (the inviter did not)", b_conf.get("relay") == [], json.dumps(b_conf))
         ent = {n["key"]: n for n in bt["nodes"]}
         check("B trusts A as A listed itself", ent.get(a_key, {}).get("names") == ["alice"]
               and ent[a_key]["addrs"] == ["127.0.0.1:%d" % a_udp] and bt["network"] == network, json.dumps(bt)[:300])
@@ -264,7 +272,7 @@ def main():
         check("and the same key next time", again == d_key, again)
         rc, kinv, err = cl("a", "invite", "--name", "dora,dmitri", "--key", d_key, "--room", "plan", "--config", a_cfg)
         check("alice invites dora and dmitri into alice/plan for D's node key only", rc == 0 and kinv.startswith("im1")
-              and len(kinv) <= 300 and "only for node" in err, "%d chars %s" % (len(kinv), err[-200:]))
+              and len(kinv) <= 300 + RELAY_CHARS and "only for node" in err, "%d chars %s" % (len(kinv), err[-200:]))
         rc, out, err = cl("a", "invite", "--name", "x", "--key", "ed25519:nope", "--config", a_cfg)
         check("an invite for a malformed key is refused", rc != 0 and "--key" in err, err[-200:])
         rc, out, err = join("c", kinv)

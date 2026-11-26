@@ -57,7 +57,7 @@ pub struct Invite {
     pub network: String,
     /// The inviting node, as the joiner will list it.
     pub node: NodeEntry,
-    /// The inviter's relay setting (config "relay").
+    /// The relays the inviter uses: its network's (trust file "relays"), then its own config's ("n0" when it opted in).
     pub relay: Vec<String>,
     /// The exact agent names the inviter will trust the joining node for, comma-separated.
     pub name: String,
@@ -410,7 +410,8 @@ pub fn invite(node: &Node, body: &Value) -> Result<Value, ApiError> {
     let inv = Invite {
         nonce,
         for_key: bound.map(|k| k[..4].try_into().unwrap()),
-        network, node: own_entry(node)?, relay: node.opts.relay.clone(), name: name.into(),
+        relay: crate::net::relay_entries(&node.members.read().unwrap(), &node.opts.relay),
+        network, node: own_entry(node)?, name: name.into(),
         from: (!from.is_empty()).then(|| from.into()), room: (!room.is_empty()).then(|| room.into()), exp: exp_s as i64 * 1000,
     };
     let s = encode_invite(&inv, node);
@@ -492,6 +493,10 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
             Some(n) => *n = inv.node.clone(),
             None => list.nodes.push(inv.node.clone()),
         }
+        // The inviter's relays become this network's relays here too; n0 stays a per-node choice (config "relay").
+        for r in inv.relay.iter().filter(|r| *r != "n0") {
+            if !list.relays.contains(r) { list.relays.push(r.clone()); }
+        }
         Ok(())
     })?;
     Ok(json!({
@@ -499,7 +504,7 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
         "network": list.network, "seq": list.seq,
         "inviter": { "name": inv.node.name, "key": inv.node.key, "names": inv.node.names }, "from": inv.from,
         "name": inv.name, "names": names, "added_name": added_name, "room": inv.room,
-        "relay": { "invite": inv.relay, "node": node.opts.relay },
+        "relay": { "invite": inv.relay, "node": crate::net::relay_entries(&list, &node.opts.relay) },
     }))
 }
 
@@ -692,7 +697,7 @@ mod tests {
 
     fn node_on(network: [u8; 32], names: &[&str]) -> Node {
         let seed = islandmail_core::keys::Seed::generate();
-        let list = MemberList { v: 1, network: b64u(&network), seq: 1, members: vec![], homes: vec![],
+        let list = MemberList { v: 1, network: b64u(&network), seq: 1, members: vec![], homes: vec![], relays: vec![],
             nodes: vec![NodeEntry { name: "a".into(), key: fmt_key(&seed.public()), addrs: vec!["192.0.2.7:4433".into()],
                                     names: names.iter().map(|n| n.to_string()).collect() }] };
         let tag = b64u(&islandmail_core::random_bytes::<9>());
@@ -823,6 +828,10 @@ mod tests {
         let rs = reply_of(&n, &s, "bob");
         assert_eq!(read_reply(&rs).unwrap().nonce, inv.nonce);
         let plain = invite(&n, &body("bob", "")).unwrap()["invite"].as_str().unwrap().len();
+        // An invite carries the network's relays (trust file) and the node's own (here n0, opted in).
+        n.members.write().unwrap().relays = vec!["https://relay.example.org".into()];
+        let s2 = invite(&n, &body("dave", "")).unwrap()["invite"].as_str().unwrap().to_string();
+        assert_eq!(read_invite(&s2, now).unwrap().relay, vec!["n0".to_string(), "https://relay.example.org".into()]);
         println!("invite {} chars with a room, {plain} without; reply {} chars", s.len(), rs.len());
     }
 }
