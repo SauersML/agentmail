@@ -91,9 +91,9 @@ impl Config {
         read_or_create_seed(&self.node_key_file)
     }
 
-    /// (name, seed) of each local identity file. Files that do not parse, and files other users could read (group or
-    /// world bits set), are skipped with a warning.
-    pub fn identities(&self) -> Vec<(String, Seed)> {
+    /// (name, sub, path, seed) of each local identity file. Files that do not parse, and files other users could read
+    /// (group or world bits set), are skipped with a warning.
+    pub fn identities(&self) -> Vec<(String, String, PathBuf, Seed)> {
         let Some(dir) = &self.identities_dir else { return vec![] };
         let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
         let mut out = Vec::new();
@@ -112,7 +112,7 @@ impl Config {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
             let (Some(name), Some(seed)) = (v["name"].as_str(), v["seed"].as_str()) else { continue };
             if let Ok(s) = Seed::from_hex(seed) {
-                out.push((name.to_string(), s));
+                out.push((name.to_string(), v["sub"].as_str().unwrap_or("").to_string(), p.clone(), s));
             }
         }
         out

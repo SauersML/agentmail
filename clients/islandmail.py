@@ -335,12 +335,13 @@ def load_identity(name, create=True):
     return ident
 
 
-def new_identity(name, sub=None, path=None):
+def new_identity(name, path=None):
+    # The sub is always agent:NAME, the id nodes certify the name under (a held file with another sub is refused).
     name = safe_name(name)
     local = name.split("@")[0]
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", local) or local.endswith(".") or local.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
-    sub = sub or "agent:%s" % name
+    sub = "agent:%s" % name
     if not re.fullmatch(r"[!-~]{1,120}", sub):
         raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     seed = os.urandom(32)
@@ -681,7 +682,7 @@ def reply_lines(m, quoted=3):
 
 
 def cmd_newkey(a):
-    ident = new_identity(a.name, a.sub)
+    ident = new_identity(a.name)
     sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(a.name))
     print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
 
@@ -729,7 +730,7 @@ def cmd_rekey(a):
     ident = load_identity(name, create=False)
     if "@" not in ident["name"]:
         raise Fail("rekey is for home names (name@home-suffix)")
-    nxt = new_identity(ident["name"], ident["sub"], path=pending_path(ident["name"]))
+    nxt = new_identity(ident["name"], path=pending_path(ident["name"]))
     sys.stderr.write("new key saved in %s; once your home has it, run enroll (its old key signs the handover)\n"
                      % pending_path(ident["name"]))
     print(nxt["id"])
@@ -1911,7 +1912,6 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("newkey", help="make your key with no home server; prints the public entry for peers")
     p.add_argument("name")
-    p.add_argument("--sub", help="durable id for the member list (default agent:NAME)")
     p.set_defaults(fn=cmd_newkey)
     p = sub.add_parser("selftoken", help="print one single-use agent token for the node (signed by your own key)")
     p.add_argument("--ttl", type=int, default=STREAM_TTL, help="seconds it stays valid, at most 86400 (default 3600)")

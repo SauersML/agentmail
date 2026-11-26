@@ -47,7 +47,14 @@ def main():
     check("operator makes a key for dev.alice", rc == 0, out[-200:])
     os.makedirs(os.path.join(user_dir, "identities"), mode=0o700)
     with open(os.path.join(held, "dev.alice.json")) as f:  # the operator hands dev.alice its key file
-        write_private_json(os.path.join(user_dir, "identities", "dev.alice.json"), json.load(f))
+        alice = json.load(f)
+        write_private_json(os.path.join(user_dir, "identities", "dev.alice.json"), alice)
+    check("newkey writes sub agent:NAME", alice.get("sub") == "agent:dev.alice", alice.get("sub"))
+    # A held file whose sub is not agent:NAME would get a certificate its tokens then fail; the node refuses it.
+    carol = {"name": "dev.carol", "sub": "agent:dev.carol@elsewhere", "seed": os.urandom(32).hex()}
+    write_private_json(os.path.join(held, "dev.carol.json"), carol)
+    os.makedirs(os.path.join(work, "carol", "identities"), mode=0o700)
+    write_private_json(os.path.join(work, "carol", "identities", "dev.carol.json"), carol)
     cfg = {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port, "iroh_port": udp,
            "node_key_file": seed, "members_file": trust, "sync_secs": 3, "identities_dir": held}
 
@@ -71,6 +78,13 @@ def main():
         check("node starts with certify identities_dir", node.start())
         rc, out = cl(user_dir, "--as", "dev.alice", "whoami")
         check("the held identity signs in (certified at startup)", rc == 0 and "dev.alice" in out, out[-200:])
+        with open(os.path.join(work, "dev.log")) as f:
+            log = f.read()
+        check("a held file with another sub is refused at startup, naming the file and the fix",
+              "refusing identity file" in log and "dev.carol.json" in log and '"agent:dev.carol"' in log,
+              [l for l in log.splitlines() if "dev.carol" in l][-1:])
+        rc, out = cl(os.path.join(work, "carol"), "--as", "dev.carol", "whoami")
+        check("and it does not sign in", rc != 0 and "403" in out, out[-200:])
         walkin = os.path.join(work, "walkin")
         rc, out = cl(walkin, "--as", "dev.mallory", "whoami")
         check("a walk-in name is refused with 403", rc != 0 and "403" in out and "identities_dir" in out, out[-240:])

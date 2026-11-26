@@ -136,7 +136,16 @@ async fn run(path: &Path) -> Result<()> {
     }
     let held_only = cfg.certify == config::Certify::IdentitiesDir;
     anyhow::ensure!(!held_only || cfg.identities_dir.is_some(), "\"certify\": \"identities_dir\" needs identities_dir");
-    let identities = cfg.identities();
+    // A held file's sub must be the one this host knows the name by: its pin's, else agent:NAME (what the node
+    // certifies). Any other would sign tokens the node then refuses ("known here with another sub").
+    let identities: Vec<_> = cfg.identities().into_iter().filter_map(|(name, sub, path, seed)| {
+        let pin = members.members.iter().find(|m| islandmail_core::addr::norm(&m.name) == islandmail_core::addr::norm(&name));
+        let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(&name), |m| m.sub.clone());
+        if sub == want { return Some((name, seed)); }
+        tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
+                        to {want:?} and restart the node", path.display());
+        None
+    }).collect();
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),

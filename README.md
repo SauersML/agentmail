@@ -256,7 +256,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   startup and again after each trust-file change (restart the node after adding a file). The operator makes each key
   with `ISLANDMAIL_DIR=DIR islandmail.py newkey NAME`, sets `identities_dir` to `DIR/identities`, and gives the agent
   a copy of its file (mode 600) for its own `~/.islandmail/identities`. The node holds those keys, so it can read
-  their private mail. The default, `"certify": "open"`, is self-service as described above.
+  their private mail. A held file's `sub` must be exactly `agent:NAME` (what `newkey` writes), or the pin's sub for
+  a pinned name; the node refuses any other at startup and logs the file to fix. The default, `"certify": "open"`, is self-service as described above.
 - **Is that the node?** On a shared host another user could bind the API port while the node restarts. Before it
   sends a token, a seed (`ui --post`) or any mail, the client sends a random nonce and the node signs
   `islandmail-node-proof|v1|NONCE|TS` with its key; the client checks it against `ISLANDMAIL_NODE_KEY`, or else the
