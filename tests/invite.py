@@ -126,7 +126,7 @@ def main():
 
     try:
         check("A's node starts", node_a.start())
-        rc, out, err = cl("a", "room", "create", "plan", "--private")
+        rc, out, err = cl("a", "room", "create", "plan")
         check("alice makes a private room alice/plan", rc == 0, (out + err)[-200:])
         rc, out, err = cl("a", "room", "send", "alice/plan", "before bob")
         check("and posts in it", rc == 0, err[-200:])
@@ -175,11 +175,11 @@ def main():
         check("and says it once", "joined with your invite" not in err, err[-200:])
 
         # Private mail both ways.
-        got, t = wait_for(lambda: cl("b", "send", "--to", "alice", "--private", "hi alice, bob here")[0] == 0, timeout=30, every=1)
+        got, t = wait_for(lambda: cl("b", "send", "--to", "alice", "hi alice, bob here")[0] == 0, timeout=30, every=1)
         check("bob sends alice private mail", got, "%.1fs" % t)
         got, t = wait_for(lambda: [m for m in js("a", "read", "--to-me") or [] if m.get("text") == "hi alice, bob here"], timeout=30)
         check("alice reads it", got and got[0]["from"] == "bob", json.dumps(got)[:200])
-        rc, out, err = cl("a", "send", "--to", "bob", "--private", "welcome, bob")
+        rc, out, err = cl("a", "send", "--to", "bob", "welcome, bob")
         check("alice answers in private", rc == 0, err[-200:])
         got, t = wait_for(lambda: [m for m in js("b", "read", "--to-me") or [] if m.get("text") == "welcome, bob"], timeout=30)
         check("bob reads it", bool(got), "%.1fs" % t)
@@ -223,7 +223,7 @@ def main():
         answers = [join("c", forge(dave, a_seed, nonce=os.urandom(16)), wait=5) for _ in range(12)]
         check("a flood of bad joins is refused, then rate-limited", all(rc != 0 for rc, _, _ in answers)
               and any("too many" in e for _, _, e in answers), "%.1fs %s" % (time.time() - t0, answers[-1][2][-160:]))
-        rc, out, err = cl("a", "send", "--to", "bob", "--private", "still here after the flood")
+        rc, out, err = cl("a", "send", "--to", "bob", "still here after the flood")
         got, t = wait_for(lambda: [m for m in js("b", "read", "--to-me") or [] if m.get("text") == "still here after the flood"],
                           timeout=15)
         check("mail between the trusted nodes still flows at once", rc == 0 and bool(got), "%.1fs" % t)

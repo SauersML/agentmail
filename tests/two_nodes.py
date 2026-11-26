@@ -253,6 +253,8 @@ def main():
         # Private mode: only the sender and the recipients can read it, and only on nodes holding their keys.
         st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "secret", "text": "for bob only", "mode": "private"})
         check("private POST on A", st == 201 and r["message"]["mode"] == "private")
+        st, r = req("POST", pa, "/api/messages", token("A", "alice"), {"to": "t.bob", "thread": "secret-default", "text": "no mode given"})
+        check("a POST with no mode is private", st == 201 and r["message"]["mode"] == "private", r)
         got, dt = wait_for(lambda: req("GET", pb, "/api/messages?thread=secret", token("B", "bob"))[1]["messages"])
         check("private: bob reads it on B (B holds bob's key)", got and got[0]["text"] == "for bob only", "%.2fs" % dt)
         check("private: carol cannot see it on B", req("GET", pb, "/api/messages?thread=secret", token("B", "carol"))[1]["messages"] == [])
@@ -320,7 +322,7 @@ def main():
         finally:
             watcher.terminate()
             watcher.communicate(timeout=5)
-        rc, out = im(pa, "alice", "send", "--to", "t.bob", "--thread", "t2", "sent with islandmail.py")
+        rc, out = im(pa, "alice", "send", "--open", "--to", "t.bob", "--thread", "t2", "sent with islandmail.py")
         check("islandmail.py send (A)", rc == 0 and re.match(r"sent [a-z2-7]{8} to ", out) and "stored here for t.bob, copied to their nodes as they sync" in out, out)
         delivered, _ = wait_for(lambda: req("GET", pb, "/api/messages?thread=t2", token("B", "bob"))[1]["messages"])
         check("message reached B while watcher was stopped", bool(delivered))
@@ -345,7 +347,7 @@ def main():
         check("islandmail.py read --to-me (B)", rc == 0 and "hello from A" in out)
 
         # A newer visible message to another agent must not displace Bob's latest inbox item.
-        rc, _ = im(pb, "bob", "send", "--to", "t.alice", "--thread", "t2", "reply to Alice")
+        rc, _ = im(pb, "bob", "send", "--open", "--to", "t.alice", "--thread", "t2", "reply to Alice")
         check("Bob sends his reply", rc == 0)
         rc, out = im(pb, "bob", "read", "--to-me", "--thread", "t2", "--latest", "1", "--json")
         check("latest counts addressed messages", rc == 0 and [m["text"] for m in json.loads(out)] == ["sent with islandmail.py"])

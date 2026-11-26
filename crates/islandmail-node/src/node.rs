@@ -521,8 +521,9 @@ impl Node {
         })?;
         let text = clean_text(body.get("text"), !files.is_empty())?;
         let mode = match body.get("mode") {
-            None => Mode::Members,
-            Some(v) => serde_json::from_value(v.clone()).map_err(|_| ApiError::new(400, "mode must be members or private"))?,
+            // Private unless the sender asks for members: only the recipients, their home nodes and the sender.
+            None => Mode::Private,
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| ApiError::new(400, "mode must be private or members"))?,
         };
         self.rate(&who.sub, "message", 120)?;
         if is_broadcast(&to) {
@@ -1514,7 +1515,7 @@ mod tests {
         let f = node.upload(&who, "a.txt", "text/plain", b"bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
         let ts = now_ts();
-        let post = json!({ "to": "all", "thread": "t", "text": "with file", "files": [id],
+        let post = json!({ "to": "all", "mode": "members", "thread": "t", "text": "with file", "files": [id],
                            "signed": signed(&_l, &alice, "all", "t", "with file", std::slice::from_ref(&f), &ts) });
         let p1 = node.post(&who, &post).unwrap();
         let p2 = node.post(&who, &post).unwrap();
@@ -1539,7 +1540,7 @@ mod tests {
         decoy.blobs.push(id.clone());
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": islandmail_core::b64u(&[7u8; 32]) }]);
         node.store.insert(&decoy, &v, Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
-        node.post(&alice, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
+        node.post(&alice, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
             "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
         let bob = Caller { key: bob_key, name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
@@ -1580,7 +1581,7 @@ mod tests {
         let (mut node, alice, _, mut list, _rx) = setup();
         node.opts.identities.get_mut().unwrap().push(("a.alice".into(), alice.clone()));
         let who = node.verify(&agent_token(&alice, &node.me())).unwrap();
-        let post = json!({"to":"all","text":"meeting notes"});
+        let post = json!({"to":"all", "mode": "members","text":"meeting notes"});
         let before = node.post(&who, &post).unwrap();
         let bob = Seed::generate();
         list.seq += 1;
@@ -1598,17 +1599,17 @@ mod tests {
         let (mut node, alice, _node_b, _list, mut rx) = setup();
         node.opts.identities.get_mut().unwrap().push(("a.alice".into(), alice.clone()));
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
+        let p = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "hi" })).unwrap();
         assert!(!p.repeated);
         let out = rx.try_recv().expect("gossiped");
         assert_eq!(out.id, p.row.env_id);
-        let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
+        let p2 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
-        for invalid in [json!({"to":"all","thread":"t","text":"hi","signed":null}),
+        for invalid in [json!({"to":"all", "mode": "members","thread":"t","text":"hi","signed":null}),
                         json!({"to":"all","thread":"t","text":"hi","mode":false})] {
             assert!(node.post(&who, &invalid).is_err());
         }
-        let p3 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "next" })).unwrap();
+        let p3 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "next" })).unwrap();
         assert_eq!(rx.try_recv().unwrap().parents, vec![p.row.env_id.clone()], "parents = thread heads");
         assert!(p3.row.id > p.row.id);
     }
@@ -1630,20 +1631,20 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let ts = now_ts();
         let _ = node
-            .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
+            .post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest { .. }));
         assert_eq!(e.ts, ts);
         // A signature over other text, or by another key, is refused.
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
+        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
         assert_eq!(bad.err().unwrap().status, 401);
         let mallory = Seed::generate();
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x", "signed": signed(&_l, &mallory, "all", "t", "x", &[], &ts) }));
+        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "x", "signed": signed(&_l, &mallory, "all", "t", "x", &[], &ts) }));
         assert_eq!(bad.err().unwrap().status, 401);
         // Old timestamps are refused.
         let old = ts_from_millis(now_millis() - 3_600_000);
-        let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "y", "signed": signed(&_l, &alice, "all", "t", "y", &[], &old) }));
+        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "y", "signed": signed(&_l, &alice, "all", "t", "y", &[], &old) }));
         assert_eq!(bad.err().unwrap().status, 400);
     }
 
@@ -1660,14 +1661,14 @@ mod tests {
         // Holding alice's key: a plain token post goes out signed by alice's key, and another node accepts it.
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let _ = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
+        let _ = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "no token inside" })).unwrap();
         let e = rx.try_recv().unwrap();
         assert!(matches!(e.attest, Attest { .. }));
         e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis()).unwrap();
         e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
         let (node, _) = mk(vec![("a.alice".into(), Seed::generate())]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        assert_eq!(node.post(&who, &json!({ "to": "all", "thread": "t", "text": "x" })).err().unwrap().status, 400);
+        assert_eq!(node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "x" })).err().unwrap().status, 400);
     }
 
     #[test]
@@ -1678,7 +1679,7 @@ mod tests {
         let id = f["id"].as_str().unwrap().to_string();
         let ts = now_ts();
         let p = node
-            .post(&who, &json!({ "to": "all", "thread": "t", "text": "see file", "files": [id],
+            .post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
                                  "signed": signed(&_l, &alice, "all", "t", "see file", std::slice::from_ref(&f), &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
@@ -1720,9 +1721,9 @@ mod tests {
 
         // This node does not hold alice's key: an unsigned post is refused, a post signed by her key goes out.
         let who = node.verify(&agent_token(&alice, &me)).unwrap();
-        let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
+        let e = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "unsigned" })).err().unwrap();
         assert_eq!(e.status, 400, "{}", e.message);
-        let _ = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
+        let _ = node.post(&who, &json!({"to":"all", "mode": "members", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }
@@ -1875,7 +1876,7 @@ mod tests {
         let (_, c) = mac.certify(&proof(&dana, "dana", &mac)).unwrap();
         let cert: Cert = serde_json::from_value(c["cert"].clone()).unwrap();
         let who = mac.verify(&token(&dana, "dana", &mac)).unwrap();
-        let before = mac.post(&who, &json!({"to": "all", "text": "before"})).unwrap();
+        let before = mac.post(&who, &json!({"to": "all", "mode": "members", "text": "before"})).unwrap();
         let env_before: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&before.row.env_id)).unwrap()[0]).unwrap();
         // Another node's revocation of the same key does not touch the mac's cert.
         let foreign = Revocation::sign(&ops, "dana", &dana.public(), &now_ts());

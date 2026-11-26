@@ -75,7 +75,7 @@ def main():
         check("bob is certified at b", cl("b", "whoami")[0] == 0)
         for name, size in (("thirty.bin", 30 * MiB), ("just-under.bin", LIMIT - 1024), ("exactly.bin", LIMIT)):
             path = blob(name, size)
-            rc, out = cl("a", "send", "--to", "bob", "--file", path, name)
+            rc, out = cl("a", "send", "--open", "--to", "bob", "--file", path, name)
             check("alice sends %s (%d bytes) at a" % (name, size), rc == 0 and re.search(r"(?m)^sent \S+ to bob", out), out[-300:])
 
             def arrived():
@@ -95,7 +95,7 @@ def main():
                     os.unlink(p)
 
         over = blob("over.bin", LIMIT + 1)
-        rc, out = cl("a", "send", "--to", "bob", "--file", over, "too big")
+        rc, out = cl("a", "send", "--open", "--to", "bob", "--file", over, "too big")
         check("the client refuses one byte over 100 MiB", rc != 0 and "exceeds 100 MiB" in out, out[-200:])
         rc, token = cl("a", "selftoken", "--ttl", "120")
         with open(over, "rb") as f:

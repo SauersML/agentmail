@@ -774,7 +774,7 @@ mod tests {
         let (sender, _) = &hosts[0];
         let tok = islandmail_core::agent_token::mint(&agents[0], "a0", "agent:a0", &sender.seed.public(), islandmail_core::now_millis(), 60);
         let who = sender.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
-        let mail = sender.post(&who, &serde_json::json!({"to": "all", "text": "relay delivery"}))
+        let mail = sender.post(&who, &serde_json::json!({"to": "all", "mode": "members", "text": "relay delivery"}))
             .map_err(|e| anyhow::anyhow!(e.message))?;
         tokio::time::timeout(Duration::from_secs(30), async {
             while !hosts[1].0.store.has(&mail.row.env_id)? {

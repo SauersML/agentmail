@@ -109,21 +109,21 @@ def main():
 
         # The first command on a fresh host: key, certificate, delivery. No pins anywhere.
         t0 = time.time()
-        rc, out = cl("ops", "send", "--to", "alice", "first words from ops", user="bob")
+        rc, out = cl("ops", "send", "--open", "--to", "alice", "first words from ops", user="bob")
         check("first `send` on a host works with no setup", rc == 0, out[-200:])
         check("it took about a second", time.time() - t0 < 5, "%.1fs" % (time.time() - t0))
         path = ident("ops", "ops.bob")
         check("the key is made under the host's names, owner-only", owner_only(path))
-        rc, out = cl("mac", "send", "--to", "ops.bob", "hi ops, from alice")
+        rc, out = cl("mac", "send", "--open", "--to", "ops.bob", "hi ops, from alice")
         check("the mac's first command makes alice (its first name)", rc == 0 and os.path.exists(ident("mac", "alice")), out[-200:])
         got, t = wait_for(lambda: [m for m in read("ops") if m.get("from") == "alice"], timeout=15)
         check("ops reads alice's mail on another host", got and got[0]["text"] == "hi ops, from alice", "%.1fs" % t)
-        rc, out = cl("ops", "send", "--to", "alice", "a reply", user="bob")
+        rc, out = cl("ops", "send", "--open", "--to", "alice", "a reply", user="bob")
         got, t = wait_for(lambda: [m for m in read("mac") if m.get("text") == "a reply"], timeout=15)
         check("and alice reads ops's reply", rc == 0 and bool(got), "%.1fs" % t)
 
         # Outside the host's names: refused, and the uncertified key is dropped.
-        rc, out = cl("ops", "--as", "s.mallory", "send", "--to", "alice", "spoof")
+        rc, out = cl("ops", "--as", "s.mallory", "send", "--open", "--to", "alice", "spoof")
         check("a name outside the host's names is refused", rc != 0 and "403" in out, out[-160:])
         check("the refused key is not kept", not os.path.exists(ident("ops", "s.mallory")))
         rc, out = cl("pod", "--as", "s.other", "whoami")
@@ -137,7 +137,7 @@ def main():
         with open(os.path.join(work, "client-pod", cursor), "w") as f:
             f.write("0")
         # Send after alice's mac certificate has replicated, so its key is in the signed recipient list.
-        rc, out = cl("ops", "send", "--to", "alice", "watch at the second home")
+        rc, out = cl("ops", "send", "--open", "--to", "alice", "watch at the second home")
         check("mail posted for second-home watch", rc == 0, out[-160:])
         rc, out = cl("pod", "watch", "--mine", "--until", timeout=25)
         check("resumed watch gets the second home's certificate", rc == 0 and "> " in out, out[-160:])
@@ -147,12 +147,12 @@ def main():
             "ops", "selftoken", "--ttl", "60", user="bob")[1])[1].get("agents", []) if x["name"] == "alice"]
         got, t = wait_for(lambda: [sorted(h) for h in homes()] == [["mac", "pod"]], timeout=15)
         check("ops's host sees alice with two homes", bool(got), "%.1fs" % t)
-        rc, out = cl("ops", "send", "--private", "--to", "alice", "for alice only", user="bob")
+        rc, out = cl("ops", "send", "--to", "alice", "for alice only", user="bob")
         check("ops sends private mail to alice", rc == 0, out[-200:])
         for h in ("mac", "pod"):
             got, t = wait_for(lambda: [m for m in read(h) if m.get("text") == "for alice only"], timeout=15)
             check("alice reads the private mail at the %s" % h, bool(got), "%.1fs" % t)
-        rc, out = cl("pod", "send", "--private", "--to", "ops.bob", "private reply from the pod")
+        rc, out = cl("pod", "send", "--to", "ops.bob", "private reply from the pod")
         got, t = wait_for(lambda: [m for m in read("ops") if m.get("text") == "private reply from the pod"], timeout=15)
         check("alice writes private mail from the pod", rc == 0 and bool(got), out[-120:])
         got, _ = wait_for(lambda: [m for m in read("mac") if m.get("text") == "private reply from the pod"], timeout=15)

@@ -73,7 +73,7 @@ def main():
         with open(path, "wb") as f:
             f.write(os.urandom(200_000))
         for i in range(2):
-            rc, out = cl("a", "send", "--to", "bob", "--file", path, "attachment %d" % i)
+            rc, out = cl("a", "send", "--open", "--to", "bob", "--file", path, "attachment %d" % i)
             check("alice sends attachment %d at a" % i, rc == 0 and re.search(r"(?m)^sent \S+ to bob", out), out[-200:])
             t0 = time.time()
 

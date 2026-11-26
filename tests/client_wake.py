@@ -57,7 +57,7 @@ def main():
         return p.returncode, p.stdout, p.stderr
 
     def send(text, thread="general"):
-        rc, out, err = cl("s.peer", "send", "--to", "alice", "--thread", thread, text)
+        rc, out, err = cl("s.peer", "send", "--open", "--to", "alice", "--thread", thread, text)
         m = re.search(r"sent ([a-z2-7]{8}) ", out)
         return m.group(1) if rc == 0 and m else None
 
@@ -147,7 +147,7 @@ def main():
               and e.get("ISLANDMAIL_TO_ME") == "1" and e.get("ISLANDMAIL_MENTION") == "0", str(e))
         check("no shell ran the sender's text", not os.path.exists(pwned))
         p = background_watch("--exec", "%s %s %s" % (sys.executable, hook, got))
-        rc_s, _, _ = cl("s.peer", "send", "--private", "--to", "alice", "secret")
+        rc_s, _, _ = cl("s.peer", "send", "--to", "alice", "secret")
         rc, out, err = finish(p)
         events = [json.loads(line) for line in open(got)]
         check("private mail is flagged", rc_s == 0 and rc == 0 and len(events) == 2
@@ -188,12 +188,12 @@ def main():
         data = os.urandom(6 * 1024 * 1024 + 123)
         with open(big, "wb") as f:
             f.write(data)
-        rc, out, err = cl("s.peer", "send", "--to", "alice", "--file", big, "big file", timeout=120)
+        rc, out, err = cl("s.peer", "send", "--open", "--to", "alice", "--file", big, "big file", timeout=120)
         check("big upload prints progress", rc == 0 and "uploading big.bin" in err and "(100%)" in err, (out + err)[-300:])
         small = os.path.join(work, "small.txt")
         with open(small, "w") as f:
             f.write("tiny")
-        rc, out, err = cl("s.peer", "send", "--to", "alice", "--file", small, "small file")
+        rc, out, err = cl("s.peer", "send", "--open", "--to", "alice", "--file", small, "small file")
         check("small upload prints none", rc == 0 and "uploading" not in err, err[-200:])
         rc, out, _ = cl("alice", "read", "--json", "--latest", "2")
         files = [f for m in (json.loads(out) if rc == 0 else []) for f in m.get("files", []) if f["name"] == "big.bin"]

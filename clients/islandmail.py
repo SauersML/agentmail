@@ -22,7 +22,7 @@ it; nothing else to set up.
   python3 islandmail.py rooms                    # your rooms with unread counts
   python3 islandmail.py room new launch @ops.bob @dev.carol   # a group chat in one line
   python3 islandmail.py chat launch              # live chat in the terminal (type to post, /help)
-  python3 islandmail.py room create plan --private --with ops.bob   (a room named YOU/plan)
+  python3 islandmail.py room create plan --with ops.bob     (a private room named YOU/plan; --open for anyone)
   python3 islandmail.py room send alice/plan "@ops.bob ready?"     (@name wakes that agent)
   python3 islandmail.py room read alice/plan     |  room add / leave / remove / topic / watch --mentions
   python3 islandmail.py dm alice "hi"            # the private room of the two of you
@@ -818,7 +818,7 @@ def send_note(reaches, to):
 
 def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
-    mode = "private" if getattr(a, "private", False) else "members"
+    mode = "members" if getattr(a, "open", False) else "private"
     if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", norm_field(a.to)) \
             and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
         # Private mail to one agent with no thread named is the DM room of the two of you.
@@ -827,8 +827,7 @@ def send(ident, a):
     files = upload(ident, a.file)
     body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files],
             "signed": signed_block(ident, to, thread, text, files, mode)}
-    if mode == "private":
-        body["mode"] = "private"
+    body["mode"] = mode
     r = api(ident, "POST", "/api/messages", body)
     m = r["message"]
     reaches = r.get("reaches")
@@ -962,15 +961,15 @@ def cmd_room_create(a):
     ident = load_identity(a.as_)
     room = room_id(ident, a.name, create=True)
     with_ = [w for w in re.split(r"[,\s]+", a.with_ or "") if w]
-    event = {"op": "create", "private": a.private, "history": a.history, "members": with_}
+    event = {"op": "create", "private": not a.open, "history": a.history, "members": with_}
     if a.topic:
         event["topic"] = norm_field(a.topic)
-    text = "created this %s room" % ("private" if a.private else "open")
+    text = "created this %s room" % ("open" if a.open else "private")
     if with_:
         text += " with " + ", ".join("@" + w for w in with_)
     m = room_post(ident, room, text, event=event, quiet=True)
-    print("created %s room %s (%s)%s" % ("private" if a.private else "open", room, m["id"],
-                                         "; members: " + ", ".join([ident["name"]] + with_) if a.private else ""))
+    print("created %s room %s (%s)%s" % ("open" if a.open else "private", room, m["id"],
+                                         "" if a.open else "; members: " + ", ".join([ident["name"]] + with_)))
 
 
 def grant_history(ident, room, names):
@@ -1380,9 +1379,7 @@ def cmd_reply(a):
     raw = meta_json(meta)
     files = upload(ident, a.file)
     body = {"to": to, "thread": m["thread"], "text": text, "files": [f["id"] for f in files], "meta": raw,
-            "signed": signed_block(ident, to, m["thread"], text, files, m["mode"], raw)}
-    if m["mode"] == "private":
-        body["mode"] = "private"
+            "mode": m["mode"], "signed": signed_block(ident, to, m["thread"], text, files, m["mode"], raw)}
     r = api(ident, "POST", "/api/messages", body)["message"]
     print("replied %s to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
 
@@ -1983,16 +1980,17 @@ def main():
     sub.add_parser("rekey", help="make a new key for a home name; enroll then hands the name to it").set_defaults(fn=cmd_rekey)
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)
-    p.add_argument("--thread", help="default general; --private to one agent with no thread: your DM room")
+    p.add_argument("--thread", help="default general; to one agent with no thread: your DM room")
     p.add_argument("--file", action="append")
-    p.add_argument("--private", action="store_true", help="only the recipients can read it")
+    p.add_argument("--open", action="store_true",
+                   help="readable by every node and agent this host trusts (default: only the recipients, their home nodes and you)")
     p.add_argument("text", nargs="?", help="the message, or - for stdin")
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser("ask", help="send to one agent and wait for its answer")
     p.add_argument("--to", required=True)
     p.add_argument("--thread", default="ask")
     p.add_argument("--wait", type=int, default=600, help="seconds to wait for the answer (default 600)")
-    p.add_argument("--private", action="store_true", help="only that agent, its home nodes and you can read the question")
+    p.add_argument("--open", action="store_true", help="readable by every node and agent this host trusts (default: only that agent, its home nodes and you)")
     p.add_argument("text", nargs="?", help="the question, or - for stdin")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("read")
@@ -2027,9 +2025,9 @@ def main():
     p.add_argument("--open", action="store_true", help="an open room anyone on the network can join")
     p.add_argument("--config", help="this node's config, to sign invites (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_room_new)
-    p = rsub.add_parser("create", help="a room named YOU/NAME (open unless --private)")
+    p = rsub.add_parser("create", help="a room named YOU/NAME (private unless --open)")
     p.add_argument("name")
-    p.add_argument("--private", action="store_true", help="invite-only; only members can read it")
+    p.add_argument("--open", action="store_true", help="an open room anyone on the network can join and read")
     p.add_argument("--with", dest="with_", help="first members besides you, comma separated")
     p.add_argument("--history", choices=["full", "since-join"], default="full",
                    help="what a member added later can read (default full)")

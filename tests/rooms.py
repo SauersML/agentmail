@@ -116,10 +116,10 @@ def main():
                                                                           token(agent))[1].get("agents", [])}, timeout=30)
             check("%s's host knows every agent" % agent, got, "%.1fs" % t)
 
-        # DMs: one room whoever starts it; `send --private` to one agent with no thread lands there too.
+        # DMs: one room whoever starts it; `send` to one agent with no thread lands there too.
         rc, out = cl("alice", "dm", "ops.bob", "hi from alice")
         check("dm posts", rc == 0 and "your DM with ops.bob" in out, out[-160:])
-        rc, out = cl("ops.bob", "send", "--private", "--to", "alice", "hi back")
+        rc, out = cl("ops.bob", "send", "--to", "alice", "hi back")
         check("private send to one agent goes to the DM room", rc == 0, out[-160:])
         dm = "dm:alice+ops.bob"
         for agent in ("alice", "ops.bob"):
@@ -130,7 +130,7 @@ def main():
         check("the third agent does not see the DM", dm not in rooms("dev.carol"))
 
         # A plain thread is an open room.
-        rc, out = cl("alice", "send", "--to", "all", "--thread", "release", "plan v1 is out")
+        rc, out = cl("alice", "send", "--open", "--to", "all", "--thread", "release", "plan v1 is out")
         rc2, out2 = cl("ops.bob", "room", "send", "release", "ack from ops")
         check("thread mail and a room post in the same open room", rc == 0 and rc2 == 0, (out + out2)[-200:])
         got, t = wait_for(lambda: texts("dev.carol", "release") == ["plan v1 is out", "ack from ops"], timeout=20)
@@ -142,7 +142,7 @@ def main():
         check("rooms shows unread counts (read marks them read)", unread == 0, str(unread))
 
         # A private room; carol, added later, reads the earlier history through a key grant.
-        rc, out = cl("alice", "room", "create", "plan", "--private", "--with", "ops.bob", "--topic", "ship it")
+        rc, out = cl("alice", "room", "create", "plan", "--with", "ops.bob", "--topic", "ship it")
         check("create a private room", rc == 0 and "alice/plan" in out, out[-160:])
         cl("alice", "room", "send", "alice/plan", "secret one")
         got, t = wait_for(lambda: "secret one" in texts("ops.bob", "alice/plan"), timeout=20)
@@ -165,7 +165,7 @@ def main():
               and info["topic"] == "ship it" and info["creator"] == "alice", json.dumps(info)[:240])
 
         # "since join": no grants, no history.
-        rc, out = cl("alice", "room", "create", "quiet", "--private", "--history", "since-join", "--with", "ops.bob")
+        rc, out = cl("alice", "room", "create", "quiet", "--history", "since-join", "--with", "ops.bob")
         cl("alice", "room", "send", "alice/quiet", "before carol")
         rc, out = cl("alice", "room", "add", "alice/quiet", "dev.carol")
         check("adding to a since-join room says so", rc == 0 and "only messages from now on" in out, out[-200:])
@@ -448,7 +448,7 @@ def issue12_checks(cl, js, req, api, token, bg, orig):
     check("--dm to your own message is refused", rc != 0, out[-120:])
 
     # Order: by signed time, replies right under their parent; watch still fires on arrival.
-    cl("alice", "room", "create", "order")
+    cl("alice", "room", "create", "order", "--open")
     cl("alice", "room", "send", "alice/order", "A first")
     cl("alice", "room", "send", "alice/order", "B second")
     a = [m for m in js("alice", "room", "read", "alice/order")["messages"] if m["text"] == "A first"][0]

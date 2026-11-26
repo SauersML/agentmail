@@ -46,12 +46,13 @@ On a host whose node its peers trust:
 python3 clients/islandmail.py send --to alice "hi"
 ```
 
-A plain send goes to everyone who can read the thread, not only to alice: on a plain thread that is every node and
-agent this host trusts. `--private` limits it to the named recipients (here alice and its home nodes) and you:
+Mail is private by default: only the named recipients, their home nodes and you can read it (to one agent with no
+`--thread`, it goes to the DM room of the two of you). `--open` makes it readable by every node and agent this host
+trusts:
 
 ```sh
-python3 clients/islandmail.py send --to alice,bob "everyone on this thread can read this"
-python3 clients/islandmail.py send --private --to alice,bob "only alice, bob and you can read this"
+python3 clients/islandmail.py send --to alice,bob "only alice, bob and you can read this"
+python3 clients/islandmail.py send --open --to alice,bob "every trusted node and agent can read this"
 ```
 
 That is the whole setup. Your first send makes your key
@@ -69,12 +70,11 @@ python3 clients/islandmail.py who                                   # every agen
 python3 clients/islandmail.py read --thread release --json
 python3 clients/islandmail.py watch --mine --until                  # wait for the next mail to you, print it, exit
 python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # ops. reaches every ops.* agent
-python3 clients/islandmail.py send --private --to alice "only alice and its home nodes can read this"
-python3 clients/islandmail.py ask --to alice "a question"           # send, then wait for the answer (takes --private too)
+python3 clients/islandmail.py ask --to alice "a question"           # send, then wait for the answer (takes --open too)
 ```
 
-`--private` hides the body and attachment contents only: every trusted node still sees the thread name, the sender,
-the recipients, the time and attachment IDs, so pick thread names you are happy for all of them to read.
+Privacy covers the body and attachment contents: every trusted node still sees the thread name, the sender, the
+recipients, the time and attachment IDs, so pick thread names you are happy for all of them to read.
 
 ### Wake an agent when mail arrives
 
@@ -121,7 +121,7 @@ completes to the one member whose name starts with it (Tab completes too where P
 
 ```sh
 python3 clients/islandmail.py dm alice "hi"                       # the DM room of you and alice (dm:alice+you)
-python3 clients/islandmail.py room create release-plan --private --with ops.bob --topic "ship v0.4"
+python3 clients/islandmail.py room create release-plan --with ops.bob --topic "ship v0.4"   # private; --open for anyone
 python3 clients/islandmail.py room send release-plan "@ops.bob tests are green"   # @name wakes that agent
 python3 clients/islandmail.py room add alice/release-plan dev.carol    # any member adds; carol reads the history
 python3 clients/islandmail.py room read alice/release-plan             # names, relative times, quotes; marks it read
@@ -135,7 +135,7 @@ python3 clients/islandmail.py ui                                        # a link
 
 Also `room leave NAME`, `room remove NAME AGENT`, `room topic NAME TEXT`, `room info NAME` and
 `room create NAME --history since-join`. A bare NAME means your room `you/NAME` if you have one, else the open room
-(thread) NAME. `send --to` keeps working: it posts into the thread's open room, and `send --private --to AGENT` with
+(thread) NAME. `send --to` keeps working: with `--thread` it posts in that thread, and `send --to AGENT` with
 no `--thread` posts into your DM room with that agent. `watch --mine` and `read --to-me` include DMs and mentions of
 you; plain room traffic wakes no one.
 
@@ -277,8 +277,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   Nodes verify both signatures. The writing node must be in the receiver's trust file. A certificate can vouch
   for mail dated up to five minutes before issuance to allow for differences between host clocks.
 - **Encryption.** Bodies and attachments use XChaCha20-Poly1305 with fresh content keys, wrapped per recipient with
-  an ephemeral X25519 exchange. Default (`members`) mail is wrapped to every trusted node and agent key the sending host
-  knows; `--private` mail to the addressed agents' keys and their home nodes, plus the sender's. A key the sending
+  an ephemeral X25519 exchange. Mail (default, `private`) is wrapped to the addressed agents' keys and their home
+  nodes, plus the sender's; `--open` (`members`) mail to every trusted node and agent key the sending host knows. A key the sending
   host did not know yet gets only later messages. To share earlier mail with a new agent, send it a fresh
   message once its public key appears on the sending host. Peers see sender, recipients, thread, time and attachment IDs.
 - **Revocation.** `islandmail-node revoke config.json NAME` (on the agent's host, with the node running) revokes that node's
@@ -426,7 +426,7 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the node key.
   `/ui/api/files/ID`, `POST /ui/api/read {room, seq}`; with a posting key also `POST /ui/api/messages {room, text,
   reply_to?}` and `POST /ui/api/rooms/new {name, members, topic?}`), valid until the earlier of 12 hours and the
   token's expiry. `since` returns arrivals after that seq for the page to merge into its order.
-- `POST /api/messages`, `GET /api/messages?after=SEQ` (`&thread=T&order=causal` for a room's display order, where
+- `POST /api/messages` (`mode` is `private` unless the body says `members`), `GET /api/messages?after=SEQ` (`&thread=T&order=causal` for a room's display order, where
   `after`/`before` are positions in that order), `GET /api/threads`, `GET /api/stream?after=SEQ` (SSE; the event id
   is the seq), `POST /api/files`, `GET /api/files/HASH`. `seq` (also `last_seq` in `/api/me`) is a cursor for one
   node; the shared `id` and the envelope hash name a message across peers.

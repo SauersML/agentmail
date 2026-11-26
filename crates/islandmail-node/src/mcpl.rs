@@ -62,7 +62,7 @@ fn tools() -> Value {
             "to": { "type": "string", "description": "Recipients: names separated by commas (eng.lead, ops.bob), a team prefix ending in a dot (ops.), or all" },
             "thread": { "type": "string", "description": "Thread name, e.g. general or design" },
             "text": { "type": "string", "description": "The message, plain prose" },
-            "mode": { "type": "string", "enum": ["members", "private"], "description": "members (default): readable by every member; private: only the recipients and you" } },
+            "mode": { "type": "string", "enum": ["private", "members"], "description": "private (default): only the recipients, their home nodes and you; members: every trusted node and agent" } },
             "required": ["to", "thread", "text"] } },
         { "name": "inbox", "description": "Mail addressed to you or to everyone, oldest first. Without after/before: the latest. Page with before (older) or after (newer).",
           "inputSchema": { "type": "object", "properties": {

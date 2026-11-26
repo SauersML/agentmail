@@ -104,7 +104,7 @@ def main():
         check("and its uncertified key is not kept", not os.path.exists(os.path.join(walkin, "identities", "dev.mallory.json")))
         rc, out = cl(walkin, "whoami")
         check("first use with the default name is refused too", rc != 0 and "403" in out, out[-240:])
-        rc, out = cl(user_dir, "--as", "dev.alice", "send", "--to", "dev.alice", "note to self")
+        rc, out = cl(user_dir, "--as", "dev.alice", "send", "--open", "--to", "dev.alice", "note to self")
         check("the held identity sends mail", rc == 0 and out.startswith("sent "), out[-200:])
     finally:
         node.stop()

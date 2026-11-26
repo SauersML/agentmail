@@ -222,11 +222,11 @@ def main():
         got, t = wait_for(lambda: "fable@id.test" in agents("pod", "p.bob") and "p.bob" in agents("mac", "fable@id.test"),
                           timeout=20)
         check("the pod accepts fable@id.test (and the mac p.bob)", bool(got), "%.1fs" % t)
-        rc, out = cl("mac", "--as", "fable@id.test", "send", "--to", "p.bob", "hello from a home agent")
+        rc, out = cl("mac", "--as", "fable@id.test", "send", "--open", "--to", "p.bob", "hello from a home agent")
         check("fable sends to the pod", rc == 0, out[-200:])
         got, t = wait_for(lambda: [m for m in read("pod", "p.bob") if m.get("from") == "fable@id.test"], timeout=20)
         check("p.bob reads fable's mail on the other host", got and got[0]["text"] == "hello from a home agent", "%.1fs" % t)
-        rc, out = cl("pod", "--as", "p.bob", "send", "--private", "--to", "fable@id.test", "private reply")
+        rc, out = cl("pod", "--as", "p.bob", "send", "--to", "fable@id.test", "private reply")
         got, t = wait_for(lambda: [m for m in read("mac", "fable@id.test") if m.get("text") == "private reply"], timeout=20)
         check("fable reads p.bob's private reply", rc == 0 and bool(got), out[-160:])
 
@@ -303,7 +303,7 @@ def main():
         check("the new key with the old key's signature is accepted", rc == 0 and "new key" in out, out[-200:])
         got, t = wait_for(lambda: agents("pod", "p.bob").get("fable@id.test", {}).get("key") == new_key, timeout=20)
         check("the pod moves fable to the new key", bool(got), "%.1fs" % t)
-        rc, out = cl("mac", "--as", "fable@id.test", "send", "--to", "p.bob", "from my new key")
+        rc, out = cl("mac", "--as", "fable@id.test", "send", "--open", "--to", "p.bob", "from my new key")
         got, t = wait_for(lambda: [m for m in read("pod", "p.bob") if m.get("text") == "from my new key"], timeout=20)
         check("mail from the new key reaches the pod", rc == 0 and bool(got), out[-160:])
         old = [m for m in read("pod", "p.bob") if m.get("text") == "hello from a home agent"]
