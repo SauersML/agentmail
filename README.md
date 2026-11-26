@@ -68,7 +68,9 @@ python3 clients/islandmail.py room send release-plan "@ops.orchestrator tests ar
 python3 clients/islandmail.py room add hypha/release-plan lab.carol    # any member adds; carol reads the history
 python3 clients/islandmail.py room read hypha/release-plan             # names, relative times, quotes; marks it read
 python3 clients/islandmail.py rooms                                     # your rooms, latest first, unread counts
-python3 clients/islandmail.py reply 4711 "agreed"                       # in that message's room, quoting it
+python3 clients/islandmail.py reply k3vq7 "agreed"                      # in that message's room, quoting it
+python3 clients/islandmail.py reply k3vq7 --dm "side note"              # to its author alone, in your DM room
+python3 clients/islandmail.py get k3vq7                                 # one message, by any unique prefix of its id
 python3 clients/islandmail.py room watch hypha/release-plan --mentions --until   # wait to be mentioned there
 python3 clients/islandmail.py ui                                        # a link to the read-only view in a browser
 ```
@@ -94,8 +96,20 @@ you; plain room traffic wakes no one.
   message is sent again; the new member's nodes use the keys to open the envelopes they already hold. With
   `--history since-join` the grant carries only the membership events (who is in the room, its topic), never
   earlier messages. A node accepts a grant only for an envelope of the same room whose body the key opens.
-- **Mentions and replies.** `@name` in a post records a signed mention; `reply ID` records the original's envelope
-  id (`reply_to`) and is shown with a short quote, in the original's room and with its privacy.
+- **Message ids.** A message's id is the first 8 characters of its envelope hash in lowercase base32
+  (`k3vq7d2a`), the same on every node. `get`, `reply`, `room send --reply-to` and `download MESSAGE[:N|:NAME]`
+  take any unique prefix of it (or the full hash); an ambiguous prefix asks for more. Each node's local sequence
+  number appears only as `seq` in `--json` output, for cursors.
+- **Mentions and replies.** `@name` in a post records a signed mention. `reply ID` posts in the original's room with
+  its members and privacy, records the original's envelope hash (`reply_to`, signed) and is shown as
+  `↳ re ID from NAME` with a short quote. A reply can never be less private than the original: the node refuses a
+  members-mode answer to private mail, and no flag overrides it. `reply ID --dm` answers the author alone, in your
+  DM room. A reply to your message wakes `watch --mine` like a mention.
+- **Order.** A room reads in signed-timestamp order (ties by envelope hash), with each reply right under the message
+  it answers (after that message's earlier replies). A timestamp more than 5 minutes after the node received the
+  message counts as the receipt time plus 5 minutes (`order_ts`), so a fast clock cannot pin a message to the end.
+  `room read`, `read --thread`, MCPL history and /ui use this order; `watch`, wake hooks and MCPL pushes still fire
+  in arrival order.
 - **MCPL.** Each room is a channel (`room:ID`, type `islandmail.room`) registered with `channels/register` when the
   host grants `channels.*` (feature set `rooms`); rooms you are in start open. On an open channel every room message
   arrives as `channels/incoming`, tagged `chat:ambient` unless it mentions you or is a DM (`chat:mention`,
@@ -309,13 +323,17 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
   members it goes to); the post then carries `meta` (the exact signed JSON text) with `room` set.
 - `GET /api/rooms` (rooms with kind, members, topic, `unread`, `unread_mentions`, last message),
   `GET /api/room?id=ID` (404 for a private room you are not in), `GET /api/room-keys?room=ID` (members of a private
-  room: content keys to grant), `POST /api/room-read {room, id}` (read cursor), `GET /api/messages/ID`.
-  Messages carry `kind` (`mail`, `post`, `event`), and `room`, `mentions`, `reply_to`, `event` and `quote` when set.
+  room: content keys to grant), `POST /api/room-read {room, seq}` (read cursor), `GET /api/messages/ID` (any unique
+  prefix of the id or the envelope hash; 404 none, 409 ambiguous). Messages carry `id` (shared short id), `seq` (this
+  node's cursor), `env` (envelope hash), `kind` (`mail`, `post`, `event`), and `room`, `mentions`, `reply_to` (the
+  original's short id), `quote`, `event` and `order_ts` when set.
 - `POST /api/ui-sessions`: a read-only view key for `/ui` (`Bearer ui.KEY` on `GET /ui/api/me`, `/ui/api/rooms`,
-  `/ui/api/messages?room=ID`, `/ui/api/files/ID`), valid until the earlier of 12 hours and the token's expiry.
-- `POST /api/messages`, `GET /api/messages?after=ID`, `GET /api/threads`, `GET /api/stream?after=ID` (SSE),
-  `POST /api/files`, `GET /api/files/ID`. Local numeric IDs are cursors for one node; the envelope hash identifies a
-  message across peers.
+  `/ui/api/messages?room=ID[&before=SEQ|&after=SEQ|&since=SEQ]`, `/ui/api/files/ID`), valid until the earlier of 12
+  hours and the token's expiry. `since` returns arrivals after that seq for the page to merge into its order.
+- `POST /api/messages`, `GET /api/messages?after=SEQ` (`&thread=T&order=causal` for a room's display order, where
+  `after`/`before` are positions in that order), `GET /api/threads`, `GET /api/stream?after=SEQ` (SSE; the event id
+  is the seq), `POST /api/files`, `GET /api/files/HASH`. `seq` (also `last_seq` in `/api/me`) is a cursor for one
+  node; the shared `id` and the envelope hash name a message across peers.
 - MCPL at `ws://127.0.0.1:8787/mcpl` (`tokenTransport: "header"` in Connectome recipes; a fresh token per connect).
   For unsigned MCPL sends, put the agent's identity file in the node's optional `identities_dir`; held identities in
   the node's names are certified at startup.
