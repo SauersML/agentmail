@@ -531,11 +531,20 @@ a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, 
 in `.`), `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`) and optional
 `homes` (identity homes: `name`, `iss`, `key`, `suffix`, optional `kg`; see above).
 
-**Versions.** Envelope version 1, sync ALPN `islandmail/sync/2` (sealed envelopes; a node on `islandmail/sync/1` is refused both ways with "peer runs an incompatible wire format" in the log), trust file version 1, store format 1. These
-restarted at 1, with new protocol strings and signature contexts, in a clean break: earlier nodes cannot peer with
-these, and their data directories and trust files are refused, not converted. A data directory belongs to its node key and network. If a peer advertises a truncated trust snapshot,
-the receiver fetches each locally trusted issuer's records separately. Room fields travel as an optional `meta` in
-the encrypted body (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`), covered by the sender's digest
+**Compatibility.** From v0.1.0 on, upgrading never needs a reset or a rejoin: a new build reads every store,
+trust file, config and envelope an earlier release wrote. At first start it migrates an older store, trust file or
+config in place, once, keeping the old file as `NAME.vN.bak`. Nodes of different builds sync over the newest
+protocol both speak; when they share none, both log which one must upgrade ("please upgrade"). A file written by a
+newer build is refused with "upgrade islandmail-node". All versions are in `crates/islandmail-core/src/versions.rs`
+(and `GET /api/node` under `versions`), migrations in `crates/islandmail-node/src/migrate.rs`, and
+`tests/upgrade.py` checks every push against the previous release.
+
+**Versions.** Envelope version 1, sync `islandmail/sync/2` (offered with every other sync version a build speaks;
+the newest common one wins), trust file version 1, config version 1 (`"v"`, optional), store format 1. Pre-release
+nodes on `islandmail/sync/1` are refused both ways with "peer runs an incompatible wire format" in the log. A data
+directory belongs to its node key and network. If a peer advertises a truncated trust snapshot, the receiver fetches
+each locally trusted issuer's records separately. Room fields travel as an optional `meta` in the encrypted body
+(JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`), covered by the sender's digest
 (`PAE("islandmail/body-meta/v1", meta)` after the attachments).
 
 **CLI.** `islandmail-node run CONFIG`, `keygen SEED_FILE`, `pubkey SEED_FILE`, `network-id`,

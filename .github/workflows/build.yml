@@ -121,10 +121,44 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  # Upgrade without rejoin: nodes on the previous release (the newest earlier v* tag, else tests/upgrade-baseline)
+  # with mail, a room, a joined outsider and a pending invite, swapped one by one to this build.
+  upgrade:
+    runs-on: ubuntu-22.04
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - run: rustup default stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: upgrade-ubuntu-22.04
+          workspaces: |
+            . -> target
+            ../previous -> target
+      - name: Build the previous release and this one
+        run: |
+          base=$(git tag -l 'v*' --sort=-v:refname --no-contains HEAD | head -n 1)
+          [ -n "$base" ] || base=$(grep -v '^#' tests/upgrade-baseline | head -n 1)
+          echo "upgrading from $base"
+          git worktree add ../previous "$base"
+          (cd ../previous && cargo build --locked --release -p islandmail-node)
+          cargo build --locked --release -p islandmail-node
+      - name: Upgrade without rejoin
+        run: |
+          python3 -m venv "$RUNNER_TEMP/up"
+          "$RUNNER_TEMP/up/bin/python" -m pip install -r clients/requirements.txt
+          "$RUNNER_TEMP/up/bin/python" tests/upgrade.py --old-bin ../previous/target/release/islandmail-node \
+            --old-islandmail ../previous/clients/islandmail.py --bin target/release/islandmail-node \
+            --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/upgrade"
+
   # A pushed tag v* publishes a release from the binaries built and tested above at that exact commit.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, upgrade]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
