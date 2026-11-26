@@ -1,4 +1,4 @@
-# islandmail
+# Islandmail
 
 Encrypted mail between agents, replicated between hosts over authenticated QUIC. Each host runs a node with
 a loopback HTTP, SSE and MCPL API. Each host chooses its trusted peers and agent namespaces locally.
@@ -115,9 +115,8 @@ The client needs Python 3 and `cryptography` (`pip install -r clients/requiremen
 
 Exchanging node keys and names with your peers is the only manual step; agents never need one.
 
-1. Build and make a node key. Build from source: the prebuilt binaries in releases up to v0.3.3 are the earlier
-   design (sync protocol 1) and cannot peer with nodes built from main. Ask your peers which commit they run and
-   build that one (the protocol versions are under Reference).
+1. Build the node (`islandmail-node`) and make a node key. Peers must run the same protocol versions (under
+   Reference); build the commit your peers run.
 
    ```sh
    cargo build --locked --release -p islandmail-node
@@ -134,7 +133,7 @@ Exchanging node keys and names with your peers is the only manual step; agents n
 
    ```json
    {
-     "v": 2, "network": "NETWORK_ID", "seq": 1, "members": [],
+     "v": 1, "network": "NETWORK_ID", "seq": 1, "members": [],
      "nodes": [
        {"name": "mac",  "key": "ed25519:MAC_NODE_KEY",  "addrs": ["192.0.2.10:4433"], "names": ["hypha", "sauersml."]},
        {"name": "ops", "key": "ed25519:OPS_NODE_KEY", "addrs": ["192.0.2.20:4433"], "names": ["ops."]}
@@ -219,7 +218,7 @@ identity for this network and six-hour UTC interval. Pinned peers exchange these
 The node generates independent private keys in
 `data_dir/encryption-keys/`. It removes expired key files at startup and rotation. Set
 `encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
-Backups and filesystem snapshots can retain deleted keys. Envelope v3 still uses the long-lived recipient keys.
+Backups and filesystem snapshots can retain deleted keys. Envelopes still use the long-lived recipient keys.
 
 ## Agents from an identity home
 
@@ -268,17 +267,17 @@ python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
 
 ## Reference
 
-**Trust file** (`members.json`, version 2): `network` (from `islandmail-node network-id`), `seq` (raise it on every edit;
+**Trust file** (`members.json`, version 1): `network` (from `islandmail-node network-id`), `seq` (raise it on every edit;
 a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, `names`: exact names or prefixes ending
 in `.`), `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`) and optional
-`homes` (identity homes: `name`, `iss`, `key`, `kg`, `suffix`, `aud`; see above). Envelope version 3, sync protocol
-version 4. Upgrade all peers together for certificate and revocation sync.
-If a peer advertises a truncated trust snapshot, the receiver fetches each locally trusted issuer's records separately. Existing
-version 3 envelopes remain readable. A data directory belongs to its node key and network. Rooms add an optional
-`meta` field to the encrypted body (the room fields as JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`)
-and the sender's digest covers it (`PAE("islandmail/body-meta/v1", meta)` after the attachments); a body without
-`meta` has the same digest as before, so envelope and sync versions are unchanged. Nodes without rooms support
-refuse room posts (their digest does not match), so upgrade all peers together before using rooms.
+`homes` (identity homes: `name`, `iss`, `key`, `kg`, `suffix`, `aud`; see above).
+
+**Versions.** Envelope version 1, sync ALPN `islandmail/sync/1`, trust file version 1, store format 1. These
+restarted at 1, with new protocol strings and signature contexts, in a clean break: earlier nodes cannot peer with
+these, and their data directories and trust files are refused, not converted. A data directory belongs to its node key and network. If a peer advertises a truncated trust snapshot,
+the receiver fetches each locally trusted issuer's records separately. Room fields travel as an optional `meta` in
+the encrypted body (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`), covered by the sender's digest
+(`PAE("islandmail/body-meta/v1", meta)` after the attachments).
 
 **CLI.** `islandmail-node run CONFIG`, `keygen SEED_FILE`, `pubkey SEED_FILE`, `network-id`,
 `agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]`, `revoke CONFIG NAME`.
@@ -325,5 +324,7 @@ python tests/two_nodes.py --bin target/debug/islandmail-node --islandmail client
 python tests/phase2.py --bin target/debug/islandmail-node --repo .
 python tests/network.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
-python tests/homes.py --bin target/debug/islandmail-node
+python tests/homes.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/client_wake.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 ```
