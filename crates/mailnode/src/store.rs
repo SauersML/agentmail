@@ -450,22 +450,13 @@ impl Store {
     /// Thread heads: envelopes of the thread no other envelope of it names as a parent (latest 16 by ts).
     pub fn heads(&self, thread: &str) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id, ts, parents FROM messages WHERE thread = ?")?;
-        let rows: Vec<(String, String, String)> =
-            st.query_map([thread], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        let mut referenced = HashSet::new();
-        for (_, _, p) in &rows {
-            for id in serde_json::from_str::<Vec<String>>(p).unwrap_or_default() {
-                referenced.insert(id);
-            }
-        }
-        let mut heads: Vec<(String, String)> =
-            rows.into_iter().filter(|(id, _, _)| !referenced.contains(id)).map(|(id, ts, _)| (ts, id)).collect();
-        heads.sort();
-        heads.reverse();
-        heads.truncate(mailcore::envelope::MAX_PARENTS);
-        let mut ids: Vec<String> = heads.into_iter().map(|(_, id)| id).collect();
-        ids.sort();
+        let mut st = db.prepare("SELECT env_id FROM (
+            SELECT env_id FROM messages WHERE thread = ?1 AND env_id NOT IN (
+                SELECT p.value FROM messages m, json_each(m.parents) p WHERE m.thread = ?1
+            ) ORDER BY ts DESC, env_id DESC LIMIT ?2
+        ) ORDER BY env_id")?;
+        let ids = st.query_map(params![thread, mailcore::envelope::MAX_PARENTS as i64], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(ids)
     }
 
