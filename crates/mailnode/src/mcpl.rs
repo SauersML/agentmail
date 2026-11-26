@@ -2,7 +2,6 @@
 //! in cursor order and waits for acknowledgement before sending the next one.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
 use mailcore::{now_millis, now_ts};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, oneshot};
 
 use crate::api::{bearer, AppState};
 use crate::node::{ApiError, Caller, Node};
@@ -66,41 +65,28 @@ fn tools() -> Value {
     ])
 }
 
-type OpenSocket = (u64, mpsc::UnboundedSender<(u16, String)>);
-
 /// Open MCPL sockets per agent, so a new connection can replace the agent's oldest.
 #[derive(Default)]
 pub struct Sockets {
-    next: AtomicU64,
-    open: Mutex<HashMap<String, Vec<OpenSocket>>>,
+    open: Mutex<HashMap<String, Vec<oneshot::Sender<()>>>>,
 }
 
 impl Sockets {
-    fn register(&self, sub: &str) -> Result<(u64, mpsc::UnboundedReceiver<(u16, String)>), ApiError> {
+    fn register(&self, sub: &str) -> Result<oneshot::Receiver<()>, ApiError> {
         let mut open = self.open.lock().unwrap();
-        let mine = open.entry(sub.to_string()).or_default();
-        mine.retain(|(_, tx)| !tx.is_closed());
-        while mine.len() >= MAX_SOCKETS_PER_SUB {
-            let (_, tx) = mine.remove(0);
-            let _ = tx.send((4000, "replaced by a newer connection from the same agent".into()));
-        }
-        if open.values().map(|v| v.len()).sum::<usize>() >= MAX_SOCKETS {
+        // The receiver also drops when an HTTP upgrade fails before the WebSocket task starts.
+        open.retain(|_, slots| {
+            slots.retain(|s| !s.is_closed());
+            !slots.is_empty()
+        });
+        if let Some(slots) = open.get_mut(sub).filter(|s| s.len() >= MAX_SOCKETS_PER_SUB) {
+            let _ = slots.remove(0).send(());
+        } else if open.values().map(Vec::len).sum::<usize>() >= MAX_SOCKETS {
             return Err(ApiError::new(503, "too many open connections; try again soon"));
         }
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        open.entry(sub.to_string()).or_default().push((id, tx));
-        Ok((id, rx))
-    }
-
-    fn unregister(&self, sub: &str, id: u64) {
-        let mut open = self.open.lock().unwrap();
-        if let Some(v) = open.get_mut(sub) {
-            v.retain(|x| x.0 != id);
-            if v.is_empty() {
-                open.remove(sub);
-            }
-        }
+        let (replace, replaced) = oneshot::channel();
+        open.entry(sub.to_owned()).or_default().push(replace);
+        Ok(replaced)
     }
 }
 
@@ -118,17 +104,12 @@ pub async fn handler(
         Ok(w) => w,
         Err(e) => return e.into_response(),
     };
-    let (id, kill) = match s.sockets.register(&who.sub) {
+    let replaced = match s.sockets.register(&who.sub) {
         Ok(x) => x,
         Err(e) => return e.into_response(),
     };
     let _ = s.node.store.seen(&who.name, &who.sub, now_millis());
-    ws.max_message_size(MAX_WS_FRAME * 2).on_upgrade(move |socket| async move {
-        let sub = who.sub.clone();
-        let sockets = s.sockets.clone();
-        run(socket, s.node.clone(), who, kill).await;
-        sockets.unregister(&sub, id);
-    })
+    ws.max_message_size(MAX_WS_FRAME * 2).on_upgrade(move |socket| run(socket, s.node, who, replaced))
 }
 
 struct Conn {
@@ -143,7 +124,7 @@ struct Conn {
     closed: bool,
 }
 
-async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::UnboundedReceiver<(u16, String)>) {
+async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut replaced: oneshot::Receiver<()>) {
     let (mut sink, mut stream) = socket.split();
     let mut events = node.events.subscribe();
     let mut trust = node.trust.subscribe();
@@ -174,7 +155,10 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut kill: mpsc::Un
                 Err(_) => break,
             },
             _ = trust.changed() => if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed") },
-            k = kill.recv() => { if let Some((code, reason)) = k { c.close(code, &reason) } else { break } },
+            r = &mut replaced => match r {
+                Ok(()) => c.close(4000, "replaced by a newer connection from the same agent"),
+                Err(_) => break,
+            },
             _ = tick.tick() => {
                 if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed"); }
                 else if c.pending.as_ref().is_some_and(|(_, _, since)| since.elapsed() >= Duration::from_secs(60)) {
@@ -486,4 +470,22 @@ impl Conn {
 /// MCPL capability paths: a grant of "channels" covers "channels.incoming".
 fn capability_in(grant: &[String], cap: &str) -> bool {
     grant.iter().any(|g| g == cap || cap.starts_with(&format!("{g}.")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_limits_count_only_live_receivers() {
+        let sockets = Sockets::default();
+        let mut live: Vec<_> = (0..MAX_SOCKETS).map(|i| sockets.register(&i.to_string()).unwrap()).collect();
+        assert!(sockets.register("next").is_err());
+        live.pop();
+        let _next = sockets.register("next").unwrap();
+        drop(live);
+        let mut same: Vec<_> = (0..=MAX_SOCKETS_PER_SUB).map(|_| sockets.register("same").unwrap()).collect();
+        assert!(same[0].try_recv().is_ok());
+        assert!(same[1..].iter_mut().all(|s| matches!(s.try_recv(), Err(oneshot::error::TryRecvError::Empty))));
+    }
 }
