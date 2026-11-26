@@ -26,7 +26,7 @@ fuzz_target!(|i: In| {
     p.extend_from_slice(&i.nonce);
     p.extend_from_slice(i.rest);
     if let Ok(inv) = invite::read_invite(&world::sign_invite(&key, &p), now) {
-        assert!(inv.exp > now && islandmail_core::cert::valid_name(&inv.name));
+        assert!(inv.exp > now && invite::split_names(&inv.name).is_ok());
         assert_eq!(inv.node.key, islandmail_core::keys::fmt_key(&key.public()));
     }
     // The reply layout has no expiry.
@@ -36,7 +36,7 @@ fuzz_target!(|i: In| {
     r.extend_from_slice(&i.nonce);
     r.extend_from_slice(i.rest);
     if let Ok(rep) = invite::read_reply(&world::sign_reply(&key, &r)) {
-        assert!(islandmail_core::cert::valid_name(&rep.name));
+        assert!(invite::split_names(&rep.name).is_ok(), "a reply names one or more exact names");
         assert_eq!(rep.node.names.len(), 0);
     }
 });
