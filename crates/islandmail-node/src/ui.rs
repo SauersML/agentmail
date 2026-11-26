@@ -177,6 +177,9 @@ pub async fn messages(State(s): State<AppState>, Viewer(who): Viewer, RawQuery(r
                            else { node.store.thread_causal(&room, &who, &q, MAX_TEXT)? };
         let senders = node.store.room_senders(&room)?;
         let info = node.room_info(&who, &room, &senders)?;
+        if crate::api::room_hidden(&info, &who) {
+            return Err(ApiError::new(404, format!("no room {room} here (private rooms are invite-only)")));
+        }
         Ok(json!({ "room": info, "messages": messages_json(&node, &rows, &who), "more": more }))
     }).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(out, 200))

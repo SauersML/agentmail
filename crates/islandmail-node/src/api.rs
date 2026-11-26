@@ -386,14 +386,19 @@ async fn room(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
     let id = p.get("id").ok_or_else(|| ApiError::new(400, "missing id"))?;
     let senders = s.node.store.room_senders(id)?;
     let info = s.node.room_info(&who, id, &senders)?;
-    // An undiscoverable private room: only a member (or a former one) learns that it exists.
-    let me = islandmail_core::addr::norm(&who.name);
-    let private = info["kind"] != "open";
-    let known = info["member"] == true || info["former"].as_array().is_some_and(|f| f.iter().any(|n| n.as_str() == Some(me.as_str())));
-    if (private && !known) || info["created"] == false {
+    if room_hidden(&info, &who) {
         return Err(ApiError::new(404, format!("no room {id} here (private rooms are invite-only)")));
     }
     Ok(json_resp(json!({ "room": info }), 200))
+}
+
+/// An undiscoverable private room: only a member (or a former one) learns that it exists, its members or its topic.
+/// The node folds the events it can read for any of its agents, so every view of `room_info` must ask this first.
+pub fn room_hidden(info: &Value, who: &Caller) -> bool {
+    let me = islandmail_core::addr::norm(&who.name);
+    let private = info["kind"] != "open";
+    let known = info["member"] == true || info["former"].as_array().is_some_and(|f| f.iter().any(|n| n.as_str() == Some(me.as_str())));
+    (private && !known) || info["created"] == false
 }
 
 async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {

@@ -279,6 +279,13 @@ def main():
         check("/ui JSON needs a view key (an agent token is not one)", st == 401 and st2 == 401, "%d %d" % (st, st2))
         st, _ = req("POST", api["mac"], "/ui/api/rooms", "ui." + key, {})
         check("/ui is read-only", st == 405, str(st))
+        # A local agent of a member's node that is not in the room learns nothing about it from /ui, as from GET /api/room.
+        home["ops.eve"], user["ops.eve"] = "pod", "eve"
+        rc, out = cl("ops.eve", "ui")
+        ekey = out.split("#k=")[1].split()[0] if "#k=" in out else ""
+        st, body = req("GET", api["pod"], "/ui/api/messages?room=alice/plan&limit=50", "ui." + ekey)
+        check("/ui/api/messages hides a private room from a non-member", rc == 0 and ekey and st == 404
+              and "ops.bob" not in json.dumps(body), "%s %s" % (st, json.dumps(body)[:200]))
     finally:
         for n in nodes.values():
             n.stop()
