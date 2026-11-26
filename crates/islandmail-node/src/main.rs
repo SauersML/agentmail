@@ -5,6 +5,7 @@
 //!   islandmail-node pubkey SEED_FILE
 //!   islandmail-node network-id
 //!   islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
+//!   islandmail-node invite-info INVITE                     (checks an invite and prints what it holds, as JSON)
 //!   islandmail-node revoke CONFIG.json NAME                (the running node revokes its certificates for NAME)
 
 mod api;
@@ -26,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use islandmail_core::keys::fmt_key;
 
 const USAGE: &str = "usage:\n  islandmail-node run CONFIG.json\n  islandmail-node keygen SEED_FILE\n  islandmail-node pubkey SEED_FILE\n  \
-     islandmail-node network-id\n  islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  islandmail-node revoke CONFIG.json NAME";
+     islandmail-node network-id\n  islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  islandmail-node revoke CONFIG.json NAME\n  islandmail-node invite-info INVITE";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -69,6 +70,10 @@ async fn main() -> Result<()> {
                 bail!("TTL_SECS must be 1 to {}", islandmail_core::agent_token::MAX_LIFETIME_S);
             }
             println!("{}", islandmail_core::agent_token::mint(&seed, name, sub, &node, islandmail_core::now_millis(), ttl));
+            Ok(())
+        }
+        Some("invite-info") if args.len() == 2 => {
+            println!("{}", invite::info(&args[1]).map_err(anyhow::Error::msg)?);
             Ok(())
         }
         Some("revoke") if args.len() == 3 => revoke(Path::new(&args[1]), &args[2]),

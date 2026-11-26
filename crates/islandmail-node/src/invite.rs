@@ -3,9 +3,20 @@
 //! this node's key (`operator_statement`), as `islandmail.py invite / join / accept` do. The node writes its own
 //! trust file (seq + 1, other entries kept) and adopts it at once.
 //!
-//!   islandmail-invite1.<b64u payload JSON>.<b64u sig over "islandmail/invite/v1\n" + payload>
-//!   islandmail-reply1.<b64u payload JSON>.<b64u sig over "islandmail/invite-reply/v1\n" + payload>
+//! Both are short base58 strings of raw bytes (str = u8 length + UTF-8; u32 big-endian):
+//!
+//!   im1 + base58(flags u8 | network 32 | node key 32 | exp u32 (unix s) | ticket 16 | name str
+//!                | [from str] | [room str] | [names: n u8, n str] | [addrs] | [relay URLs: n u8, n str] | sig 64)
+//!   imr1 + base58(flags u8 | network 32 | node key 32 | exp u32 | ticket 16 | name str | [room str] | [addrs] | sig 64)
+//!
+//! flags: 1 relay n0, 2 relay URLs, 4 addrs, 8 names, 16 from, 32 room. addrs = n u8, then per address 4 | IPv4 4 |
+//! port u16 or 6 | IPv6 16 | port u16. sig is the node key's Ed25519 signature over "islandmail/invite/v1\n" (reply:
+//! "islandmail/invite-reply/v1\n") + every byte before it. Derived, not sent: the inviting node's names default to
+//! [from], its entry name is from (else its first name); the joining node's entry name is the invited name. The ticket
+//! is the first 16 bytes of the inviting node's (deterministic) signature over network, exp, name and room, so accept
+//! checks that its own node issued the invite, still unexpired, without keeping any state.
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -13,22 +24,26 @@ use islandmail_core::cert::{valid_name, valid_namespace_entry};
 use islandmail_core::keys::{fmt_key, parse_key};
 use islandmail_core::members::NodeEntry;
 use islandmail_core::{b64u, b64u_decode, now_millis, MemberList};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::node::{ApiError, Node};
 
-pub const INVITE_PREFIX: &str = "islandmail-invite1.";
-pub const REPLY_PREFIX: &str = "islandmail-reply1.";
-const INVITE_CTX: &str = "islandmail/invite/v1\n";
-const REPLY_CTX: &str = "islandmail/invite-reply/v1\n";
+pub const INVITE_PREFIX: &str = "im1";
+pub const REPLY_PREFIX: &str = "imr1";
+const INVITE_CTX: &[u8] = b"islandmail/invite/v1\n";
+const REPLY_CTX: &[u8] = b"islandmail/invite-reply/v1\n";
+const TICKET_CTX: &[u8] = b"islandmail/invite-ticket/v1\n";
 pub const MAX_INVITE_LIFE_MS: i64 = 7 * 24 * 3600 * 1000;
 const SKEW_MS: i64 = 300_000;
+const N0: u8 = 1;
+const URLS: u8 = 2;
+const ADDRS: u8 = 4;
+const NAMES: u8 = 8;
+const FROM: u8 = 16;
+const ROOM: u8 = 32;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Invite {
-    pub v: u32,
     pub network: String,
     /// The inviting node, as the joiner will list it.
     pub node: NodeEntry,
@@ -37,64 +52,197 @@ pub struct Invite {
     /// The one exact agent name the inviter will trust the joining node for.
     pub name: String,
     /// The inviting agent, if one asked: whom to write to first.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// A room the joined agent is added to on accept.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room: Option<String>,
-    pub iat: i64,
     pub exp: i64,
+    pub ticket: [u8; 16],
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub struct Reply {
-    pub v: u32,
     pub network: String,
-    /// The joining node's entry (its own names are ignored: accept trusts it for the invite's name only).
+    /// The joining node: its key and addrs (accept trusts it for the invite's name only).
     pub node: NodeEntry,
-    /// The invite this answers, whole: accept checks its own signature on it.
-    pub invite: String,
-    pub iat: i64,
+    pub name: String,
+    pub room: Option<String>,
+    pub exp: i64,
+    pub ticket: [u8; 16],
 }
 
-fn seal(prefix: &str, ctx: &str, payload: &impl Serialize, node: &Node) -> String {
-    let raw = serde_json::to_vec(payload).expect("JSON");
-    let sig = node.seed.sign(&[ctx.as_bytes(), &raw].concat());
-    format!("{prefix}{}.{}", b64u(&raw), b64u(&sig))
-}
+/* base58 (Bitcoin alphabet) */
 
-/// The payload bytes of a sealed string and the key that must have signed them (read from the payload itself).
-fn open<T: for<'de> Deserialize<'de>>(s: &str, prefix: &str, ctx: &str, signer: impl Fn(&T) -> &str) -> Result<T, String> {
-    let rest = s.trim().strip_prefix(prefix).ok_or_else(|| format!("does not start with {prefix}"))?;
-    let (p, sig) = rest.split_once('.').ok_or("is cut short")?;
-    let (raw, sig) = (b64u_decode(p).ok_or("is not base64url")?, b64u_decode(sig).ok_or("is not base64url")?);
-    let v: T = serde_json::from_slice(&raw).map_err(|e| format!("is not readable ({e})"))?;
-    let key = parse_key(signer(&v)).map_err(|_| "names no valid node key")?;
-    if !islandmail_core::keys::verify(&key, &[ctx.as_bytes(), &raw].concat(), &sig) {
-        return Err("signature does not match its node key (changed or damaged)".into());
+const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+pub fn b58(bytes: &[u8]) -> String {
+    let mut digits: Vec<u8> = Vec::new();
+    for &b in bytes {
+        let mut carry = b as u32;
+        for d in digits.iter_mut() {
+            carry += (*d as u32) << 8;
+            *d = (carry % 58) as u8;
+            carry /= 58;
+        }
+        while carry > 0 { digits.push((carry % 58) as u8); carry /= 58; }
     }
-    Ok(v)
+    let zeros = bytes.iter().take_while(|&&b| b == 0).count();
+    std::iter::repeat_n(b'1', zeros).chain(digits.iter().rev().map(|&d| B58[d as usize])).map(char::from).collect()
+}
+
+pub fn b58_decode(s: &str) -> Option<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    for c in s.bytes() {
+        let mut carry = B58.iter().position(|&x| x == c)? as u32;
+        for b in bytes.iter_mut() {
+            carry += (*b as u32) * 58;
+            *b = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+        while carry > 0 { bytes.push((carry & 0xff) as u8); carry >>= 8; }
+    }
+    let zeros = s.bytes().take_while(|&c| c == b'1').count();
+    Some(std::iter::repeat_n(0, zeros).chain(bytes.into_iter().rev()).collect())
+}
+
+/* the byte layout */
+
+#[derive(Default)]
+struct W(Vec<u8>);
+
+impl W {
+    fn put(&mut self, b: &[u8]) -> &mut Self { self.0.extend_from_slice(b); self }
+    fn str(&mut self, s: &str) -> &mut Self { self.0.push(s.len().min(255) as u8); self.put(&s.as_bytes()[..s.len().min(255)]) }
+    fn addrs(&mut self, addrs: &[String]) {
+        let list: Vec<SocketAddr> = addrs.iter().filter_map(|a| a.parse().ok()).take(255).collect();
+        self.0.push(list.len() as u8);
+        for a in list {
+            match a.ip() {
+                IpAddr::V4(ip) => self.put(&[4]).put(&ip.octets()),
+                IpAddr::V6(ip) => self.put(&[6]).put(&ip.octets()),
+            };
+            self.put(&a.port().to_be_bytes());
+        }
+    }
+}
+
+struct R<'a>(&'a [u8]);
+
+impl<'a> R<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.0.len() < n { return Err("is cut short".into()); }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Ok(a)
+    }
+    fn u8(&mut self) -> Result<u8, String> { Ok(self.take(1)?[0]) }
+    fn arr<const N: usize>(&mut self) -> Result<[u8; N], String> { Ok(self.take(N)?.try_into().unwrap()) }
+    fn str(&mut self) -> Result<String, String> {
+        let n = self.u8()? as usize;
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| "holds a name that is not UTF-8".into())
+    }
+    fn addrs(&mut self) -> Result<Vec<String>, String> {
+        (0..self.u8()?).map(|_| {
+            let ip: IpAddr = match self.u8()? {
+                4 => self.arr::<4>()?.into(),
+                6 => self.arr::<16>()?.into(),
+                _ => return Err("holds an unknown address type".to_string()),
+            };
+            Ok(SocketAddr::new(ip, u16::from_be_bytes(self.arr()?)).to_string())
+        }).collect()
+    }
+}
+
+fn key_bytes(k: &str) -> [u8; 32] {
+    parse_key(k).expect("valid key")
+}
+
+fn network_bytes(n: &str) -> Result<[u8; 32], String> {
+    b64u_decode(n).and_then(|b| b.try_into().ok()).ok_or_else(|| "invalid network ID".into())
+}
+
+/// The ticket only the inviting node can make: it ties name, room and expiry to this node and network.
+fn ticket(node: &Node, network: &[u8; 32], exp_s: u32, name: &str, room: &str) -> [u8; 16] {
+    let mut w = W::default();
+    w.put(TICKET_CTX).put(network).put(&exp_s.to_be_bytes()).str(name).str(room);
+    node.seed.sign(&w.0)[..16].try_into().unwrap()
+}
+
+fn seal(prefix: &str, ctx: &[u8], mut w: W, node: &Node) -> String {
+    let sig = node.seed.sign(&[ctx, &w.0].concat());
+    w.put(&sig);
+    format!("{prefix}{}", b58(&w.0))
+}
+
+/// The payload of a sealed string, after checking its signature by the node key at bytes 1..33.
+fn open(s: &str, prefix: &str, ctx: &[u8], what: &str) -> Result<Vec<u8>, String> {
+    let body = s.trim().strip_prefix(prefix).ok_or_else(|| format!("that is not {what} (it starts with {prefix})"))?;
+    let raw = b58_decode(body).ok_or_else(|| format!("{what} is damaged (not base58)"))?;
+    if raw.len() < 1 + 32 + 32 + 64 { return Err(format!("{what} is cut short")); }
+    let (payload, sig) = raw.split_at(raw.len() - 64);
+    let key: [u8; 32] = payload[33..65].try_into().unwrap();
+    if !islandmail_core::keys::verify(&key, &[ctx, payload].concat(), sig) {
+        return Err(format!("{what} signature does not match its node key (changed or damaged)"));
+    }
+    Ok(payload.to_vec())
 }
 
 fn check_entry(n: &NodeEntry) -> Result<(), String> {
-    parse_key(&n.key).map_err(|_| "invalid node key")?;
     if n.name.is_empty() || n.name.len() > 64 || n.names.len() > islandmail_core::members::MAX_NAMES
-        || !n.names.iter().all(|e| valid_namespace_entry(e))
-        || !n.addrs.iter().all(|a| a.parse::<std::net::SocketAddr>().is_ok()) {
+        || !n.names.iter().all(|e| valid_namespace_entry(e)) {
         return Err("invalid node entry".into());
     }
     Ok(())
 }
 
+fn encode_invite(inv: &Invite, node: &Node) -> String {
+    let derived = inv.from.as_ref().is_some_and(|f| inv.node.names == [f.clone()]);
+    let urls: Vec<&String> = inv.relay.iter().filter(|r| *r != "n0").collect();
+    let flags = if inv.relay.iter().any(|r| r == "n0") { N0 } else { 0 } | if urls.is_empty() { 0 } else { URLS }
+        | if inv.node.addrs.is_empty() { 0 } else { ADDRS } | if derived { 0 } else { NAMES }
+        | if inv.from.is_some() { FROM } else { 0 } | if inv.room.is_some() { ROOM } else { 0 };
+    let mut w = W::default();
+    w.put(&[flags]).put(&network_bytes(&inv.network).expect("own network")).put(&key_bytes(&inv.node.key))
+        .put(&((inv.exp / 1000) as u32).to_be_bytes()).put(&inv.ticket).str(&inv.name);
+    if let Some(f) = &inv.from { w.str(f); }
+    if let Some(r) = &inv.room { w.str(r); }
+    if !derived {
+        w.0.push(inv.node.names.len() as u8);
+        for n in &inv.node.names { w.str(n); }
+    }
+    if !inv.node.addrs.is_empty() { w.addrs(&inv.node.addrs); }
+    if !urls.is_empty() {
+        w.0.push(urls.len() as u8);
+        for u in urls { w.str(u); }
+    }
+    seal(INVITE_PREFIX, INVITE_CTX, w, node)
+}
+
 pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
-    let inv: Invite = open(s, INVITE_PREFIX, INVITE_CTX, |i: &Invite| &i.node.key).map_err(|e| format!("invite {e}"))?;
-    check_entry(&inv.node).map_err(|e| format!("invite: {e}"))?;
-    if inv.v != 1 || !valid_name(&inv.name) || inv.exp <= inv.iat || inv.exp - inv.iat > MAX_INVITE_LIFE_MS {
+    let raw = open(s, INVITE_PREFIX, INVITE_CTX, "an invite")?;
+    let mut r = R(&raw);
+    let bad = |e: String| format!("invite {e}");
+    let flags = r.u8()?;
+    let network = b64u(&r.arr::<32>()?);
+    let key = fmt_key(&r.arr::<32>()?);
+    let exp = u32::from_be_bytes(r.arr()?) as i64 * 1000;
+    let ticket = r.arr::<16>()?;
+    let name = r.str().map_err(bad)?;
+    let from = if flags & FROM != 0 { Some(r.str().map_err(bad)?) } else { None };
+    let room = if flags & ROOM != 0 { Some(r.str().map_err(bad)?) } else { None };
+    let names = if flags & NAMES != 0 { (0..r.u8()?).map(|_| r.str()).collect::<Result<Vec<_>, _>>().map_err(bad)? }
+                else { vec![from.clone().ok_or("invite is malformed (no names)")?] };
+    let addrs = if flags & ADDRS != 0 { r.addrs().map_err(bad)? } else { vec![] };
+    let mut relay = if flags & N0 != 0 { vec!["n0".to_string()] } else { vec![] };
+    if flags & URLS != 0 { for _ in 0..r.u8()? { relay.push(r.str().map_err(bad)?); } }
+    if !r.0.is_empty() || flags & !63 != 0 { return Err("invite is malformed".into()); }
+    let node_name = from.clone().or_else(|| names.first().map(|n| n.trim_end_matches('.').to_string())).unwrap_or("peer".into());
+    let inv = Invite { network, node: NodeEntry { name: node_name, key, addrs, names }, relay, name, from, room, exp, ticket };
+    check_entry(&inv.node).map_err(bad)?;
+    if !valid_name(&inv.name) {
         return Err("invite is malformed".into());
     }
-    if inv.iat > now + SKEW_MS {
-        return Err("invite is dated in the future".into());
+    if inv.exp > now + MAX_INVITE_LIFE_MS + SKEW_MS {
+        return Err("invite runs longer than 7 days".into());
     }
     if now >= inv.exp {
         return Err(format!("invite expired at {}", islandmail_core::ts_from_millis(inv.exp)));
@@ -102,11 +250,38 @@ pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
     Ok(inv)
 }
 
+fn encode_reply(r: &Reply, node: &Node) -> String {
+    let flags = if r.node.addrs.is_empty() { 0 } else { ADDRS } | if r.room.is_some() { ROOM } else { 0 };
+    let mut w = W::default();
+    w.put(&[flags]).put(&network_bytes(&r.network).expect("own network")).put(&key_bytes(&r.node.key))
+        .put(&((r.exp / 1000) as u32).to_be_bytes()).put(&r.ticket).str(&r.name);
+    if let Some(room) = &r.room { w.str(room); }
+    if !r.node.addrs.is_empty() { w.addrs(&r.node.addrs); }
+    seal(REPLY_PREFIX, REPLY_CTX, w, node)
+}
+
+/// `islandmail-node invite-info INVITE`: what a checked invite holds, for setting up a fresh host before its node runs.
+pub fn info(s: &str) -> Result<Value, String> {
+    let i = read_invite(s, now_millis())?;
+    Ok(json!({ "network": i.network, "relay": i.relay, "name": i.name, "from": i.from, "room": i.room,
+               "exp": islandmail_core::ts_from_millis(i.exp),
+               "node": { "name": i.node.name, "key": i.node.key, "addrs": i.node.addrs, "names": i.node.names } }))
+}
+
 pub fn read_reply(s: &str) -> Result<Reply, String> {
-    let r: Reply = open(s, REPLY_PREFIX, REPLY_CTX, |r: &Reply| &r.node.key).map_err(|e| format!("reply {e}"))?;
-    check_entry(&r.node).map_err(|e| format!("reply: {e}"))?;
-    if r.v != 1 { return Err("reply is malformed".into()); }
-    Ok(r)
+    let raw = open(s, REPLY_PREFIX, REPLY_CTX, "a reply")?;
+    let mut r = R(&raw);
+    let bad = |e: String| format!("reply {e}");
+    let flags = r.u8()?;
+    let network = b64u(&r.arr::<32>()?);
+    let key = fmt_key(&r.arr::<32>()?);
+    let exp = u32::from_be_bytes(r.arr()?) as i64 * 1000;
+    let ticket = r.arr::<16>()?;
+    let name = r.str().map_err(bad)?;
+    let room = if flags & ROOM != 0 { Some(r.str().map_err(bad)?) } else { None };
+    let addrs = if flags & ADDRS != 0 { r.addrs().map_err(bad)? } else { vec![] };
+    if !r.0.is_empty() || flags & !(ADDRS | ROOM) != 0 || !valid_name(&name) { return Err("reply is malformed".into()); }
+    Ok(Reply { network, node: NodeEntry { name: name.clone(), key, addrs, names: vec![] }, name, room, exp, ticket })
 }
 
 /// What the host owner signs with the node key to ask for one step: action is invite, join or accept.
@@ -196,14 +371,17 @@ pub fn invite(node: &Node, body: &Value) -> Result<Value, ApiError> {
     if let Some(h) = holder(&node.members.read().unwrap(), name, None) {
         return Err(ApiError::new(409, format!("{name} is already held here by {h}; invite with a name nobody holds")));
     }
-    let now = now_millis();
-    let members = node.members.read().unwrap().clone();
+    if name.len() + room.len() + from.len() > 200 {
+        return Err(ApiError::new(400, "name, room and from are too long for an invite"));
+    }
+    let network = node.members.read().unwrap().network.clone();
+    let exp_s = ((now_millis() + 999) / 1000 + ttl) as u32;
     let inv = Invite {
-        v: 1, network: members.network.clone(), node: own_entry(node)?, relay: node.opts.relay.clone(), name: name.into(),
-        from: (!from.is_empty()).then(|| from.into()), room: (!room.is_empty()).then(|| room.into()),
-        iat: now, exp: now + ttl * 1000,
+        ticket: ticket(node, &network_bytes(&network).map_err(|e| ApiError::new(500, e))?, exp_s, name, room),
+        network, node: own_entry(node)?, relay: node.opts.relay.clone(), name: name.into(),
+        from: (!from.is_empty()).then(|| from.into()), room: (!room.is_empty()).then(|| room.into()), exp: exp_s as i64 * 1000,
     };
-    Ok(json!({ "invite": seal(INVITE_PREFIX, INVITE_CTX, &inv, node), "exp": islandmail_core::ts_from_millis(inv.exp) }))
+    Ok(json!({ "invite": encode_invite(&inv, node), "exp": islandmail_core::ts_from_millis(inv.exp) }))
 }
 
 /// POST /api/joins {invite, ts, sig}: trust the inviting node, make sure this node may certify the invited name, and
@@ -242,9 +420,10 @@ pub fn join(node: &Node, body: &Value) -> Result<Value, ApiError> {
         Ok(())
     })?;
     let mine = list.node_by_key(&node.seed.public()).cloned().expect("own entry");
-    let reply = Reply { v: 1, network: network.clone(), node: mine, invite: raw.into(), iat: now_millis() };
+    let reply = Reply { network: network.clone(), node: mine, name: inv.name.clone(), room: inv.room.clone(), exp: inv.exp,
+                        ticket: inv.ticket };
     Ok(json!({
-        "reply": seal(REPLY_PREFIX, REPLY_CTX, &reply, node), "network": network, "seq": list.seq,
+        "reply": encode_reply(&reply, node), "network": network, "seq": list.seq,
         "inviter": { "name": inv.node.name, "key": inv.node.key, "names": inv.node.names }, "from": inv.from,
         "name": inv.name, "added_name": added_name, "room": inv.room,
         "relay": { "invite": inv.relay, "node": node.opts.relay },
@@ -256,15 +435,19 @@ pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
     let raw = arg_str(body, "reply").trim();
     operator(node, body, "accept", raw)?;
     let r = read_reply(raw).map_err(|e| ApiError::new(400, e))?;
-    let inv = read_invite(&r.invite, now_millis()).map_err(|e| ApiError::new(400, e))?;
     let me_key = fmt_key(&node.seed.public());
-    if inv.node.key != me_key {
-        return Err(ApiError::new(400, "this reply answers another node's invite"));
+    let network = node.members.read().unwrap().network.clone();
+    let exp_s = (r.exp / 1000) as u32;
+    if r.network != network || r.node.key == me_key
+        || ticket(node, &network_bytes(&network).map_err(|e| ApiError::new(500, e))?, exp_s, &r.name,
+                  r.room.as_deref().unwrap_or("")) != r.ticket {
+        return Err(ApiError::new(400, "this reply answers no invite of this node (another node's, or altered)"));
     }
-    if r.network != inv.network || r.node.key == me_key {
-        return Err(ApiError::new(400, "reply does not match the invite"));
+    if now_millis() >= r.exp {
+        return Err(ApiError::new(400, format!("the invite expired at {}", islandmail_core::ts_from_millis(r.exp))));
     }
-    let name = inv.name.clone();
+    let inv = &r;
+    let name = r.name.clone();
     let list = edit_trust(node, |list, _| {
         if list.network != inv.network {
             return Err(ApiError::new(409, "the invite was for another network"));
@@ -290,20 +473,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tampered_and_expired_invites_are_refused() {
+    fn base58_round_trips() {
+        for b in [vec![], vec![0], vec![0, 0, 1, 255], (0..=255u8).collect::<Vec<_>>()] {
+            assert_eq!(b58_decode(&b58(&b)).unwrap(), b);
+        }
+        assert_eq!(b58(b"hello world"), "StV1DL6CwTryKyV");
+        assert!(b58_decode("0OIl").is_none());
+    }
+
+    fn node() -> Node {
         let seed = islandmail_core::keys::Seed::generate();
-        let inv = Invite {
-            v: 1, network: b64u(&[7u8; 32]), relay: vec![], name: "bob".into(), from: None, room: None, iat: 1_000, exp: 10_000,
-            node: NodeEntry { name: "a".into(), key: fmt_key(&seed.public()), addrs: vec![], names: vec!["alice".into()] },
+        let list = MemberList { v: 1, network: b64u(&[7u8; 32]), seq: 1, members: vec![], homes: vec![],
+            nodes: vec![NodeEntry { name: "a".into(), key: fmt_key(&seed.public()), addrs: vec!["192.0.2.7:4433".into()],
+                                    names: vec!["alice".into()] }] };
+        let path = std::env::temp_dir().join(format!("islandmail-invite-{}.sqlite", b64u(&islandmail_core::random_bytes::<9>())));
+        let store = crate::store::Store::open(&path).unwrap();
+        store.bind_roster(&seed.public(), &list).unwrap();
+        let opts = crate::node::Opts { public_url: "http://x".into(), relay: vec!["n0".into()], ..Default::default() };
+        Node::new(store, list, seed, opts, tokio::sync::mpsc::channel(1).0)
+    }
+
+    #[test]
+    fn invites_round_trip_and_refuse_tampering_and_expiry() {
+        let n = node();
+        let now = now_millis();
+        let body = |name: &str, room: &str| {
+            let ts = islandmail_core::now_ts();
+            let arg = format!("{name}|{room}|alice|604800");
+            let st = operator_statement("invite", &fmt_key(&n.seed.public()), &ts, &arg);
+            json!({ "name": name, "room": room, "from": "alice", "ttl_s": 604800, "ts": ts, "sig": b64u(&n.seed.sign(st.as_bytes())) })
         };
-        let raw = serde_json::to_vec(&inv).unwrap();
-        let sig = seed.sign(&[INVITE_CTX.as_bytes(), &raw].concat());
-        let s = format!("{INVITE_PREFIX}{}.{}", b64u(&raw), b64u(&sig));
-        assert!(read_invite(&s, 5_000).is_ok());
-        assert!(read_invite(&s, 10_000).unwrap_err().contains("expired"));
-        let mut bad = inv.clone();
-        bad.name = "mallory".into();
-        let t = format!("{INVITE_PREFIX}{}.{}", b64u(&serde_json::to_vec(&bad).unwrap()), b64u(&sig));
-        assert!(read_invite(&t, 5_000).unwrap_err().contains("signature"));
+        let s = invite(&n, &body("bob", "alice/plan")).unwrap()["invite"].as_str().unwrap().to_string();
+        assert!(s.starts_with("im1") && s.len() <= 260, "{} chars: {s}", s.len());
+        let inv = read_invite(&s, now).unwrap();
+        assert_eq!((inv.name.as_str(), inv.room.as_deref(), inv.from.as_deref()), ("bob", Some("alice/plan"), Some("alice")));
+        assert_eq!(inv.node.names, vec!["alice".to_string()]);
+        assert_eq!(inv.node.addrs, vec!["192.0.2.7:4433".to_string()]);
+        assert_eq!(inv.relay, vec!["n0".to_string()]);
+        assert_eq!(inv.node.key, fmt_key(&n.seed.public()));
+        // Any changed byte breaks the signature.
+        let mut raw = b58_decode(&s[3..]).unwrap();
+        raw[1 + 32 + 32 + 4 + 16 + 1] ^= 1;
+        assert!(read_invite(&format!("im1{}", b58(&raw)), now).unwrap_err().contains("signature"));
+        assert!(read_invite(&s, inv.exp).unwrap_err().contains("expired"));
+        assert!(read_invite(&s.replace("im1", "imr1"), now).is_err());
+        // The reply's ticket proves the invite was this node's, for this name and room only.
+        let r = Reply { network: inv.network.clone(), node: NodeEntry { name: "bob".into(), key: fmt_key(&n.seed.public()),
+                        addrs: vec![], names: vec![] }, name: "bob".into(), room: inv.room.clone(), exp: inv.exp, ticket: inv.ticket };
+        let exp_s = (inv.exp / 1000) as u32;
+        assert_eq!(ticket(&n, &[7u8; 32], exp_s, "bob", "alice/plan"), r.ticket);
+        assert_ne!(ticket(&n, &[7u8; 32], exp_s, "carol", "alice/plan"), r.ticket);
+        let rs = encode_reply(&r, &n);
+        assert!(rs.starts_with("imr1") && rs.len() <= 260, "{} chars", rs.len());
+        assert_eq!(read_reply(&rs).unwrap().ticket, inv.ticket);
+        let plain = invite(&n, &body("bob", "")).unwrap()["invite"].as_str().unwrap().len();
+        println!("invite {} chars with a room, {plain} without; reply {} chars", s.len(), rs.len());
     }
 }

@@ -6,7 +6,6 @@ tampered invite, a tampered reply, and an accept for a name the inviter holds.
   python3 tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
 import argparse
-import base64
 import json
 import os
 import signal
@@ -19,20 +18,34 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from two_nodes import RESULTS, Node, check, free_port, run, wait_for, work_directory  # noqa: E402
 
 
-def b64u(b):
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def unb64u(s):
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+def b58(b):
+    n, out = int.from_bytes(b, "big"), ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\0"))) + out
 
 
-def tamper(sealed, prefix, change):
-    # The same signature over a changed payload.
-    p, sig = sealed[len(prefix):].split(".")
-    obj = json.loads(unb64u(p))
-    change(obj)
-    return prefix + b64u(json.dumps(obj).encode()) + "." + sig
+def unb58(s):
+    n = 0
+    for c in s:
+        n = n * 58 + B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def tamper(sealed, prefix, at):
+    # The same signature over one changed byte (at: offset in the raw bytes).
+    raw = bytearray(unb58(sealed[len(prefix):]))
+    raw[at] ^= 1
+    return prefix + b58(bytes(raw))
+
+
+# Offset of the first byte of the invited name: flags, network, node key, exp, ticket, name length.
+NAME_AT = 1 + 32 + 32 + 4 + 16 + 1
 
 
 def main():
@@ -100,23 +113,23 @@ def main():
         rc, out, err = cl("a", "invite", "--name", "alice", "--config", a_cfg)
         check("no invite for a name this node holds", rc != 0 and "409" in err, err[-200:])
         rc, short, err = cl("a", "invite", "--name", "bob", "--ttl", "1", "--config", a_cfg)
-        check("a one-second invite", rc == 0 and short.startswith("islandmail-invite1."), err[-200:])
+        check("a one-second invite", rc == 0 and short.startswith("im1"), err[-200:])
         time.sleep(2)
         rc, out, err = join(short)
         check("join refuses an expired invite", rc != 0 and "expired" in err, err[-200:])
         check("and sets nothing up", not os.path.exists(b_cfg))
 
         rc, inv, err = cl("a", "invite", "--name", "bob", "--room", "plan", "--config", a_cfg)
-        check("alice invites bob into alice/plan", rc == 0 and inv.startswith("islandmail-invite1."), err[-200:])
-        check("the invite is one compact line", "\n" not in inv and len(inv) < 1500, "%d chars" % len(inv))
-        bad = tamper(inv, "islandmail-invite1.", lambda o: o.update(name="mallory"))
+        check("alice invites bob into alice/plan", rc == 0 and inv.startswith("im1"), err[-200:])
+        check("the invite is one short line", "\n" not in inv and len(inv) <= 260, "%d chars: %s" % (len(inv), inv))
+        bad = tamper(inv, "im1", NAME_AT)
         rc, out, err = join(bad)
         check("join refuses a tampered invite", rc != 0 and "signature" in err, err[-200:])
         check("and sets nothing up", not os.path.exists(b_cfg))
 
         # One command on B: node key, trust file, config, node started, inviter trusted, bob's key certified.
         rc, reply, err = join(inv)
-        check("join on a host with no node", rc == 0 and reply.startswith("islandmail-reply1."), err[-400:])
+        check("join on a host with no node", rc == 0 and reply.startswith("imr1") and len(reply) <= 260, err[-400:])
         check("join started B's node", b_pid() is not None)
         with open(b_cfg) as f:
             cfg = json.load(f)
@@ -127,10 +140,10 @@ def main():
         ent = {n["key"]: n for n in bt["nodes"]}
         check("B trusts A as A listed itself", ent.get(a_key, {}).get("names") == ["alice"]
               and ent[a_key]["addrs"] == ["127.0.0.1:%d" % a_udp], json.dumps(bt["nodes"]))
-        check("join tells what it set", "trusts node 'a'" in err and "network" in err, err[-300:])
+        check("join tells what it set", "trusts node 'alice'" in err and "network" in err, err[-300:])
         check("bob's key is made at join", os.path.exists(os.path.join(bdir, "client", "identities", "bob.json")))
 
-        bad = tamper(reply, "islandmail-reply1.", lambda o: o["node"].update(names=["alice"]))
+        bad = tamper(reply, "imr1", NAME_AT)
         rc, out, err = cl("a", "accept", bad, "--config", a_cfg)
         check("accept refuses a tampered reply", rc != 0 and "signature" in err, err[-200:])
 

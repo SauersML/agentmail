@@ -8,12 +8,12 @@ The node and the client run on macOS, Linux and Windows.
 
 ## Join with an invite
 
-Someone on the network sent you an invite (one line starting `islandmail-invite1.`). With the node binary built
+Someone on the network sent you an invite (one line of about 230 characters starting `im1`). With the node binary built
 (`cargo build --locked --release -p islandmail-node`, on your PATH or passed as `--bin`) and
 `pip install cryptography`:
 
 ```sh
-python3 clients/islandmail.py join islandmail-invite1.…     # prints one reply line: send it back to them
+python3 clients/islandmail.py join im1…                    # prints one reply line: send it back to them
 python3 clients/islandmail.py send --to alice "hi"         # once they ran accept
 ```
 
@@ -25,7 +25,7 @@ name, says what it set, and prints the reply. The inviter's side:
 
 ```sh
 python3 clients/islandmail.py invite --name bob [--room plan] [--config CONFIG.json]   # one line to send to bob
-python3 clients/islandmail.py accept islandmail-reply1.…                              # bob's node, for bob only
+python3 clients/islandmail.py accept imr1…                                          # bob's node, for bob only
 ```
 
 `accept` trusts the replying node for exactly the invited name, never a prefix and never a name this host already
@@ -359,7 +359,7 @@ the encrypted body (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`)
 (`PAE("islandmail/body-meta/v1", meta)` after the attachments).
 
 **CLI.** `islandmail-node run CONFIG`, `keygen SEED_FILE`, `pubkey SEED_FILE`, `network-id`,
-`agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]`, `revoke CONFIG NAME`.
+`agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]`, `revoke CONFIG NAME`, `invite-info INVITE`.
 
 **HTTP API** (loopback). Every request except `GET /api/node`, `POST /api/agents`, `POST /api/revocations` and the invite steps carries a fresh single-use agent token: PASETO
 v4.public, signed by the agent key, audience the node key, from `islandmail.py selftoken`, in the Authorization bearer
@@ -373,9 +373,19 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the audience.
   that breaks continuity.
 - `POST /api/invites` `{name, room, from, ttl_s, ts, sig}`, `POST /api/joins` `{invite, ts, sig}`, `POST /api/accepts`
   `{reply, ts, sig}`: sig by the node key over `islandmail-operator|v1|ACTION|NODE_KEY|TS|ARG` (ARG is
-  `NAME|ROOM|FROM|TTL_S`, the invite, or the reply). An invite is `islandmail-invite1.` + base64url(JSON) + `.` +
-  base64url(signature over `islandmail/invite/v1\n` + JSON) by the inviting node; a reply is the same with
-  `islandmail-reply1.` and `islandmail/invite-reply/v1\n`, signed by the joining node, and carries the invite.
+  `NAME|ROOM|FROM|TTL_S`, the invite, or the reply).
+- **Invite and reply format.** Raw bytes in base58 (Bitcoin alphabet) after a prefix; `str` is a u8 length and UTF-8,
+  integers big-endian. Invite: `im1` + base58(`flags` u8, network ID 32, node key 32, expiry u32 (Unix seconds),
+  ticket 16, name `str`, then `from` `str` if flag 16, room `str` if flag 32, the node's names (u8 count, `str` each)
+  if flag 8, addrs if flag 4, relay URLs (u8 count, `str` each) if flag 2, then the node key's Ed25519 signature 64
+  over `islandmail/invite/v1\n` + every byte before it). Flag 1 is relay `n0`. addrs: u8 count, then `4` + IPv4 4 +
+  port u16 or `6` + IPv6 16 + port u16. Left out because join derives them: the node's names when they are just
+  `[from]`, its entry name (`from`, else its first name). The ticket is the first 16 bytes of the inviting node's
+  signature over `islandmail/invite-ticket/v1\n`, network, expiry, name and room, so accept checks the invite was its
+  own without keeping state. Reply: `imr1` + base58(`flags`, network 32, joining node key 32, the invite's expiry and
+  ticket, name, room if flag 32, addrs if flag 4, signature 64 by the joining node over
+  `islandmail/invite-reply/v1\n` + those bytes). A typical invite is about 230 characters, a reply about 200.
+  `islandmail-node invite-info INVITE` checks one and prints it as JSON.
 - `POST /api/revocations` `{name, ts, sig}`, signed by the node key (what `islandmail-node revoke` sends). Each name's
   signed timestamp must advance. A replay returns 409, including after a node restart.
 - `GET /api/agents`: every agent this host accepts, with its homes. `GET /api/me`, `GET /api/names`.

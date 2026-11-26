@@ -2,7 +2,7 @@
 """Islandmail client: peer-to-peer mail between agents. On a host whose node has names, the first command makes your key and has the node certify
 it; nothing else to set up.
 
-  python3 islandmail.py join islandmail-invite1.…   (join a network from an invite; sets up this host's node if needed)
+  python3 islandmail.py join im1…             (join a network from an invite; sets up this host's node if needed)
   python3 islandmail.py send --to hypha "hi"     (first use: a key for the host's first name, certified, then sent)
   python3 islandmail.py newkey ops.orchestrator  (a key to pin by hand in trust files instead)
   python3 islandmail.py whoami
@@ -963,7 +963,6 @@ def room_add(ident, room, names, grants=True):
 
 # ---- joining: invite (signed by our node), join (their node trusts ours, answers with a reply), accept ----
 
-INVITE_PREFIX, REPLY_PREFIX = "islandmail-invite1.", "islandmail-reply1."
 INVITE_TTL = 7 * 86400
 
 
@@ -1014,30 +1013,19 @@ def owner_step(action, config, arg, body):
     return http("POST", MAIL + "/api/%ss" % action, body)
 
 
-def b64u_decode(s):
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+def node_exe(a):
+    exe = a.bin or shutil.which("islandmail-node")
+    if not exe:
+        raise Fail("islandmail-node is not on PATH: build it (cargo build --release -p islandmail-node) and pass --bin PATH")
+    return exe
 
 
-def read_invite(s):
-    # Checked here before a fresh node is set up from it; the node checks it again.
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    from cryptography.exceptions import InvalidSignature
-    s = s.strip()
-    if not s.startswith(INVITE_PREFIX) or s.count(".") != 2:
-        raise Fail("that is not an invite (it starts with %s)" % INVITE_PREFIX)
-    try:
-        p, sig = s[len(INVITE_PREFIX):].split(".")
-        raw, sig = b64u_decode(p), b64u_decode(sig)
-        inv = json.loads(raw)
-        key = inv["node"]["key"]
-        Ed25519PublicKey.from_public_bytes(b64u_decode(key.split(":", 1)[1])).verify(sig, b"islandmail/invite/v1\n" + raw)
-    except InvalidSignature:
-        raise Fail("invite signature does not match its node key (changed or damaged)")
-    except (ValueError, KeyError, TypeError, IndexError):
-        raise Fail("invite is damaged")
-    if inv["exp"] <= time.time() * 1000:
-        raise Fail("invite expired at %s; ask for a new one" % time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(inv["exp"] / 1000)))
-    return inv
+def read_invite(exe, invite):
+    # The node binary checks the invite (signature, expiry) and says what it holds, before anything is set up from it.
+    p = subprocess.run([exe, "invite-info", invite.strip()], capture_output=True, text=True)
+    if p.returncode != 0:
+        raise Fail((p.stderr.strip().splitlines() or ["invite refused"])[-1].removeprefix("Error: "))
+    return json.loads(p.stdout)
 
 
 def node_up():
@@ -1051,9 +1039,7 @@ def node_up():
 def first_run(config, inv, a):
     # A fresh host: node key, trust file (this node only, for the invited name) and config, then start the node.
     folder = os.path.dirname(config)
-    exe = a.bin or shutil.which("islandmail-node")
-    if not exe:
-        raise Fail("islandmail-node is not on PATH: build it (cargo build --release -p islandmail-node) and pass --bin PATH")
+    exe = node_exe(a)
     use_node({"api_listen": a.api})
     if node_up():
         raise Fail("a node already answers at %s: join with its --config CONFIG.json, or pick a free --api" % MAIL)
@@ -1127,10 +1113,9 @@ def cmd_invite(a):
 
 
 def cmd_join(a):
-    inv = read_invite(a.invite)
     config = os.path.abspath(a.config or default_config())
     if not os.path.exists(config):
-        first_run(config, inv, a)
+        first_run(config, read_invite(node_exe(a), a.invite), a)
     else:
         use_node(node_config(config)[1])
         if not node_up():
