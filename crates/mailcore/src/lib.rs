@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod envelope;
 pub mod keys;
 pub mod members;
+pub mod node_key;
 pub mod order;
 pub mod paseto;
 
