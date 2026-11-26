@@ -362,6 +362,15 @@ static EDIT: Mutex<()> = Mutex::new(());
 /// Edits the trust file on disk (the source of truth) and adopts the result: seq one above both the file and the
 /// list in use. `f` may refuse.
 fn edit_trust(node: &Node, f: impl FnOnce(&mut MemberList, &str) -> Result<(), ApiError>) -> Result<MemberList, ApiError> {
+    edit_trust_with(node, |list, me, _| f(list, me))
+}
+
+/// `edit_trust` with a store transaction for `f`'s own writes (an invite's spend), committed only once the edited
+/// trust file is valid and on disk: a refused edit spends nothing. A crash between the two leaves the trust file
+/// edited and the invite unspent, which the same node completes on its next try (its names are already its own, so
+/// no other node can use the invite).
+fn edit_trust_with(node: &Node, f: impl FnOnce(&mut MemberList, &str, &rusqlite::Transaction) -> Result<(), ApiError>)
+    -> Result<MemberList, ApiError> {
     let _g = EDIT.lock().unwrap();
     let path = node.opts.members_file.as_deref().ok_or_else(|| ApiError::new(503, "this node has no trust file to edit"))?;
     crate::private_fs::check_writers(path).map_err(|e| ApiError::new(409, format!("{e:#}")))?;
@@ -371,11 +380,18 @@ fn edit_trust(node: &Node, f: impl FnOnce(&mut MemberList, &str) -> Result<(), A
     if list.network != node.members.read().unwrap().network {
         return Err(ApiError::new(409, "trust file names another network than the one this node runs; restart it first"));
     }
-    f(&mut list, &fmt_key(&node.seed.public()))?;
-    list.seq = list.seq.max(cur) + 1;
-    list.validate().map_err(|e| ApiError::new(409, format!("{e:#}")))?;
-    write_atomic(path, &serde_json::to_vec_pretty(&list).expect("JSON"))?;
+    let committed = {
+        let mut db = node.store.conn();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(anyhow::Error::from)?;
+        f(&mut list, &fmt_key(&node.seed.public()), &tx)?;
+        list.seq = list.seq.max(cur) + 1;
+        list.validate().map_err(|e| ApiError::new(409, format!("{e:#}")))?;
+        write_atomic(path, &serde_json::to_vec_pretty(&list).expect("JSON"))?;
+        tx.commit()
+    };
+    // The file is written either way: adopt it, as the trust watcher would.
     node.reload_members(&list).map_err(|e| ApiError::new(409, format!("{e:#}")))?;
+    committed.map_err(anyhow::Error::from)?;
     // As when the trust watcher adopts a change: held identities newly in our names, and a sync with the new peer now.
     node.certify_identities();
     node.resync.notify_one();
@@ -567,8 +583,7 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     let nonce = b64u(&r.nonce);
     let name = r.name.clone();
     let mut row: Option<(String, String)> = None;
-    let list = edit_trust(node, |list, _| {
-        let db = node.store.conn();
+    let list = edit_trust_with(node, |list, _, db| {
         type InviteRow = (String, String, String, i64, Option<String>, Option<String>);
         let got: Option<InviteRow> = db.query_row(
             "SELECT name, room, from_, exp, spent_by, for_key FROM join_invites WHERE nonce = ?", [&nonce],
@@ -606,6 +621,7 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
         for n in &names {
             if !entry.names.iter().any(|e| e.eq_ignore_ascii_case(n)) { entry.names.push(n.clone()); }
         }
+        // Spent in the transaction that commits only with the trust file written (edit_trust_with).
         let n = db.execute("UPDATE join_invites SET spent_by = ?, spent_ms = ? WHERE nonce = ? AND spent_by IS NULL",
                            rusqlite::params![r.node.key, now_millis(), nonce]).map_err(anyhow::Error::from)?;
         if n != 1 { return Err(ApiError::new(409, "this invite was already used")); }
@@ -891,6 +907,33 @@ mod tests {
         let (inv3, g) = (make(&a, "gail", ""), fresh());
         assert!(answer(&a, &fresh(), "imr1junk")["error"].as_str().unwrap().contains("too many"));
         assert_eq!(answer(&a, &g, &reply_of(&g, &inv3, "gail"))["ok"], true);
+    }
+
+    #[test]
+    fn a_refused_trust_edit_does_not_spend_the_invite() {
+        let a = node_on([7u8; 32], &["alice"]);
+        let b = node_on([7u8; 32], &[]);
+        // b is trusted here already, for as many names as a node may hold: one more makes the trust file invalid.
+        let full: Vec<String> = (0..islandmail_core::members::MAX_NAMES).map(|i| format!("b{i}")).collect();
+        let bkey = fmt_key(&b.seed.public());
+        edit_trust(&a, |list, _| {
+            list.nodes.push(NodeEntry { name: "b".into(), key: bkey.clone(), addrs: vec![], names: full.clone() });
+            Ok(())
+        }).unwrap();
+        let seq = a.members.read().unwrap().seq;
+        let inv = make(&a, "bob", "");
+        let r = reply_of(&b, &inv, "bob");
+        let v = answer(&a, &b, &r);
+        assert!(v["error"].as_str().unwrap().contains("more than"), "{v}");
+        let unspent = |n: &Node| n.store.conn().query_row("SELECT count(*) FROM join_invites WHERE spent_by IS NULL",
+                                                          [], |x| x.get::<_, i64>(0)).unwrap();
+        assert_eq!(unspent(&a), 1, "the refused join left the invite unspent");
+        assert_eq!(a.members.read().unwrap().seq, seq, "and the trust file as it was");
+        // Room made: the same invite works.
+        edit_trust(&a, |list, _| { list.nodes.iter_mut().find(|n| n.key == bkey).unwrap().names.pop(); Ok(()) }).unwrap();
+        assert_eq!(answer(&a, &b, &r)["ok"], true);
+        assert_eq!(unspent(&a), 0);
+        assert!(a.members.read().unwrap().node_by_key(&b.seed.public()).unwrap().names.contains(&"bob".to_string()));
     }
 
     #[test]
