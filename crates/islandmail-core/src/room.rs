@@ -56,7 +56,24 @@ pub enum Event {
     Leave {},
     Remove { members: Vec<String> },
     Topic { topic: String },
+    /// The creator's word on its members' keys and home nodes, for hosts that do not trust those nodes: such a host
+    /// accepts mail in this room (and nowhere else) written by a listed node for its listed agent. The latest vouch
+    /// replaces earlier ones; membership still comes from the other events.
+    Vouch { members: Vec<VouchEntry> },
 }
+
+/// One vouched member: its name, sub and key, and the nodes that write for it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VouchEntry {
+    pub name: String,
+    pub sub: String,
+    pub key: String,
+    pub nodes: Vec<String>,
+}
+
+/// Most nodes one vouched member lists.
+pub const MAX_VOUCH_NODES: usize = 8;
 
 impl Event {
     /// Names this event brings into the room (they receive the event itself).
@@ -70,7 +87,7 @@ impl Event {
     fn rank(&self) -> u8 {
         match self {
             Event::Create { .. } => 0,
-            Event::Add { .. } | Event::Topic { .. } => 1,
+            Event::Add { .. } | Event::Topic { .. } | Event::Vouch { .. } => 1,
             Event::Leave {} | Event::Remove { .. } => 2,
         }
     }
@@ -95,6 +112,8 @@ impl Event {
             Event::Leave {} => "left the room".into(),
             Event::Remove { members } => format!("removed {}", members.join(", ")),
             Event::Topic { topic } => format!("set the topic: {topic}"),
+            Event::Vouch { members } => format!("vouched for the nodes of {}",
+                members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")),
         }
     }
 }
@@ -165,6 +184,18 @@ impl Meta {
                     &[]
                 }
                 Event::Leave {} => &[],
+                Event::Vouch { members } => {
+                    ensure!(members.len() <= MAX_ROOM_MEMBERS, "invalid member names");
+                    for v in members {
+                        ensure!(crate::cert::valid_agent_name(&v.name), "invalid member names");
+                        ensure!(!v.sub.is_empty() && v.sub.len() <= 120 && v.sub.bytes().all(|b| (b'!'..=b'~').contains(&b)),
+                                "invalid vouched sub");
+                        ensure!(crate::keys::parse_key(&v.key).is_ok(), "invalid vouched key");
+                        ensure!((1..=MAX_VOUCH_NODES).contains(&v.nodes.len())
+                                && v.nodes.iter().all(|n| crate::keys::parse_key(n).is_ok()), "invalid vouched nodes");
+                    }
+                    &[]
+                }
             };
             ensure!(names.len() <= MAX_ROOM_MEMBERS && names.iter().all(|n| crate::cert::valid_agent_name(n)), "invalid member names");
         }
@@ -346,6 +377,8 @@ pub fn fold(id: &str, events: &mut [Folded<'_>]) -> State {
                     s.topic.clone_from(topic);
                 }
             }
+            // Read by the node (`vouched`), not part of membership.
+            Event::Vouch { .. } => {}
         }
     }
     s
@@ -380,6 +413,9 @@ pub fn plan(id: &str, state: Option<&State>, from: &str, event: Option<&Event>) 
         // A plain thread: an open room that needs no create event.
         _ => return Ok((false, None)),
     };
+    if let Some(Event::Vouch { .. }) = event {
+        ensure!(state.creator.as_deref() == Some(from_n.as_str()), "only the room's creator vouches for its members");
+    }
     if !state.private() {
         return Ok((false, None));
     }
@@ -468,6 +504,12 @@ mod tests {
         assert_eq!(plan("general", None, "eve", None).unwrap(), (false, None));
         assert_eq!(plan(&dm_id("a", "b"), None, "a", None).unwrap(), (true, Some(vec!["a".into(), "b".into()])));
         assert!(plan(&dm_id("a", "b"), None, "c", None).is_err());
+        // Only the creator vouches, and a vouch changes no membership.
+        let vouch = Event::Vouch { members: vec![] };
+        assert!(plan("dana/x", Some(&s), "bob", Some(&vouch)).is_err());
+        assert_eq!(plan("dana/x", Some(&s), "dana", Some(&vouch)).unwrap().1.unwrap(), ["bob", "dana"]);
+        let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "dana", &create), ev("2", "2026-01-01T00:00:02.000Z", "dana", &vouch)];
+        assert_eq!(fold("dana/x", &mut events).members.keys().collect::<Vec<_>>(), ["bob", "dana"]);
     }
 
     #[test]
@@ -479,5 +521,11 @@ mod tests {
         assert_eq!(m.event, Some(Event::Add { members: vec!["bob".into()] }));
         assert!(Meta::parse(r#"{"event":{"op":"leave"}}"#).is_err());
         assert!(Meta::parse(r#"{"grant":[{"env":"x","ck":"y"}]}"#).is_err());
+        let k = crate::keys::fmt_key(&crate::keys::Seed::generate().public());
+        let vouch = |name: &str, nodes: &str| format!(r#"{{"room":"dana/x","event":{{"op":"vouch","members":[{{"name":"{name}","sub":"agent:{name}","key":"{k}","nodes":[{nodes}]}}]}}}}"#);
+        assert!(Meta::parse(&vouch("bob", &format!("\"{k}\""))).is_ok());
+        assert!(Meta::parse(&vouch("bob", "")).is_err(), "a vouched member names at least one node");
+        assert!(Meta::parse(&vouch("bob", "\"x\"")).is_err(), "nodes are keys");
+        assert!(Meta::parse(&vouch("a b", &format!("\"{k}\""))).is_err());
     }
 }

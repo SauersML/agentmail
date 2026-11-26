@@ -317,6 +317,15 @@ impl Envelope {
     /// What any trusted node checks before keeping and forwarding an envelope it may not be able to read: framing,
     /// sizes, time and the writing node's signature and membership.
     pub fn check(&self, members: &MemberList, now_ms: i64) -> Result<()> {
+        self.check_frame(now_ms)?;
+        if !members.is_node(&parse_key(&self.node)?) {
+            bail!("written by a node that is not a member");
+        }
+        Ok(())
+    }
+
+    /// `check` without the membership of the writing node: framing, sizes, time and the node's signature.
+    pub fn check_frame(&self, now_ms: i64) -> Result<()> {
         if self.v != VERSION {
             bail!("unsupported envelope version {}", self.v);
         }
@@ -354,9 +363,6 @@ impl Envelope {
         let sig = b64u_decode(&self.sig).ok_or_else(|| anyhow!("bad sig"))?;
         if !keys::verify(&node, &self.signing_bytes(), &sig) {
             bail!("node signature does not verify");
-        }
-        if !members.is_node(&node) {
-            bail!("written by a node that is not a member");
         }
         Ok(())
     }

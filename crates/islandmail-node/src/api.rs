@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/rooms", get(rooms))
         .route("/api/room", get(room))
         .route("/api/room-keys", get(room_keys))
+        .route("/api/room-vouch", get(room_vouch))
         .route("/api/room-read", axum::routing::post(room_read))
         .route("/api/ui-sessions", axum::routing::post(ui_session))
         .route("/ui", get(crate::ui::page))
@@ -407,6 +408,19 @@ async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQue
     let node = s.node.clone();
     let keys = tokio::task::spawn_blocking(move || node.room_keys(&who, &id)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(json!({ "keys": keys }), 200))
+}
+
+/// GET /api/room-vouch?room=: what the room's creator vouches for now (its current members' keys and home nodes),
+/// for the creator's client to sign and post as a vouch event.
+async fn room_vouch(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
+    let p = params(&raw);
+    let id = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
+    if !islandmail_core::room::creator_of(&id).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
+        return Err(ApiError::new(403, "only the room's creator vouches for its members"));
+    }
+    let node = s.node.clone();
+    let members = tokio::task::spawn_blocking(move || node.vouch_entries(&id)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "members": members }), 200))
 }
 
 /// POST /api/room-read {room, seq}: the caller has read the room up to local seq `seq`.

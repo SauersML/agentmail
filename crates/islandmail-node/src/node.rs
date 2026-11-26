@@ -829,7 +829,17 @@ impl Node {
         if let Some(e) = event {
             body["event"] = serde_json::to_value(e).map_err(|e| ApiError::from(anyhow::Error::from(e)))?;
         }
-        Ok(self.post(who, &body)?.row)
+        let row = self.post(who, &body)?.row;
+        // The creator vouches again whenever it changes who is in the room, so hosts that trust only some of the
+        // members' nodes take the others' mail here (and stop when they leave).
+        use islandmail_core::room::Event;
+        if matches!(event, Some(Event::Create { .. } | Event::Add { .. } | Event::Remove { .. }))
+            && islandmail_core::room::creator_of(room).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
+            if let Err(e) = self.send_vouch(who, room) {
+                tracing::warn!("{room}: could not post the creator's vouch: {}", e.message);
+            }
+        }
+        Ok(row)
     }
 
     /// A new private room `who/name` (history full) with `members` that this host knows; returns the room id and the
@@ -928,19 +938,34 @@ impl Node {
             return Ok(None);
         }
         let members = self.members.read().unwrap().clone();
-        env.check(&members, now_millis())?;
+        env.check_frame(now_millis())?;
+        let read = if members.is_node(&parse_key(&env.node)?) {
+            self.open_trusted(&env, &members)?
+        } else {
+            // A node this host does not trust: only mail in a room whose creator vouched for it (`open_vouched`).
+            Some(self.open_vouched(&env, &members)?)
+        };
+        let Some((o, v)) = read else {
+            let extra = crate::store::Extra { kind: "mail", ..Default::default() };
+            return Ok(self.store.insert_with(&env, None, None, "[]", None, now_millis(), &extra)?.map(Arc::new));
+        };
+        self.store_opened(&env, o, v)
+    }
+
+    /// An envelope from a trusted node: opened and verified, or None to keep it sealed.
+    fn open_trusted(&self, env: &Envelope, members: &MemberList) -> Result<Option<(Opened, islandmail_core::Verified)>> {
         // Open with a slot for one of this node's keys, or a key grant that arrived before the envelope. Mail this node
         // cannot open (or that opens but does not verify) is kept and forwarded sealed: no sender, thread or text here.
         let opened = match env.open_for(self.opening_keys(env.ts_ms()).iter()) {
             Ok(Some(o)) => Some(o),
-            Ok(None) => self.checked_grants(&env)?.into_iter().next(),
+            Ok(None) => self.checked_grants(env)?.into_iter().next(),
             Err(e) => {
                 tracing::warn!("message {} has a slot for this node but does not open; kept sealed: {e:#}", &env.id[..12]);
                 None
             }
         };
-        let read = match opened {
-            Some(o) => match self.verify_read(&env, &o, &members) {
+        Ok(match opened {
+            Some(o) => match self.verify_read(env, &o, members) {
                 Ok(v) => Some((o, v)),
                 Err(e) => {
                     tracing::warn!("message {} opens here but does not verify; kept sealed: {e:#}", &env.id[..12]);
@@ -948,11 +973,35 @@ impl Node {
                 }
             },
             None => None,
-        };
-        let Some((o, v)) = read else {
-            let extra = crate::store::Extra { kind: "mail", ..Default::default() };
-            return Ok(self.store.insert_with(&env, None, None, "[]", None, now_millis(), &extra)?.map(Arc::new));
-        };
+        })
+    }
+
+    /// An envelope written by a node outside the trust file. It is taken only if it opens here, is a post in room R,
+    /// its sender (name, key) and this writing node are in the latest vouch of R's creator, and (in a private room)
+    /// the sender is a member now. Otherwise it is refused, not kept: `note_refused` retries it when trust or a vouch
+    /// changes. A vouch never comes from such a node, and a vouched node gains nothing outside R.
+    fn open_vouched(&self, env: &Envelope, members: &MemberList) -> Result<(Opened, islandmail_core::Verified)> {
+        let not_member = || anyhow::anyhow!("written by a node that is not a member");
+        let o = env.open_for(self.opening_keys(env.ts_ms()).iter()).ok().flatten().ok_or_else(not_member)?;
+        let meta = islandmail_core::room::Meta::parse(&o.body.meta).map_err(|_| not_member())?;
+        let room = meta.room.clone().filter(|r| *r == o.header.thread).ok_or_else(not_member)?;
+        anyhow::ensure!(!matches!(meta.event, Some(islandmail_core::room::Event::Vouch { .. })),
+                        "written by a node that is not a member (a vouch counts only from a trusted node)");
+        let h = &o.header;
+        let vouched = self.room_vouched(&room, members)?;
+        let writer = parse_key(&env.node)?;
+        let ok = vouched.iter().any(|a| islandmail_core::addr::same(&a.name, &h.from) && fmt_key(&a.key) == h.attest.key
+                                       && a.homes.contains(&writer));
+        anyhow::ensure!(ok, "written by a node that is not a member, and no vouch of {room}'s creator covers it for {}", h.from);
+        if let Some(state) = self.room_state(&room)?.filter(|s| s.private()) {
+            anyhow::ensure!(state.is_member(&h.from), "{} is not a member of {room} now", h.from);
+        }
+        let v = env.verify_opened(&o, members, &vouched)?;
+        anyhow::ensure!(o.body.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
+        Ok((o, v))
+    }
+
+    fn store_opened(&self, env: &Envelope, o: Opened, v: islandmail_core::Verified) -> Result<Option<Arc<Row>>> {
         let h = &o.header;
         let files_json = serde_json::to_string(&o.body.files)?;
         let (meta_raw, meta) = match islandmail_core::room::Meta::parse(&o.body.meta) {
@@ -967,10 +1016,14 @@ impl Node {
         let readers = (h.mode == Mode::Private).then(|| readers_of(&agents, h));
         let read = Read { header: h, v: &v, ck: &o.ck };
         let Some(row) =
-            self.store.insert_with(&env, Some(read), Some(&o.body.text), &files_json, readers.as_deref(), now_millis(), &extra)?
+            self.store.insert_with(env, Some(read), Some(&o.body.text), &files_json, readers.as_deref(), now_millis(), &extra)?
         else {
             return Ok(None);
         };
+        if meta.event.is_some() {
+            // Membership and vouches decide which refused envelopes may now be taken.
+            self.trust.send_modify(|g| *g += 1);
+        }
         if h.mode == Mode::Private {
             let granted: Vec<String> = self.store.grants_for(&env.id)?.into_iter().flat_map(|g| g.2).collect();
             if !granted.is_empty() {
@@ -978,7 +1031,7 @@ impl Node {
             }
         }
         if !meta.grant.is_empty() {
-            self.apply_grant(&env, h, &meta, &agents)?;
+            self.apply_grant(env, h, &meta, &agents)?;
         }
         let _ = self.store.seen(&h.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
@@ -1194,14 +1247,94 @@ impl Node {
         Ok(Some(room::fold(id, &mut events)))
     }
 
+    /// The agents in the latest vouch of `room`'s creator, as this host may use them in that room only. The vouch must
+    /// be in an envelope written by a node in the trust file. Left out: names this host already knows, names under
+    /// a trusted node's names or pinned, and agents homed at a trusted node (those come from the trust file and
+    /// certificates as always). Each comes as a pinned agent whose homes are the vouched nodes.
+    pub fn room_vouched(&self, room: &str, members: &MemberList) -> Result<Vec<Agent>> {
+        use islandmail_core::room::{creator_of, Event, Meta};
+        let Some(creator) = creator_of(room).map(norm) else { return Ok(vec![]) };
+        let mut latest: Option<(String, String, Vec<islandmail_core::room::VouchEntry>)> = None;
+        for (id, ts, from, raw) in self.store.room_events(room)? {
+            if norm(&from) != creator || latest.as_ref().is_some_and(|(t, i, _)| (t, i) >= (&ts, &id)) {
+                continue;
+            }
+            let Ok(Meta { event: Some(Event::Vouch { members: entries }), .. }) = Meta::parse(&raw) else { continue };
+            let Some(raw_env) = self.store.envelopes(std::slice::from_ref(&id))?.pop() else { continue };
+            let trusted = serde_json::from_str::<Envelope>(&raw_env).ok()
+                .and_then(|e| parse_key(&e.node).ok()).is_some_and(|k| members.is_node(&k));
+            if trusted {
+                latest = Some((ts, id, entries));
+            }
+        }
+        let Some((_, _, entries)) = latest else { return Ok(vec![]) };
+        let known = self.agents();
+        let trusted = members.node_keys();
+        Ok(entries.into_iter().filter_map(|v| {
+            let same = |n: &str| islandmail_core::addr::same(n, &v.name);
+            if known.iter().any(|a| same(&a.name)) || members.members.iter().any(|m| same(&m.name))
+                || members.nodes.iter().any(|n| n.covers(&v.name)) {
+                return None;
+            }
+            let key = parse_key(&v.key).ok()?;
+            let homes: Vec<PublicKey> = v.nodes.iter().filter_map(|n| parse_key(n).ok()).collect();
+            if homes.is_empty() || homes.iter().any(|h| trusted.contains(h)) {
+                return None;
+            }
+            Some(Agent { name: v.name, sub: v.sub, key, homes, certs: vec![], pinned: true })
+        }).collect())
+    }
+
+    /// What `room`'s creator vouches for now: each current member this host knows, with its key and home nodes.
+    pub fn vouch_entries(&self, room: &str) -> Result<Vec<islandmail_core::room::VouchEntry>, ApiError> {
+        let members = self.members.read().unwrap().clone();
+        let state = self.room_state(room)?.ok_or_else(|| ApiError::new(404, format!("no room {room} here")))?;
+        let agents = self.agents();
+        let vouched = self.room_vouched(room, &members)?;
+        let mut out = Vec::new();
+        for name in state.members.keys() {
+            let Some(a) = agents.iter().chain(vouched.iter()).find(|a| islandmail_core::addr::same(&a.name, name)) else { continue };
+            if a.homes.is_empty() {
+                continue;
+            }
+            out.push(islandmail_core::room::VouchEntry {
+                name: a.name.clone(), sub: a.sub.clone(), key: fmt_key(&a.key),
+                nodes: a.homes.iter().take(islandmail_core::room::MAX_VOUCH_NODES).map(fmt_key).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Post the creator's vouch for `room`'s current members (after it created the room or changed who is in it).
+    fn send_vouch(&self, who: &Caller, room: &str) -> Result<(), ApiError> {
+        let entries = self.vouch_entries(room)?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let text = format!("vouched for the nodes of {}", entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
+        self.room_send(who, room, &text, None, Some(&islandmail_core::room::Event::Vouch { members: entries }))?;
+        Ok(())
+    }
+
     /// Where a post in `room` by `from` goes, with an optional membership event.
     pub fn room_plan(&self, room: &str, from: &str, event: Option<&islandmail_core::room::Event>, members: &MemberList,
                      agents: &[Agent]) -> Result<Plan, ApiError> {
         let state = self.room_state(room)?;
         let (private, names) = islandmail_core::room::plan(room, state.as_ref(), from, event)
             .map_err(|e| ApiError::new(if e.to_string().contains("no room") { 404 } else { 403 }, format!("{e}")))?;
+        // Members this host knows only through the creator's vouch: sealed to as well, in this room only.
+        let vouched = self.room_vouched(room, members)?;
         if !private {
-            let keys = Self::recipients(members, agents, "all", from, Mode::Members)?;
+            let mut keys = Self::recipients(members, agents, "all", from, Mode::Members)?;
+            for a in &vouched {
+                keys.push(a.key);
+                keys.extend(a.homes.iter().copied());
+            }
+            keys.sort();
+            keys.dedup();
+            if keys.len() > islandmail_core::envelope::MAX_KEYS {
+                return Err(ApiError::new(503, "more recipient keys than an envelope holds"));
+            }
             return Ok(Plan { to: islandmail_core::room::room_to(room), mode: Mode::Members, keys, names: None });
         }
         let names = names.unwrap_or_default();
@@ -1210,7 +1343,7 @@ impl Node {
             None => islandmail_core::room::room_to(room),
         };
         let mut keys = Vec::new();
-        for a in agents.iter().filter(|a| names.contains(&norm(&a.name)) || islandmail_core::addr::same(&a.name, from)) {
+        for a in agents.iter().chain(vouched.iter()).filter(|a| names.contains(&norm(&a.name)) || islandmail_core::addr::same(&a.name, from)) {
             keys.push(a.key);
             keys.extend(a.homes.iter().copied());
         }

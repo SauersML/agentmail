@@ -971,6 +971,27 @@ def room_info(ident, room):
     return api(ident, "GET", "/api/room?" + urllib.parse.urlencode({"id": room}))["room"]
 
 
+def room_vouch(ident, room, quiet=True):
+    # The creator vouches for its members' keys and home nodes, so a host that trusts only some of those nodes takes
+    # the others' mail in this room (README: rooms across nodes that do not trust each other). Others: nothing.
+    if "/" not in room or _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
+        return None
+    entries = api(ident, "GET", "/api/room-vouch?" + urllib.parse.urlencode({"room": room}))["members"]
+    if not entries:
+        return None
+    text = "vouched for the nodes of " + ", ".join(e["name"] for e in entries)
+    return room_post(ident, room, text, event={"op": "vouch", "members": entries}, quiet=quiet)
+
+
+def cmd_room_vouch(a):
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name)
+    if "/" not in room or _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
+        raise Fail("only the room's creator vouches for its members")
+    m = room_vouch(ident, room)
+    print("vouched in %s (%s)" % (room, m["id"]) if m else "nothing to vouch for in %s" % room)
+
+
 def room_event(ident, name, event, text):
     room = room_id(ident, name)
     m = room_post(ident, room, text, event=event, quiet=True)
@@ -988,6 +1009,7 @@ def cmd_room_create(a):
     if with_:
         text += " with " + ", ".join("@" + w for w in with_)
     m = room_post(ident, room, text, event=event, quiet=True)
+    room_vouch(ident, room)
     print("created %s room %s (%s)%s" % ("open" if a.open else "private", room, m["id"],
                                          "" if a.open else "; members: " + ", ".join([ident["name"]] + with_)))
 
@@ -1019,6 +1041,7 @@ def room_add(ident, room, names, grants=True):
     names = [n.lstrip("@") for n in names if n.lstrip("@")]
     info = room_info(ident, room)
     room_post(ident, room, "added " + ", ".join("@" + n for n in names), event={"op": "add", "members": names}, quiet=True)
+    room_vouch(ident, room)
     note = ""
     if info["kind"] == "private" and not grants:
         note = "; their agent is not known here yet, so they see only messages from now on"
@@ -1304,6 +1327,7 @@ def cmd_room_leave(a):
 def cmd_room_remove(a):
     ident = load_identity(a.as_)
     room, _ = room_event(ident, a.name, {"op": "remove", "members": a.names}, "removed " + ", ".join(a.names))
+    room_vouch(ident, room)
     print("removed %s from %s" % (", ".join(a.names), room))
 
 
@@ -1473,6 +1497,7 @@ def cmd_room_new(a):
     if members:
         text += " with " + ", ".join("@" + w for w in members)
     room_post(ident, room, text, event=event, quiet=True)
+    room_vouch(ident, room)
     print("created %s%s" % (room, " with " + ", ".join("@" + w for w in members) if members else ""))
     for w in outside:
         try:
@@ -2104,6 +2129,9 @@ def main():
     p.add_argument("name")
     p.add_argument("names", nargs="+")
     p.set_defaults(fn=cmd_room_remove)
+    p = rsub.add_parser("vouch", help="vouch for the members' nodes again (the creator only; create/add/remove do it)")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_room_vouch)
     p = rsub.add_parser("topic")
     p.add_argument("name")
     p.add_argument("text")
