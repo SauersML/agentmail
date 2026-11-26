@@ -85,6 +85,10 @@ fn tools() -> Value {
             "room": { "type": "string" }, "text": { "type": "string" },
             "reply_to": { "type": "string", "description": "Id of the message this answers (optional)" } },
             "required": ["room", "text"] } },
+        { "name": "room_new", "description": "Start a group chat: a private room YOU/NAME with these members (full history for anyone added later).",
+          "inputSchema": { "type": "object", "properties": {
+            "name": { "type": "string" }, "members": { "type": "array", "items": { "type": "string" } },
+            "topic": { "type": "string" } }, "required": ["name"] } },
     ])
 }
 
@@ -527,6 +531,16 @@ impl Conn {
                         r["members"].as_array().map(|m| m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default())
                 }).collect::<Vec<_>>().join("\n"))
             }
+            "room_new" => {
+                let members: Vec<String> = args["members"].as_array()
+                    .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
+                let (room, unknown) = n.new_room(me, args["name"].as_str().unwrap_or(""), &members, args["topic"].as_str().unwrap_or(""))?;
+                let mut out = format!("Created private room {room}; post with room_send.");
+                if !unknown.is_empty() {
+                    out += &format!(" Not on this network yet (invite them, then add them): {}.", unknown.join(", "));
+                }
+                Ok(out)
+            }
             "room_send" => {
                 let room = args["room"].as_str().unwrap_or("").to_string();
                 let reply_to = args["reply_to"].as_str();
@@ -562,13 +576,7 @@ impl Conn {
 
     /// Post as the connected agent in a room (the node signs: the agent's identity file is in identities_dir).
     fn room_send(&self, room: &str, text: &str, reply_to: Option<&str>) -> Result<Row, ApiError> {
-        let members = self.node.members.read().unwrap().clone();
-        let plan = self.node.room_plan(room, &self.who.name, None, &members, &self.node.agents())?;
-        let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true });
-        if let Some(id) = reply_to {
-            body["reply_to"] = json!(crate::api::resolve(&self.node, id, &self.who)?.env_id);
-        }
-        Ok(self.node.post(&self.who, &body)?.row)
+        self.node.room_send(&self.who, room, text, reply_to, None)
     }
 
     /// The channel descriptor of a room (from `Node::rooms`).

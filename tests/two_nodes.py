@@ -368,7 +368,7 @@ def main():
             check("MCPL initialize", init["result"]["serverInfo"]["name"] == "islandmail" and "mcpl" in init["result"]["capabilities"]["experimental"])
             ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             tl = json.loads(ws.recv(timeout=5))
-            check("MCPL tools/list", [t["name"] for t in tl["result"]["tools"]] == ["send", "inbox", "thread", "threads", "who", "search", "get", "rooms", "room_send"])
+            check("MCPL tools/list", [t["name"] for t in tl["result"]["tools"]] == ["send", "inbox", "thread", "threads", "who", "search", "get", "rooms", "room_send", "room_new"])
             ws.send(json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "thread", "arguments": {"thread": "t1"}}}))
             tc = json.loads(ws.recv(timeout=5))
             check("MCPL tools/call thread", "hello from A" in tc["result"]["content"][0]["text"])

@@ -1,6 +1,7 @@
-//! The read-only room view at /ui. The page itself is public (it holds no data); its JSON calls carry a view key
+//! The room view at /ui. The page itself is public (it holds no data); its JSON calls carry a view key
 //! (`Bearer ui.KEY`) that an agent mints with its own agent token (`islandmail.py ui`). A key reads what that agent
-//! may read, for at most 12 hours, and nothing else: no posting, no read cursors.
+//! may read and moves its read cursors, for at most 12 hours. A posting key (`islandmail.py ui --post`) also posts,
+//! starts rooms and replies as the agent: the node signs with the agent key lent for that session.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -22,35 +23,51 @@ const MAX_SESSIONS: usize = 256;
 
 #[derive(Default)]
 pub struct Sessions {
-    open: Mutex<HashMap<String, Caller>>,
+    open: Mutex<HashMap<String, (Caller, bool)>>,
 }
 
 impl Sessions {
     /// A new view key for `who`, valid until the earlier of 12 hours and the agent token's own expiry.
-    pub fn open(&self, mut who: Caller) -> (String, i64) {
+    pub fn open(&self, mut who: Caller, post: bool) -> (String, i64) {
         let now = now_millis();
         who.exp_ms = (now + SESSION_MS).min(who.exp_ms.max(now + 600_000));
         let key = islandmail_core::b64u(&islandmail_core::random_bytes::<24>());
         let mut open = self.open.lock().unwrap();
-        open.retain(|_, c| c.exp_ms > now);
+        open.retain(|_, (c, _)| c.exp_ms > now);
         if open.len() >= MAX_SESSIONS {
-            if let Some(oldest) = open.iter().min_by_key(|(_, c)| c.exp_ms).map(|(k, _)| k.clone()) {
+            if let Some(oldest) = open.iter().min_by_key(|(_, (c, _))| c.exp_ms).map(|(k, _)| k.clone()) {
                 open.remove(&oldest);
             }
         }
         let exp = who.exp_ms;
-        open.insert(key.clone(), who);
+        open.insert(key.clone(), (who, post));
         (key, exp)
     }
 
-    fn get(&self, key: &str) -> Option<Caller> {
+    fn get(&self, key: &str) -> Option<(Caller, bool)> {
         let open = self.open.lock().unwrap();
-        open.get(key).filter(|c| c.exp_ms > now_millis()).cloned()
+        open.get(key).filter(|(c, _)| c.exp_ms > now_millis()).cloned()
     }
 }
 
 /// The agent a view key belongs to, while it is still an active member here.
 pub struct Viewer(Caller);
+
+/// A view key that may also post.
+pub struct Poster(Caller);
+
+impl FromRequestParts<AppState> for Poster {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let Viewer(who) = Viewer::from_request_parts(parts, state).await?;
+        let key = crate::api::bearer(&parts.headers).and_then(|t| t.strip_prefix("ui.").map(String::from)).unwrap_or_default();
+        match state.ui.get(&key) {
+            Some((_, true)) => Ok(Poster(who)),
+            _ => Err(ApiError::new(403, "this link is read-only; for one that posts: islandmail.py ui --post")),
+        }
+    }
+}
 
 impl FromRequestParts<AppState> for Viewer {
     type Rejection = ApiError;
@@ -58,7 +75,7 @@ impl FromRequestParts<AppState> for Viewer {
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
         let key = crate::api::bearer(&parts.headers).and_then(|t| t.strip_prefix("ui.").map(String::from))
             .ok_or_else(|| ApiError::new(401, "open this page with the link from: islandmail.py ui"))?;
-        let who = state.ui.get(&key).ok_or_else(|| ApiError::new(401, "this view key expired; get a new link: islandmail.py ui"))?;
+        let (who, _) = state.ui.get(&key).ok_or_else(|| ApiError::new(401, "this view key expired; get a new link: islandmail.py ui"))?;
         if !state.node.active(&who) {
             return Err(ApiError::new(401, "session expired or membership changed"));
         }
@@ -80,9 +97,58 @@ pub async fn page() -> Response {
     r
 }
 
-pub async fn me(State(s): State<AppState>, Viewer(who): Viewer) -> Result<Response, ApiError> {
+pub async fn me(State(s): State<AppState>, Viewer(who): Viewer, headers: axum::http::HeaderMap) -> Result<Response, ApiError> {
+    let key = crate::api::bearer(&headers).and_then(|t| t.strip_prefix("ui.").map(String::from)).unwrap_or_default();
+    let post = s.ui.get(&key).is_some_and(|(_, p)| p);
+    let agents: Vec<String> = s.node.agents().iter().map(|a| a.name.clone()).collect();
     Ok(json_resp(json!({ "name": who.name, "sub": who.sub, "node": islandmail_core::keys::fmt_key(&s.node.seed.public()),
-                         "expires": islandmail_core::ts_from_millis(who.exp_ms) }), 200))
+                         "expires": islandmail_core::ts_from_millis(who.exp_ms), "post": post, "agents": agents }), 200))
+}
+
+fn body_json(body: &[u8]) -> Result<serde_json::Value, ApiError> {
+    serde_json::from_slice(body).map_err(|_| ApiError::new(400, "body is not valid JSON"))
+}
+
+/// POST /ui/api/messages {room, text, reply_to?}: post in a room as the key's agent.
+pub async fn post(State(s): State<AppState>, Poster(who): Poster, body: axum::body::Bytes) -> Result<Response, ApiError> {
+    let v = body_json(&body)?;
+    let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?.to_string();
+    let text = v["text"].as_str().unwrap_or("").to_string();
+    if text.trim().is_empty() {
+        return Err(ApiError::new(400, "nothing to send"));
+    }
+    let reply_to = v["reply_to"].as_str().map(String::from);
+    let node = s.node.clone();
+    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, ApiError> {
+        let row = node.room_send(&who, &room, &text, reply_to.as_deref(), None)?;
+        Ok(json!({ "message": messages_json(&node, &[row], &who).pop() }))
+    }).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(out, 201))
+}
+
+/// POST /ui/api/rooms/new {name, members: [..], topic?}: a private room NAME of the key's agent with those members.
+pub async fn new_room(State(s): State<AppState>, Poster(who): Poster, body: axum::body::Bytes) -> Result<Response, ApiError> {
+    let v = body_json(&body)?;
+    let name = v["name"].as_str().unwrap_or("").to_string();
+    let members: Vec<String> = match &v["members"] {
+        serde_json::Value::Array(a) => a.iter().filter_map(|m| m.as_str().map(String::from)).collect(),
+        serde_json::Value::String(t) => t.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(String::from).collect(),
+        _ => Vec::new(),
+    };
+    let topic = v["topic"].as_str().unwrap_or("").to_string();
+    let node = s.node.clone();
+    let (room, unknown) = tokio::task::spawn_blocking(move || node.new_room(&who, &name, &members, &topic))
+        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "room": room, "unknown": unknown }), 201))
+}
+
+/// POST /ui/api/read {room, seq}: the viewer has seen the room up to `seq` (clears its unread count).
+pub async fn mark_read(State(s): State<AppState>, Viewer(who): Viewer, body: axum::body::Bytes) -> Result<Response, ApiError> {
+    let v = body_json(&body)?;
+    let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?;
+    let seq = v["seq"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "seq is required"))?;
+    s.node.store.mark_read(&who, room, seq)?;
+    Ok(json_resp(json!({ "ok": true }), 200))
 }
 
 pub async fn rooms(State(s): State<AppState>, Viewer(who): Viewer) -> Result<Response, ApiError> {

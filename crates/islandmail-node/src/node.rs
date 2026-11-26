@@ -100,6 +100,9 @@ pub struct Node {
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
     auth_seen: Mutex<HashSet<(String, &'static str)>>,
+    /// Agent keys a post-capable /ui session lent this node (in memory only, until the session expires): agent key ->
+    /// (seed, expiry ms).
+    lent: Mutex<HashMap<String, (Seed, i64)>>,
 }
 
 impl Node {
@@ -127,6 +130,7 @@ impl Node {
             rates: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
             auth_seen: Mutex::new(HashSet::new()),
+            lent: Mutex::new(HashMap::new()),
         };
         node.refresh();
         node
@@ -666,11 +670,72 @@ impl Node {
     /// The caller's agent key, if this node holds it: an identity named like the caller with the caller's key
     /// (which the token check already tied to the pin or certificate). (key string, seed)
     fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
-        self.opts
+        let held = self.opts
             .identities
             .iter()
             .find(|(n, s)| islandmail_core::addr::same(n, &who.name) && fmt_key(&s.public()) == who.key)
-            .map(|(_, s)| (who.key.clone(), s.clone()))
+            .map(|(_, s)| (who.key.clone(), s.clone()));
+        held.or_else(|| {
+            let mut lent = self.lent.lock().unwrap();
+            let now = now_millis();
+            lent.retain(|_, (_, exp)| *exp > now);
+            lent.get(&who.key).filter(|(s, _)| fmt_key(&s.public()) == who.key).map(|(s, _)| (who.key.clone(), s.clone()))
+        })
+    }
+
+    /// Lend this node the caller's agent key until `exp_ms` so it can sign the caller's posts from /ui (memory only).
+    pub fn lend_key(&self, who: &Caller, seed: Seed, exp_ms: i64) -> Result<(), ApiError> {
+        if fmt_key(&seed.public()) != who.key {
+            return Err(ApiError::new(400, "that seed is not the signed-in agent's key"));
+        }
+        let mut lent = self.lent.lock().unwrap();
+        let keep = lent.get(&who.key).map_or(0, |(_, e)| *e);
+        lent.insert(who.key.clone(), (seed, exp_ms.max(keep)));
+        Ok(())
+    }
+
+    /// Post as `who` in a room, signed by this node with the caller's held or lent key: the room's plan decides the
+    /// recipients and mode. `reply_to` is a message id prefix or envelope hash; `event` a membership event.
+    pub fn room_send(&self, who: &Caller, room: &str, text: &str, reply_to: Option<&str>,
+                     event: Option<&islandmail_core::room::Event>) -> Result<crate::store::Row, ApiError> {
+        let members = self.members.read().unwrap().clone();
+        let plan = self.room_plan(room, &who.name, event, &members, &self.agents())?;
+        let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true });
+        if let Some(id) = reply_to.filter(|r| !r.is_empty()) {
+            body["reply_to"] = json!(crate::api::resolve(self, id, who)?.env_id);
+        }
+        if let Some(e) = event {
+            body["event"] = serde_json::to_value(e).map_err(|e| ApiError::from(anyhow::Error::from(e)))?;
+        }
+        Ok(self.post(who, &body)?.row)
+    }
+
+    /// A new private room `who/name` (history full) with `members` that this host knows; returns the room id and the
+    /// names it does not know (to invite).
+    pub fn new_room(&self, who: &Caller, name: &str, members: &[String], topic: &str)
+                    -> Result<(String, Vec<String>), ApiError> {
+        let room = format!("{}/{}", norm(&who.name), name.trim());
+        let ok = |c: char| c.is_alphanumeric() || "._-".contains(c);
+        if name.trim().is_empty() || !name.trim().chars().all(ok) || !islandmail_core::room::valid_room_id(&room) {
+            return Err(ApiError::new(400, "a room name is letters, digits, dot, dash or underscore"));
+        }
+        if self.room_state(&room)?.is_some() {
+            return Err(ApiError::new(409, format!("you already have a room {room}")));
+        }
+        let agents = self.agents();
+        let (known, unknown): (Vec<String>, Vec<String>) = members.iter()
+            .map(|m| norm(m.trim_start_matches('@')))
+            .filter(|m| !m.is_empty() && !islandmail_core::addr::same(m, &who.name))
+            .partition(|m| agents.iter().any(|a| islandmail_core::addr::same(&a.name, m)));
+        let event = islandmail_core::room::Event::Create {
+            private: true, history: islandmail_core::room::History::Full, topic: topic.trim().to_string(), members: known.clone(),
+        };
+        let mut text = "created this private room".to_string();
+        if !known.is_empty() {
+            text += &format!(" with {}", known.iter().map(|m| format!("@{m}")).collect::<Vec<_>>().join(", "));
+        }
+        self.room_send(who, &room, &text, None, Some(&event))?;
+        Ok((room, unknown))
     }
 
     /// The exact keys a post is sealed to. Members mode: every pinned agent and node key and every certified agent

@@ -66,7 +66,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ui", get(crate::ui::page))
         .route("/ui/api/me", get(crate::ui::me))
         .route("/ui/api/rooms", get(crate::ui::rooms))
-        .route("/ui/api/messages", get(crate::ui::messages))
+        .route("/ui/api/messages", get(crate::ui::messages).post(crate::ui::post))
+        .route("/ui/api/rooms/new", axum::routing::post(crate::ui::new_room))
+        .route("/ui/api/read", axum::routing::post(crate::ui::mark_read))
         .route("/ui/api/files/{id}", get(crate::ui::file))
         .route("/api/threads", get(threads))
         .route("/api/names", get(names))
@@ -351,9 +353,24 @@ async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Resul
     Ok(json_resp(json!({ "ok": true }), 200))
 }
 
-/// POST /api/ui-sessions: a read-only key for the /ui page, bound to the caller, for at most 12 hours.
-async fn ui_session(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
-    let (key, exp) = s.ui.open(who);
+/// POST /api/ui-sessions: a key for the /ui page, bound to the caller, for at most 12 hours. Read-only by default;
+/// `{"post": true, "seed": HEX}` lends the node the caller's agent key (memory only, until the key expires) so the page
+/// can post as the caller.
+async fn ui_session(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
+    let v: Value = if body.is_empty() { json!({}) } else {
+        serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?
+    };
+    let post = v["post"] == json!(true);
+    let seed = if post {
+        let hex = v["seed"].as_str().ok_or_else(|| ApiError::new(400, "a posting key needs the agent's seed"))?;
+        Some(islandmail_core::keys::Seed::from_hex(hex).map_err(|_| ApiError::new(400, "seed must be 64 hex digits"))?)
+    } else {
+        None
+    };
+    let (key, exp) = s.ui.open(who.clone(), post);
+    if let Some(seed) = seed {
+        s.node.lend_key(&who, seed, exp)?;
+    }
     Ok(json_resp(json!({ "key": key, "expires": islandmail_core::ts_from_millis(exp), "path": format!("/ui#k={key}") }), 201))
 }
 

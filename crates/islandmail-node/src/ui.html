@@ -64,7 +64,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 
 /* main */
 .main { display: grid; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr); grid-template-areas: "head" "members" "msgs"; }
+  grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "members" "msgs" "compose"; }
 .head { grid-area: head; display: flex; align-items: flex-start; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--border); min-width: 0; }
 .back { display: none; width: 30px; height: 30px; border-radius: 8px; align-items: center; justify-content: center; font-size: 18px; color: var(--muted); flex: none; }
 .back:hover { background: var(--hover); }
@@ -89,7 +89,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .mini { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 50% var(--av-l)); flex: none; }
 li.gone .mini { background: var(--border-strong); }
 @media (min-width: 1100px) {
-  .main { grid-template-columns: minmax(0, 1fr) 240px; grid-template-rows: auto minmax(0, 1fr); grid-template-areas: "head head" "msgs members"; }
+  .main { grid-template-columns: minmax(0, 1fr) 240px; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "head head" "msgs members" "compose members"; }
   .members, .members.open { display: block; max-height: none; border-bottom: 0; border-left: 1px solid var(--border); padding: 14px 18px; }
   .members ul { display: block; }
   .members li { padding: 3px 0; }
@@ -98,6 +98,40 @@ li.gone .mini { background: var(--border-strong); }
 .scroll { grid-area: msgs; overflow-y: auto; overflow-x: hidden; min-height: 0; position: relative; }
 .list { padding: 4px 0 18px; }
 [hidden] { display: none !important; }
+/* composer */
+.compose { grid-area: compose; padding: 8px 20px 16px; }
+.compose .box { border: 1px solid var(--border-strong); border-radius: 12px; background: var(--input); display: flex; align-items: flex-end; gap: 8px; padding: 6px 6px 6px 12px; }
+.compose .box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.compose textarea { flex: 1; min-width: 0; border: 0; outline: none; resize: none; background: transparent; color: var(--text);
+  font: inherit; line-height: 1.45; max-height: 160px; padding: 5px 0; }
+.compose .send { flex: none; background: var(--accent); color: var(--on-accent); border-radius: 8px; padding: 5px 12px; font-size: 13.5px; font-weight: 600; }
+.compose .send:disabled { opacity: .45; cursor: default; }
+.compose .hint { font-size: 11.5px; color: var(--faint); margin: 5px 4px 0; display: flex; gap: 10px; flex-wrap: wrap; }
+.compose .err { color: #c0473a; }
+.replying { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); margin: 0 4px 6px; min-width: 0; }
+.replying .q { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.replying button { color: var(--faint); font-size: 14px; padding: 0 4px; }
+.sugg { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 4px 6px; }
+.sugg button { font-size: 12.5px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px; background: var(--side); }
+.sugg button.on { border-color: var(--accent); color: var(--accent); }
+.msg .act { visibility: hidden; font-size: 12px; color: var(--faint); margin-left: 8px; border-radius: 6px; padding: 0 6px; }
+.msg:hover .act, .msg:focus-within .act { visibility: visible; }
+.msg .act:hover { background: var(--hover); color: var(--text); }
+.newroom { flex: none; font-size: 12.5px; font-weight: 600; color: var(--accent); border: 1px solid var(--border); border-radius: 7px; padding: 2px 9px; margin-left: auto; background: var(--input); }
+.newroom:hover { background: var(--accent-weak); }
+.room .udot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
+/* dialog */
+.modal { position: fixed; inset: 0; background: rgba(10, 12, 20, .38); display: grid; place-items: center; padding: 16px; z-index: 20; }
+.modal form { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; box-shadow: 0 12px 40px rgba(0, 0, 0, .18); }
+.modal h2 { margin: 0 0 14px; font-size: 16px; letter-spacing: -.01em; }
+.modal label { display: block; font-size: 12.5px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+.modal input { width: 100%; font: inherit; font-size: 14px; color: var(--text); background: var(--input); border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 10px; outline: none; }
+.modal input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.modal .row button { border-radius: 8px; padding: 6px 14px; font-size: 13.5px; font-weight: 600; }
+.modal .ok { background: var(--accent); color: var(--on-accent); }
+.modal .cancel { color: var(--muted); }
+.modal .msgline { font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 1em; }
 .more { display: block; margin: 14px auto 4px; font-size: 13px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 4px 12px; }
 .more:hover { background: var(--hover); color: var(--text); }
 .placeholder { grid-column: 1 / -1; grid-row: 1 / -1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
@@ -166,7 +200,7 @@ a.chip:hover { background: var(--hover); border-color: var(--border-strong); }
 <div class="app" id="app">
   <aside class="side">
     <div class="side-head">
-      <div class="brand"><span class="dot" id="dot"></span>Rooms</div>
+      <div class="brand"><span class="dot" id="dot"></span>Rooms<button class="newroom" id="newroom" type="button" hidden>New room</button></div>
       <input class="filter" id="filter" type="search" placeholder="Filter rooms" autocomplete="off" spellcheck="false">
     </div>
     <nav class="rooms" id="rooms"></nav>
@@ -202,7 +236,7 @@ let KEY = null;
 function gate(title, cmdIntro) {
   if (document.querySelector('.gate')) return;
   const g = el('div', 'gate'), c = el('div', 'card');
-  c.append(el('h2', null, title), el('p', null, cmdIntro), el('code', null, 'python3 clients/islandmail.py ui'));
+  c.append(el('h2', null, title), el('p', null, cmdIntro), el('code', null, 'python3 clients/islandmail.py ui --post'));
   g.append(c); document.body.append(g);
 }
 const noKey = () => gate('Islandmail rooms', 'Open this page with the link from:');
@@ -213,6 +247,14 @@ async function req(path) {
   if (r.status === 401) { expired(); throw new Error('unauthorized'); }
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r;
+}
+async function send(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { Authorization: 'Bearer ui.' + KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body), cache: 'no-store' });
+  if (r.status === 401) { expired(); throw new Error('unauthorized'); }
+  let j = {}; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+  return j;
 }
 async function api(path) {
   try { const j = await (await req(path)).json(); dotEl.classList.remove('off'); return j; }
@@ -308,6 +350,7 @@ function renderRooms() {
     b.type = 'button'; b.dataset.id = r.id; b.onclick = () => selectRoom(r.id);
     const r1 = el('div', 'r1'), r2 = el('div', 'r2');
     r1.append(glyph(r.kind), el('span', 'label', r.label || r.id));
+    if (r.unread > 0 && r.id !== S.cur) r1.append(el('span', 'udot'));
     if (r.last) { const w = el('span', 'when num', rel(r.last.ts)); w.title = abs(r.last.ts); r1.append(w); }
     const sn = r.last ? (r.last.kind === 'event' ? r.last.from + ' ' + (r.last.snippet || '') : r.last.from + ': ' + (r.last.snippet || '')) : (r.topic || '');
     r2.append(el('span', 'snip', sn.replace(/\s+/g, ' ')));
@@ -342,7 +385,8 @@ function renderHead() {
   t.append(t1); if (r.topic) t.append(el('div', 'topic', r.topic));
   const mt = el('button', 'mtoggle num', ((r.members || []).length) + ' ' + (r.participants ? 'participants' : 'members'));
   mt.type = 'button'; mt.onclick = () => { S.membersOpen = !S.membersOpen; document.getElementById('members').classList.toggle('open', S.membersOpen); };
-  h.append(back, t, mt, el('span', 'ro', 'read-only'));
+  h.append(back, t, mt);
+  if (!canPost()) h.append(el('span', 'ro', 'read-only'));
   return h;
 }
 function renderMembers() {
@@ -366,6 +410,99 @@ function buildPane() {
   scrollEl.append(moreBtn, listEl);
   scrollEl.addEventListener('scroll', () => { S.pinned = nearBottom(); });
   mainEl.replaceChildren(head, mem, scrollEl); renderMembers();
+  if (canPost()) mainEl.append(buildComposer());
+}
+const canPost = () => !!(S.me && S.me.post);
+
+/* ---------- composer ---------- */
+let C = null;
+function memberNames() { const r = roomMeta(); return (r.members || []).filter(n => !S.me || n !== S.me.name); }
+function buildComposer() {
+  const wrap = el('div', 'compose'), rep = el('div', 'replying'), sugg = el('div', 'sugg'), box = el('div', 'box');
+  const ta = el('textarea'); ta.rows = 1; ta.placeholder = 'Message ' + (roomMeta().label || S.cur); ta.setAttribute('aria-label', 'Message');
+  const btn = el('button', 'send', 'Send'); btn.type = 'button';
+  const hint = el('div', 'hint'); hint.append(el('span', null, 'Enter to send · Shift+Enter for a new line · @ to mention'));
+  const err = el('span', 'err'); hint.append(err);
+  rep.hidden = true; sugg.hidden = true;
+  box.append(ta, btn); wrap.append(rep, sugg, box, hint);
+  C = { ta, btn, rep, sugg, err, replyTo: null, pick: 0, opts: [] };
+  const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(160, ta.scrollHeight) + 'px'; };
+  ta.addEventListener('input', () => { grow(); suggest(); C.err.textContent = ''; });
+  ta.addEventListener('keydown', ev => {
+    if (!C.sugg.hidden && (ev.key === 'Tab' || (ev.key === 'Enter' && !ev.shiftKey))) { ev.preventDefault(); takeSuggestion(C.opts[C.pick]); return; }
+    if (!C.sugg.hidden && (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft')) { ev.preventDefault(); C.pick = (C.pick + (ev.key === 'ArrowRight' ? 1 : C.opts.length - 1)) % C.opts.length; drawSugg(); return; }
+    if (ev.key === 'Escape') { if (!C.sugg.hidden) { C.sugg.hidden = true; } else setReply(null); return; }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); submit(); }
+  });
+  btn.onclick = submit;
+  return wrap;
+}
+function mentionAt() {
+  const v = C.ta.value.slice(0, C.ta.selectionStart), m = /(^|[^\w.])@([\w.-]*)$/.exec(v);
+  return m ? { start: v.length - m[2].length - 1, frag: m[2].toLowerCase() } : null;
+}
+function suggest() {
+  const at = mentionAt();
+  C.opts = at ? memberNames().filter(n => n.toLowerCase().startsWith(at.frag)).slice(0, 6) : [];
+  C.pick = 0; drawSugg();
+}
+function drawSugg() {
+  C.sugg.replaceChildren(); C.sugg.hidden = !C.opts.length;
+  C.opts.forEach((n, i) => { const b = el('button', i === C.pick ? 'on' : null, '@' + n); b.type = 'button';
+    b.onmousedown = ev => { ev.preventDefault(); takeSuggestion(n); }; C.sugg.append(b); });
+}
+function takeSuggestion(n) {
+  const at = mentionAt(); if (!at || !n) return;
+  const v = C.ta.value, end = C.ta.selectionStart, ins = '@' + n + ' ';
+  C.ta.value = v.slice(0, at.start) + ins + v.slice(end); const p = at.start + ins.length;
+  C.ta.setSelectionRange(p, p); C.opts = []; drawSugg(); C.ta.focus();
+}
+function setReply(m) {
+  if (!C) return; C.replyTo = m ? m.id : null; C.rep.replaceChildren(); C.rep.hidden = !m;
+  if (!m) return;
+  const x = el('button', null, '×'); x.type = 'button'; x.title = 'Cancel reply'; x.onclick = () => setReply(null);
+  C.rep.append(el('span', null, '↳ Replying to'), nameEl(m.from), el('span', 'q', (m.text || '').replace(/\s+/g, ' ')), x);
+  C.ta.focus();
+}
+async function submit() {
+  const text = C.ta.value.trim(); if (!text || C.btn.disabled) return;
+  C.btn.disabled = true; C.err.textContent = '';
+  try {
+    await send('/ui/api/messages', { room: S.cur, text, reply_to: C.replyTo || undefined });
+    C.ta.value = ''; C.ta.style.height = 'auto'; setReply(null); S.pinned = true;
+    await pollRoom(); toBottom(); pollRooms();
+  } catch (e) { C.err.textContent = 'Not sent: ' + e.message; }
+  finally { C.btn.disabled = false; C.ta.focus(); }
+}
+
+/* ---------- new room ---------- */
+function newRoomDialog() {
+  const m = el('div', 'modal'), f = el('form'), msg = el('div', 'msgline');
+  const field = (label, ph) => { const l = el('label', null, label), i = el('input'); i.placeholder = ph; i.autocomplete = 'off'; i.spellcheck = false; f.append(l, i); return i; };
+  f.append(el('h2', null, 'New room'));
+  const name = field('Name', 'release-plan'), who = field('Members', '@ops.orchestrator @lab.carol'), topic = field('Topic (optional)', 'What this room is for');
+  const ok = el('button', 'ok', 'Create'), cancel = el('button', 'cancel', 'Cancel'), row = el('div', 'row');
+  ok.type = 'submit'; cancel.type = 'button'; row.append(cancel, ok); f.append(msg, row); m.append(f);
+  const close = () => m.remove();
+  cancel.onclick = close; m.onclick = ev => { if (ev.target === m) close(); };
+  f.onkeydown = ev => { if (ev.key === 'Escape') close(); };
+  f.onsubmit = async ev => {
+    ev.preventDefault(); ok.disabled = true; msg.textContent = '';
+    try {
+      const members = who.value.split(/[\s,]+/).map(x => x.replace(/^@/, '')).filter(Boolean);
+      const j = await send('/ui/api/rooms/new', { name: name.value.trim(), members, topic: topic.value.trim() });
+      await pollRooms(); selectRoom(j.room);
+      if (j.unknown && j.unknown.length) { msg.textContent = 'Not on this network yet: ' + j.unknown.join(', ') + '. Invite them with islandmail.py invite.'; ok.disabled = false; ok.textContent = 'Done'; f.onsubmit = e => { e.preventDefault(); close(); }; }
+      else close();
+    } catch (e) { msg.textContent = e.message; ok.disabled = false; }
+  };
+  document.body.append(m); name.focus();
+}
+document.getElementById('newroom').onclick = newRoomDialog;
+async function markRead() {
+  if (!S.cur || !S.maxSeq || document.hidden || S.readSeq === S.cur + ':' + S.maxSeq) return;
+  S.readSeq = S.cur + ':' + S.maxSeq;
+  try { await send('/ui/api/read', { room: S.cur, seq: S.maxSeq }); const r = S.rooms.find(x => x.id === S.cur); if (r) { r.unread = 0; r.unread_mentions = 0; renderRooms(); } } catch (e) {}
 }
 const nearBottom = () => !scrollEl || scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
 const toBottom = () => { if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight; };
@@ -388,6 +525,10 @@ function buildNodes(arr, prev) {
       row.append(tint(el('div', 'av', (Array.from(m.from || '?')[0] || '?').toUpperCase()), m.from));
       const meta = el('div', 'meta'), t = el('span', 'time num', rel(m.ts));
       t.dataset.ts = m.ts; t.title = abs(m.ts); meta.append(nameEl(m.from), t); body.append(meta);
+    }
+    if (canPost()) {
+      const a = el('button', 'act', 'Reply'); a.type = 'button'; a.onclick = () => setReply(m);
+      (body.querySelector('.meta') || body).append(a);
     }
     if (m.reply_to) { row.classList.add('reply'); body.append(el('div', 're num', '↳ re ' + m.reply_to)); }
     if (m.quote) {
@@ -473,7 +614,7 @@ async function selectRoom(id) {
     const j = await api('/ui/api/messages?' + qs({ room: id, limit: PAGE }));
     if (token !== S.token) return;
     S.info = j.room || null; S.msgs = displayOrder(ingest(j.messages)); S.more = !!j.more; S.loaded = true;
-    buildPane(); rerender(); toBottom(); S.pinned = true;
+    buildPane(); rerender(); toBottom(); S.pinned = true; markRead();
   } catch (e) {
     if (token === S.token && listEl) listEl.replaceChildren(el('div', 'placeholder', 'Could not load this room.'));
   }
@@ -511,6 +652,7 @@ async function pollRoom() {
         S.msgs = displayOrder(S.msgs.concat(fresh));
         rerender();
         if (pin) toBottom(); else scrollEl.scrollTop = top;
+        markRead();
       }
       if (!j.more) break;
     }
@@ -527,13 +669,15 @@ function renderFoot() {
   if (!S.me) return;
   const av = tint(el('div', 'av', (Array.from(S.me.name || '?')[0] || '?').toUpperCase()), S.me.name);
   av.style.width = av.style.height = '28px'; av.style.fontSize = '13px'; av.style.marginTop = '0';
-  const who = el('div', 'who'); who.append(S.me.name + ' ', el('span', 'sub', 'reading'));
+  const who = el('div', 'who'); who.append(S.me.name + ' ', el('span', 'sub', canPost() ? 'chatting' : 'reading'));
+  document.getElementById('newroom').hidden = !canPost();
   who.title = (S.me.sub || '') + (S.me.expires ? '\nlink expires ' + abs(S.me.expires) : '');
   footEl.append(av, who);
 }
 filterEl.addEventListener('input', renderRooms);
 document.addEventListener('keydown', ev => {
   const inInput = ev.target === filterEl;
+  if (ev.target !== filterEl && ev.target.closest && ev.target.closest('textarea, input, .modal')) return;
   if (ev.key === '/' && !inInput && !ev.metaKey && !ev.ctrlKey) { ev.preventDefault(); filterEl.focus(); return; }
   if (ev.key === 'Escape' && inInput) { filterEl.value = ''; renderRooms(); filterEl.blur(); return; }
   let d = 0;
