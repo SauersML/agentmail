@@ -134,10 +134,26 @@ impl EndpointHooks for MemberGate {
 #[derive(Debug, Clone)]
 struct JoinProto {
     node: Arc<Node>,
+    /// Any key may open a join connection and hold it for the 10 s request timeout; past this many at once, a new one
+    /// is closed at once, so keys made by the thousand cannot pile up connection state.
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Join connections served at once.
+const MAX_JOINS: usize = 16;
+
+impl JoinProto {
+    fn new(node: Arc<Node>) -> Self {
+        JoinProto { node, slots: Arc::new(tokio::sync::Semaphore::new(MAX_JOINS)) }
+    }
 }
 
 impl ProtocolHandler for JoinProto {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let Ok(_slot) = self.slots.clone().try_acquire_owned() else {
+            conn.close(429u32.into(), b"too many joins at once; try again soon");
+            return Ok(());
+        };
         let peer = *conn.remote_id().as_bytes();
         let node = self.node.clone();
         let res = tokio::time::timeout(Duration::from_secs(10), async {
@@ -684,7 +700,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(SYNC_ALPN, SyncProto { node: node.clone() })
         .accept(OLD_SYNC_ALPN, OldSyncProto)
-        .accept(JOIN_ALPN, JoinProto { node: node.clone() })
+        .accept(JOIN_ALPN, JoinProto::new(node.clone()))
         .spawn();
     *node.dialer.lock().unwrap() = Some(Dialer { endpoint: endpoint.clone(), lookup: lookup.clone(), relays: relays.clone() });
 
@@ -877,6 +893,52 @@ mod tests {
         assert!(serde_json::from_slice::<Envelope>(&m).is_err(), "never taken for mail");
         let mean = (0..2000).map(|_| cover_delay().as_secs_f64()).sum::<f64>() / 2000.0;
         assert!((80.0..160.0).contains(&mean), "mean wait {mean}");
+    }
+
+    #[tokio::test]
+    async fn join_connections_beyond_the_cap_are_closed_at_once() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("islandmail-join-cap-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
+        std::fs::create_dir(&dir)?;
+        let key = Seed::generate();
+        let list = islandmail_core::MemberList {
+            v: 1, network: islandmail_core::b64u(&islandmail_core::random_bytes::<32>()), seq: 1, members: vec![], homes: vec![], relays: Default::default(),
+            nodes: vec![NodeEntry { name: "n0".into(), key: fmt_key(&key.public()), addrs: vec![], names: vec![] }],
+        };
+        let (tx, _rx) = mpsc::channel(4);
+        let node = Arc::new(Node::new(Store::open(&dir.join("n.sqlite"))?, list, key.clone(), Opts::default(), tx));
+        let local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
+        let ep = Endpoint::builder(presets::Minimal).bind_addr(local)?.relay_mode(RelayMode::Disabled)
+            .secret_key(SecretKey::from_bytes(key.bytes())).bind().await?;
+        let router = Router::builder(ep.clone()).accept(JOIN_ALPN, JoinProto::new(node.clone())).spawn();
+        let addr = EndpointAddr::new(ep.id()).with_ip_addr(ep.bound_sockets()[0]);
+        let outsider = Endpoint::builder(presets::Minimal).bind_addr(local)?.relay_mode(RelayMode::Disabled).bind().await?;
+        // Any key may open join connections (keys are free); each sends one byte of a request and then nothing.
+        let extra = 8;
+        let mut held = Vec::new();
+        for _ in 0..MAX_JOINS + extra {
+            let conn = outsider.connect(addr.clone(), JOIN_ALPN).await?;
+            // A connection the node already closed fails here; it still counts below.
+            let stream = match conn.open_bi().await {
+                Ok((mut send, recv)) => send.write_all(b"i").await.ok().map(|_| (send, recv)),
+                Err(_) => None,
+            };
+            held.push((conn, stream));
+        }
+        // The node keeps at most MAX_JOINS of them waiting; the rest close at once, not after the 10 s request timeout.
+        let closed = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let n = held.iter().filter(|(c, _)| c.close_reason().is_some()).count();
+                if n >= extra { break n; }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await;
+        assert!(closed.is_ok(), "{} slow join connections were all kept open", MAX_JOINS + extra);
+        drop(held);
+        outsider.close().await;
+        router.shutdown().await?;
+        drop(node);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
