@@ -261,7 +261,8 @@ impl Envelope {
     }
 
     pub fn day(&self) -> &str {
-        &self.ts[..10.min(self.ts.len())]
+        // ts is checked only in `check`: an unchecked one may hold a multibyte character before byte 10.
+        self.ts.get(..10).unwrap_or(&self.ts)
     }
 
     pub fn ts_ms(&self) -> i64 {
@@ -688,6 +689,17 @@ mod tests {
         let mut e = base.clone();
         e.epk = b64u(&[0u8; 7]);
         assert!(resign(e).check(&w.members, now).unwrap_err().to_string().contains("epk"));
+    }
+
+    #[test]
+    fn day_of_an_unchecked_ts_does_not_panic() {
+        let mut e: Envelope = serde_json::from_value(serde_json::json!({"v":1,"id":"x","ts":"2026-11-9Φ60:46:01.574Z",
+            "ciphertext":"","epk":"","keys":[],"node":"","sig":""})).unwrap();
+        assert_eq!(e.day(), "2026-11-9Φ60:46:01.574Z");
+        e.ts = "2026-11-26T10:00:00.000Z".into();
+        assert_eq!(e.day(), "2026-11-26");
+        e.ts = "2026".into();
+        assert_eq!(e.day(), "2026");
     }
 
     #[test]
