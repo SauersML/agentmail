@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,14 +24,37 @@ import urllib.request
 RESULTS = []
 
 
+_CLIENT = []
+
+
+def client_module():
+    # clients/islandmail.py as a module: its owner-only file helpers work on every platform.
+    if not _CLIENT:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "islandmail", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clients", "islandmail.py"))
+        im = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(im)
+        _CLIENT.append(im)
+    return _CLIENT[0]
+
+
+def owner_only(path):
+    # Mode 600 on POSIX; on Windows a protected access list with only this user.
+    if not os.path.exists(path):
+        return False
+    if os.name != "nt":
+        return stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        return client_module().others_with_access(fd) is None
+    finally:
+        os.close(fd)
+
+
 def write_private_json(path, obj):
     # Owner-only on every platform (mode 600, or a Windows access list with only this user), as the client writes it.
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "islandmail", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clients", "islandmail.py"))
-    im = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(im)
-    im.write_private(path, json.dumps(obj))
+    client_module().write_private(path, json.dumps(obj))
 
 
 def check(name, ok, detail=""):

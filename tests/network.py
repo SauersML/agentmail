@@ -17,7 +17,6 @@ import hashlib
 import json
 import os
 import socket
-import stat
 import subprocess
 import sys
 import threading
@@ -25,7 +24,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import http.client  # noqa: E402
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, check, client_module, free_port, owner_only, req, run, wait_for, work_directory  # noqa: E402
 
 
 def stream_until_closed(port, token, out):
@@ -114,8 +113,7 @@ def main():
         check("first `send` on a host works with no setup", rc == 0, out[-200:])
         check("it took about a second", time.time() - t0 < 5, "%.1fs" % (time.time() - t0))
         path = ident("ops", "ops.orchestrator")
-        check("the key is made under the host's names, mode 600",
-              os.path.exists(path) and stat.S_IMODE(os.stat(path).st_mode) == 0o600)
+        check("the key is made under the host's names, owner-only", owner_only(path))
         rc, out = cl("mac", "send", "--to", "ops.orchestrator", "hi ops, from hypha")
         check("the mac's first command makes hypha (its first name)", rc == 0 and os.path.exists(ident("mac", "hypha")), out[-200:])
         got, t = wait_for(lambda: [m for m in read("ops") if m.get("from") == "hypha"], timeout=15)
@@ -132,12 +130,8 @@ def main():
         check("the pod may not certify the mac's other names", rc != 0 and "403" in out, out[-160:])
 
         # Two homes: hypha's key on the pod too. Its first use there gets the pod's certificate.
-        os.makedirs(os.path.dirname(ident("pod", "hypha")), mode=0o700, exist_ok=True)
         with open(ident("mac", "hypha")) as f:
-            data = f.read()
-        fd = os.open(ident("pod", "hypha"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(data)
+            client_module().write_private(ident("pod", "hypha"), f.read())
         # Resume an existing stream cursor: this path opens /api/stream without first calling /api/me.
         cursor = "watch-%s-hypha-main.last" % hashlib.sha256(pub["pod"].encode()).hexdigest()
         with open(os.path.join(work, "client-pod", cursor), "w") as f:
