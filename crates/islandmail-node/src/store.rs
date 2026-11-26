@@ -1004,6 +1004,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// Content keys of an open room's membership events, oldest first: what a host trusted after they were sent
+    /// needs to know the room (its create event above all). Members-mode rows only, so nothing private is here.
+    pub fn room_event_keys(&self, thread: &str) -> Result<Vec<(String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT env_id, ck FROM messages WHERE thread = ? AND mode = 'members' AND kind = 'event' \
+                                 AND ck IS NOT NULL ORDER BY ts, env_id")?;
+        let rows = st.query_map([thread], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Record a key grant: `keys` may now read `env_id` with content key `ck`. Ok(true) when new.
     pub fn put_grant(&self, env_id: &str, keys: &[String], ck: &str, grant_env: &str, thread: &str) -> Result<bool> {
         let db = self.db.lock().unwrap();
@@ -1041,7 +1051,7 @@ impl Store {
 
     /// A row this node could not open, opened through a grant: fill in its header and body. A row whose sender
     /// signature is already here under another envelope stays sealed (a replay).
-    pub fn fill_opened(&self, env_id: &str, read: Read<'_>, readers: &str, text: &str, files: &str, extra: &Extra) -> Result<()> {
+    pub fn fill_opened(&self, env_id: &str, read: Read<'_>, readers: Option<&str>, text: &str, files: &str, extra: &Extra) -> Result<()> {
         let db = self.db.lock().unwrap();
         let Read { header: h, v, .. } = read;
         db.execute("UPDATE OR IGNORE messages SET sender = ?, sender_sub = ?, recipient = ?, thread = ?, mode = ?, \

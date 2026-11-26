@@ -696,7 +696,8 @@ pub fn complete_held(node: &Node) {
     }
 }
 
-/// A room add made by the node for a held identity: the membership event, then (private room) the history grants.
+/// A room add made by the node for a held identity: the membership event, then the grants (a private room's
+/// history, an open CREATOR/NAME room's membership events).
 fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) -> Result<String, ApiError> {
     let event = json!({ "op": "add", "members": names });
     let ev: islandmail_core::room::Event = serde_json::from_value(event.clone()).map_err(|e| ApiError::new(400, format!("{e}")))?;
@@ -704,7 +705,9 @@ fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) 
     let plan = node.room_plan(room, &who.name, Some(&ev), &members, &agents)?;
     let text = format!("added {}", names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", "));
     node.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": event }))?;
-    if plan.mode != islandmail_core::Mode::Private {
+    // A private room grants its history. An open CREATOR/NAME room grants its membership events, so a host that was
+    // not trusted yet when the room was made learns the room (a plain thread has nothing to grant).
+    if plan.mode != islandmail_core::Mode::Private && islandmail_core::room::creator_of(room).is_none() {
         return Ok(String::new());
     }
     let keys = node.room_keys(who, room)?;
@@ -715,7 +718,8 @@ fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) 
                                     "text": format!("key grant: {} earlier messages of {room}", chunk.len()) }))?;
         }
     }
-    Ok(format!("; {} earlier messages granted", keys.len()))
+    Ok(if plan.mode == islandmail_core::Mode::Private { format!("; {} earlier messages granted", keys.len()) }
+       else { format!("; {} membership events granted", keys.len()) })
 }
 
 /// POST /api/invites/joined {nonce}: this agent has seen (and done the room add for) that join.

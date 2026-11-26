@@ -1053,6 +1053,10 @@ def room_add(ident, room, names, grants=True):
             note = "; they can read its %d earlier messages" % n
         else:
             note = "; they see only messages from now on"
+    elif info["kind"] == "open" and "/" in room and grants:
+        # An open CREATOR/NAME room: its membership events were sealed to the hosts trusted when each was sent, so a
+        # host trusted later has no room until it gets their keys (the create event above all). Posts are not granted.
+        grant_history(ident, room, names)
     return note
 
 
