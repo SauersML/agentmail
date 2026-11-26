@@ -654,6 +654,16 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         woken.resync.notify_one();
     })));
 
+    // Room adds for joins with invites from held identities (invite.rs), once the joined agents' keys are here.
+    let held = node.clone();
+    tasks.push(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let n = held.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::invite::complete_held(&n)).await;
+        }
+    }));
+
     let rotating = node.clone();
     tasks.push(tokio::spawn(async move {
         loop {

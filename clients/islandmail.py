@@ -1014,7 +1014,6 @@ def room_add(ident, room, names, grants=True):
 
 # ---- joining: invite (signed by our node), join (their node trusts ours, answers with a reply), accept ----
 
-INVITE_TTL = 7 * 86400
 
 
 def default_config():
@@ -1087,23 +1086,39 @@ def node_up():
         return False
 
 
+def new_node_key(exe, folder):
+    # The node key of a host not set up yet: made once in FOLDER/node.seed, then reused by the first join.
+    seed = os.path.join(folder, "node.seed")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    if os.name == "nt":
+        restrict(folder, folder=True)
+    step = "pubkey" if os.path.exists(seed) else "keygen"
+    return subprocess.run([exe, step, seed], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def cmd_nodekey(a):
+    # This host's node key, for an invite bound to it (invite --key); a fresh host gets its key made now.
+    config = os.path.abspath(a.config or default_config())
+    if os.path.exists(config):
+        _, _, seed, _ = node_config(config)
+        print("ed25519:" + b64u(ed25519_public(read_node_seed(seed))))
+    else:
+        print(new_node_key(node_exe(a), os.path.dirname(config)))
+
+
 def first_run(config, inv, a):
-    # A fresh host: node key, trust file (this node only, for the invited name) and config, then start the node.
+    # A fresh host: node key, trust file (this node only, for the invited names) and config, then start the node.
     folder = os.path.dirname(config)
     exe = node_exe(a)
     use_node({"api_listen": a.api})
     if node_up():
         raise Fail("a node already answers at %s: join with its --config CONFIG.json, or pick a free --api" % MAIL)
-    os.makedirs(folder, mode=0o700, exist_ok=True)
-    if os.name == "nt":
-        restrict(folder, folder=True)
-    key = subprocess.run([exe, "keygen", os.path.join(folder, "node.seed")], check=True, capture_output=True,
-                         text=True).stdout.strip()
+    key = new_node_key(exe, folder)
     port, addrs = 0, []
     if a.listen:
         port, addrs = int(a.listen.rsplit(":", 1)[1]), [a.listen]
     trust = {"v": 1, "network": inv["network"], "seq": 1, "members": [],
-             "nodes": [{"name": inv["name"], "key": key, "addrs": addrs, "names": [inv["name"]]}]}
+             "nodes": [{"name": inv["names"][0], "key": key, "addrs": addrs, "names": inv["names"]}]}
     cfg = {"data_dir": "data", "api_listen": a.api, "iroh_port": port, "relay": inv["relay"],
            "node_key_file": "node.seed", "members_file": "members.json"}
     for name, obj in (("members.json", trust), ("config.json", cfg)):
@@ -1128,9 +1143,11 @@ def first_run(config, inv, a):
                      % (key, folder, inv["network"], json.dumps(inv["relay"]), proc.pid, exe, config))
 
 
-def make_invite(ident, name, room=None, config=None, ttl=INVITE_TTL):
-    # {invite, exp}: a signed invite for NAME (and optionally a room of ident's) from this host's node, the line `join`
-    # takes. Needs the node's config and key file (default ~/.islandmail/node/config.json); Fail when they are not here.
+def make_invite(ident, name, room=None, config=None, ttl=0, key=""):
+    # {invite, exp}: a signed invite for NAME (one exact name, or a comma list of several) and optionally a room of
+    # ident's, from this host's node: the line `join` takes. KEY (ed25519:…, from `nodekey` on their host) binds it to
+    # that node, valid 7 days; without one it is for whoever has it first, valid a day. ttl 0 takes those defaults.
+    # Needs the node's config and key file (default ~/.islandmail/node/config.json); Fail when they are not here.
     global MAIL
     saved = MAIL
     try:
@@ -1140,8 +1157,8 @@ def make_invite(ident, name, room=None, config=None, ttl=INVITE_TTL):
         if room:
             room_info(ident, room)
         frm = ident["name"] if ident else ""
-        out = owner_step("invite", config, "%s|%s|%s|%d" % (name, room, frm, ttl),
-                         {"name": name, "room": room, "from": frm, "ttl_s": ttl})
+        out = owner_step("invite", config, "%s|%s|%s|%d|%s" % (name, room, frm, ttl, key),
+                         {"name": name, "room": room, "from": frm, "ttl_s": ttl, "key": key})
         return out
     except (OSError, KeyError) as e:
         raise Fail("cannot read this node's config or key (%s)" % e)
@@ -1156,18 +1173,28 @@ def cmd_invite(a):
     except Fail:
         if a.room:
             raise
-    out = make_invite(ident, a.name, a.room, a.config, a.ttl)
+    out = make_invite(ident, a.name, a.room, a.config, a.ttl, a.key or "")
     print(out["invite"])
-    sys.stderr.write("islandmail: invite for %s%s, valid until %s. They run: islandmail.py join INVITE; "
+    sys.stderr.write("islandmail: invite for %s%s%s, valid until %s. They run: islandmail.py join INVITE; "
                      "their node then joins this one by itself (only if it cannot reach this node, join prints a reply for: "
                      "islandmail.py accept REPLY).\n"
-                     % (a.name, " (joins room %s)" % a.room if a.room else "", out["exp"]))
+                     % (a.name, " (joins room %s)" % a.room if a.room else "",
+                        ", only for node %s" % a.key if a.key else "", out["exp"]))
 
 
 def cmd_join(a):
     config = os.path.abspath(a.config or default_config())
     if not os.path.exists(config):
-        first_run(config, read_invite(node_exe(a), a.invite), a)
+        inv = read_invite(node_exe(a), a.invite)
+        folder = os.path.dirname(config)
+        if inv["for_key_prefix"]:
+            # Bound to a node key: the one `nodekey` made here, or the invite is someone else's.
+            key = new_node_key(node_exe(a), folder) if os.path.exists(os.path.join(folder, "node.seed")) else ""
+            raw = base64.urlsafe_b64decode(key[8:] + "=" * (-len(key[8:]) % 4)) if key else b""
+            if b64u(raw[:4]) != inv["for_key_prefix"]:
+                raise Fail("this invite is for another node key: send the inviter this host's key (islandmail.py nodekey) "
+                           "and join with the invite they make for it")
+        first_run(config, inv, a)
     else:
         use_node(node_config(config)[1])
         if not node_up():
@@ -1178,18 +1205,22 @@ def cmd_join(a):
     notes = ["this node now trusts node %r (%s, names %s); trust file seq %d"
              % (n["name"], n["key"], ", ".join(n["names"]) or "none", out["seq"])]
     if out["added_name"]:
-        notes.append("this node may now certify %s" % out["name"])
+        notes.append("this node may now certify %s" % ", ".join(out["names"]))
     if out["relay"]["invite"] != out["relay"]["node"]:
         notes.append("relay: the inviter uses %s and this node %s; to match, set \"relay\": %s in %s and restart the node"
                      % (json.dumps(out["relay"]["invite"]), json.dumps(out["relay"]["node"]),
                         json.dumps(out["relay"]["invite"]), config))
-    # The invited name gets its key now, so the inviter's node learns it as soon as they accept.
-    ident = None
-    try:
-        ident = _read_identity(out["name"]) if os.path.exists(ident_path(out["name"])) else new_identity(out["name"])
-        certify(ident)
-    except Fail as e:
-        notes.append("could not certify %s yet (%s); the first send does it" % (out["name"], e))
+    # Each invited name gets its key now, so the inviter's node learns them as soon as the nodes sync.
+    idents = []
+    for name in out["names"]:
+        try:
+            ident = _read_identity(name) if os.path.exists(ident_path(name)) else new_identity(name)
+            certify(ident)
+            idents.append(ident)
+        except Fail as e:
+            notes.append("could not certify %s yet (%s); the first send does it" % (name, e))
+    ident = idents[0] if idents else None
+    names = ", ".join(out["names"])
     url = "ISLANDMAIL_URL=%s " % MAIL if MAIL != "http://127.0.0.1:8787" else ""
     who = out["from"] or "THEIR-AGENT"
     for line in notes:
@@ -1197,11 +1228,11 @@ def cmd_join(a):
     if not out["joined"]:
         sys.stderr.write("islandmail: the inviting node could not be reached (%s). Send the line below to the inviter; "
                          "they run: islandmail.py accept REPLY. Then you are %s: %sislandmail.py send --to %s \"hello\"\n"
-                         % (out["unreachable"], out["name"], url, who))
+                         % (out["unreachable"], names, url, who))
         print(out["reply"])
         return
-    print("joined as %s%s" % (out["name"], "; you're in %s once %s's client next runs (it adds you)" % (out["room"], who)
-                                            if out["room"] else ""))
+    print("joined as %s%s" % (names, "; you're in %s once %s's node or client adds you" % (out["room"], who)
+                                       if out["room"] else ""))
     if out["from"] and ident:
         # One line in the inviter's inbox. Their agent's key reaches this node within seconds of the join.
         for _ in range(30):
@@ -1217,7 +1248,7 @@ def cmd_accept(a):
     out = owner_step("accept", a.config, a.reply.strip(), {"reply": a.reply.strip()})
     name = out["name"]
     print("this node now trusts node %r (%s) for exactly %s; trust file seq %d"
-          % (out["node"]["name"], out["node"]["key"], name, out["seq"]))
+          % (out["node"]["name"], out["node"]["key"], name.replace(",", ", "), out["seq"]))
     if out.get("room"):
         complete_joins(_load_identity(a.as_, create=False), wait=60)
 
@@ -1226,17 +1257,19 @@ def complete_joins(ident, wait=0):
     # Nodes that joined with this agent's invites: one line each, and the invite's room add, which only this agent can
     # sign. A private room's history needs their agent's key, which arrives once the two nodes sync.
     for r in api(ident, "GET", "/api/invites/joined")["joined"]:
-        line = "%s joined with your invite (node %s)" % (r["name"], r["node"])
+        names = r["name"].split(",")
+        line = "%s joined with your invite (node %s)" % (", ".join(names), r["node"])
         if r["room"]:
             for _ in range(max(1, wait)):
-                if any(_addr(x["name"]) == _addr(r["name"]) for x in api(ident, "GET", "/api/agents")["agents"]):
+                known = {_addr(x["name"]) for x in api(ident, "GET", "/api/agents")["agents"]}
+                if all(_addr(n) in known for n in names):
                     break
                 if wait:
                     time.sleep(1)
             else:
                 sys.stderr.write("islandmail: %s; they are added to %s once their key arrives\n" % (line, r["room"]))
                 continue
-            line += "; added to %s%s" % (r["room"], room_add(ident, r["room"], [r["name"]]))
+            line += "; added to %s%s" % (r["room"], room_add(ident, r["room"], names))
         api(ident, "POST", "/api/invites/joined", {"nonce": r["nonce"]})
         sys.stderr.write("islandmail: %s\n" % line)
 
@@ -1963,12 +1996,18 @@ def main():
     p.add_argument("--listen", metavar="HOST:PORT", help="first join: a UDP address peers can dial directly")
     p.add_argument("--wait", type=int, default=60, help="seconds to reach the inviting node before printing a reply instead")
     p.set_defaults(fn=cmd_join)
-    p = sub.add_parser("invite", help="an invite for one agent name (and optionally a room), valid 7 days")
-    p.add_argument("--name", required=True, help="the one exact name this node will trust theirs for")
-    p.add_argument("--room", help="a room of yours they are added to on accept")
-    p.add_argument("--ttl", type=int, default=INVITE_TTL, help="seconds it stays valid (default 7 days)")
+    p = sub.add_parser("invite", help="an invite for exact agent names (and optionally a room); best bound to their node key")
+    p.add_argument("--name", required=True, help="the exact name (or comma list: a,b) this node will trust theirs for")
+    p.add_argument("--key", metavar="ed25519:KEY", help="only the node with this key may join (they print it with: "
+                   "islandmail.py nodekey); recommended")
+    p.add_argument("--room", help="a room of yours they are added to when they join")
+    p.add_argument("--ttl", type=int, default=0, help="seconds it stays valid (default: 7 days with --key, else 1 day)")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_invite)
+    p = sub.add_parser("nodekey", help="this host's node key (made now on a fresh host), for an invite bound to it")
+    p.add_argument("--config", help="the node's config (default ~/.islandmail/node/config.json)")
+    p.add_argument("--bin", help="fresh host: the islandmail-node binary (default: on PATH)")
+    p.set_defaults(fn=cmd_nodekey)
     p = sub.add_parser("accept", help="trust the node that answered your invite, for the invited name only")
     p.add_argument("reply")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")

@@ -12,11 +12,13 @@
 //!
 //! Both strings are base58 of raw bytes (str = u8 length + UTF-8; u32 big-endian):
 //!
-//!   im1 + base58(flags u8 | network 32 | node key 32 | exp u32 (unix s) | nonce 16 | name str
-//!                | [from str] | [room str] | [names: n u8, n str] | [addrs] | [relay URLs: n u8, n str] | sig 64)
-//!   imr1 + base58(flags u8 | network 32 | node key 32 | nonce 16 | name str | [addrs] | sig 64)
+//!   im1 + base58(flags u8 | network 32 | node key 32 | exp u32 (unix s) | nonce 16 | names str (comma-separated)
+//!                | [from str] | [room str] | [for key: first 4 bytes] | [names: n u8, n str] | [addrs]
+//!                | [relay URLs: n u8, n str] | sig 64)
+//!   imr1 + base58(flags u8 | network 32 | node key 32 | nonce 16 | names str | [addrs] | sig 64)
 //!
-//! flags: 1 relay n0, 2 relay URLs, 4 addrs, 8 names, 16 from, 32 room. addrs = n u8, then per address 4 | IPv4 4 |
+//! flags: 1 relay n0, 2 relay URLs, 4 addrs, 8 names, 16 from, 32 room, 64 for key (a key-bound invite: only the node
+//! whose key starts with those 4 bytes may join; the inviting node keeps the whole key and checks it). addrs = n u8, then per address 4 | IPv4 4 |
 //! port u16 or 6 | IPv6 16 | port u16. sig is the node key's Ed25519 signature over "islandmail/invite/v1\n" (reply:
 //! "islandmail/invite-reply/v1\n") + every byte before it. Derived, not sent: the inviting node's names default to
 //! [from], its entry name is from (else its first name); the joining node's entry name is the invited name.
@@ -45,6 +47,10 @@ const ADDRS: u8 = 4;
 const NAMES: u8 = 8;
 const FROM: u8 = 16;
 const ROOM: u8 = 32;
+const FOR_KEY: u8 = 64;
+/// A key-less invite (first contact) lasts a day unless asked otherwise; one bound to a node key, a week.
+pub const KEYLESS_LIFE_S: i64 = 24 * 3600;
+pub const MAX_NAMES_PER_INVITE: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Invite {
@@ -53,7 +59,7 @@ pub struct Invite {
     pub node: NodeEntry,
     /// The inviter's relay setting (config "relay").
     pub relay: Vec<String>,
-    /// The one exact agent name the inviter will trust the joining node for.
+    /// The exact agent names the inviter will trust the joining node for, comma-separated.
     pub name: String,
     /// The inviting agent, if one asked: whom to write to first.
     pub from: Option<String>,
@@ -62,6 +68,19 @@ pub struct Invite {
     pub exp: i64,
     /// One-time: the inviting node keeps it until a node joins with it.
     pub nonce: [u8; 16],
+    /// A key-bound invite: the first 4 bytes of the only node key that may join (a check for the joiner; the inviting node holds the whole key).
+    pub for_key: Option<[u8; 4]>,
+}
+
+/// The names of a comma list: each a valid exact agent name, distinct, at most MAX_NAMES_PER_INVITE.
+pub fn split_names(list: &str) -> Result<Vec<String>, String> {
+    let names: Vec<String> = list.split(',').map(|n| n.trim().to_string()).collect();
+    let mut seen = std::collections::HashSet::new();
+    if names.len() > MAX_NAMES_PER_INVITE || !names.iter().all(|n| valid_name(n) && seen.insert(islandmail_core::addr::norm(n))) {
+        return Err(format!("names must be 1 to {MAX_NAMES_PER_INVITE} distinct exact agent names, comma-separated \
+                            (letters, digits, . _ -; not ending in '.')"));
+    }
+    Ok(names)
 }
 
 #[derive(Clone, Debug)]
@@ -195,12 +214,14 @@ fn encode_invite(inv: &Invite, node: &Node) -> String {
     let urls: Vec<&String> = inv.relay.iter().filter(|r| *r != "n0").collect();
     let flags = if inv.relay.iter().any(|r| r == "n0") { N0 } else { 0 } | if urls.is_empty() { 0 } else { URLS }
         | if inv.node.addrs.is_empty() { 0 } else { ADDRS } | if derived { 0 } else { NAMES }
-        | if inv.from.is_some() { FROM } else { 0 } | if inv.room.is_some() { ROOM } else { 0 };
+        | if inv.from.is_some() { FROM } else { 0 } | if inv.room.is_some() { ROOM } else { 0 }
+        | if inv.for_key.is_some() { FOR_KEY } else { 0 };
     let mut w = W::default();
     w.put(&[flags]).put(&network_bytes(&inv.network).expect("own network")).put(&key_bytes(&inv.node.key))
         .put(&((inv.exp / 1000) as u32).to_be_bytes()).put(&inv.nonce).str(&inv.name);
     if let Some(f) = &inv.from { w.str(f); }
     if let Some(r) = &inv.room { w.str(r); }
+    if let Some(k) = &inv.for_key { w.put(k); }
     if !derived {
         w.0.push(inv.node.names.len() as u8);
         for n in &inv.node.names { w.str(n); }
@@ -225,18 +246,18 @@ pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
     let name = r.str().map_err(bad)?;
     let from = if flags & FROM != 0 { Some(r.str().map_err(bad)?) } else { None };
     let room = if flags & ROOM != 0 { Some(r.str().map_err(bad)?) } else { None };
+    let for_key = if flags & FOR_KEY != 0 { Some(r.arr::<4>()?) } else { None };
     let names = if flags & NAMES != 0 { (0..r.u8()?).map(|_| r.str()).collect::<Result<Vec<_>, _>>().map_err(bad)? }
                 else { vec![from.clone().ok_or("invite is malformed (no names)")?] };
     let addrs = if flags & ADDRS != 0 { r.addrs().map_err(bad)? } else { vec![] };
     let mut relay = if flags & N0 != 0 { vec!["n0".to_string()] } else { vec![] };
     if flags & URLS != 0 { for _ in 0..r.u8()? { relay.push(r.str().map_err(bad)?); } }
-    if !r.0.is_empty() || flags & !63 != 0 { return Err("invite is malformed".into()); }
+    if !r.0.is_empty() || flags & !127 != 0 { return Err("invite is malformed".into()); }
     let node_name = from.clone().or_else(|| names.first().map(|n| n.trim_end_matches('.').to_string())).unwrap_or("peer".into());
-    let inv = Invite { network, node: NodeEntry { name: node_name, key, addrs, names }, relay, name, from, room, exp, nonce };
+    let inv = Invite { network, node: NodeEntry { name: node_name, key, addrs, names }, relay, name, from, room, exp, nonce,
+                       for_key };
     check_entry(&inv.node).map_err(bad)?;
-    if !valid_name(&inv.name) {
-        return Err("invite is malformed".into());
-    }
+    split_names(&inv.name).map_err(bad)?;
     if inv.exp > now + MAX_INVITE_LIFE_MS + SKEW_MS {
         return Err("invite runs longer than 7 days".into());
     }
@@ -257,7 +278,8 @@ fn encode_reply(r: &Reply, node: &Node) -> String {
 /// `islandmail-node invite-info INVITE`: what a checked invite holds, for setting up a fresh host before its node runs.
 pub fn info(s: &str) -> Result<Value, String> {
     let i = read_invite(s, now_millis())?;
-    Ok(json!({ "network": i.network, "relay": i.relay, "name": i.name, "from": i.from, "room": i.room,
+    Ok(json!({ "network": i.network, "relay": i.relay, "name": i.name, "names": split_names(&i.name)?, "from": i.from,
+               "room": i.room, "for_key_prefix": i.for_key.map(|k| b64u(&k)),
                "exp": islandmail_core::ts_from_millis(i.exp),
                "node": { "name": i.node.name, "key": i.node.key, "addrs": i.node.addrs, "names": i.node.names } }))
 }
@@ -272,15 +294,16 @@ pub fn read_reply(s: &str) -> Result<Reply, String> {
     let nonce = r.arr::<16>()?;
     let name = r.str().map_err(bad)?;
     let addrs = if flags & ADDRS != 0 { r.addrs().map_err(bad)? } else { vec![] };
-    if !r.0.is_empty() || flags & !ADDRS != 0 || !valid_name(&name) { return Err("reply is malformed".into()); }
+    if !r.0.is_empty() || flags & !ADDRS != 0 || split_names(&name).is_err() { return Err("reply is malformed".into()); }
     Ok(Reply { network, node: NodeEntry { name: name.clone(), key, addrs, names: vec![] }, name, nonce })
 }
 
 /* the store: outstanding invites */
 
 pub fn init(db: &rusqlite::Connection) -> anyhow::Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS invites (nonce TEXT PRIMARY KEY, name TEXT NOT NULL, room TEXT NOT NULL,
-                      from_ TEXT NOT NULL, exp INTEGER NOT NULL, spent_by TEXT, spent_ms INTEGER, told INTEGER NOT NULL DEFAULT 0);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS join_invites (nonce TEXT PRIMARY KEY, name TEXT NOT NULL, room TEXT NOT NULL,
+                      from_ TEXT NOT NULL, exp INTEGER NOT NULL, for_key TEXT, spent_by TEXT, spent_ms INTEGER,
+                      told INTEGER NOT NULL DEFAULT 0);")?;
     Ok(())
 }
 
@@ -356,20 +379,27 @@ fn arg_str<'a>(body: &'a Value, k: &str) -> &'a str {
 
 /// POST /api/invites {name, room?, from?, ttl_s?, ts, sig}: a signed invite for one exact name.
 pub fn invite(node: &Node, body: &Value) -> Result<Value, ApiError> {
-    let (name, room, from) = (arg_str(body, "name"), arg_str(body, "room"), arg_str(body, "from"));
-    let ttl = body.get("ttl_s").and_then(|v| v.as_i64()).unwrap_or(MAX_INVITE_LIFE_MS / 1000);
-    operator(node, body, "invite", &format!("{name}|{room}|{from}|{ttl}"))?;
-    if !valid_name(name) {
-        return Err(ApiError::new(400, "--name must be one exact agent name (letters, digits, . _ -; not ending in '.')"));
-    }
+    let (name, room, from, for_key) = (arg_str(body, "name"), arg_str(body, "room"), arg_str(body, "from"), arg_str(body, "key"));
+    let ttl = body.get("ttl_s").and_then(|v| v.as_i64()).unwrap_or(0);
+    operator(node, body, "invite", &format!("{name}|{room}|{from}|{ttl}|{for_key}"))?;
+    let names = split_names(name).map_err(|e| ApiError::new(400, format!("--name: {e}")))?;
+    let name = &names.join(",");
+    let bound = match for_key {
+        "" => None,
+        k => Some(parse_key(k).ok().filter(|b| fmt_key(b) == k)
+            .ok_or_else(|| ApiError::new(400, "--key must be a node key, ed25519:… (islandmail.py nodekey prints it)"))?),
+    };
+    let ttl = if ttl == 0 { if bound.is_some() { MAX_INVITE_LIFE_MS / 1000 } else { KEYLESS_LIFE_S } } else { ttl };
     if !(1..=MAX_INVITE_LIFE_MS / 1000).contains(&ttl) {
         return Err(ApiError::new(400, "ttl_s must be 1 second to 7 days"));
     }
     if room.len() > 200 || room.contains(['|', '\n']) || from.len() > 120 {
         return Err(ApiError::new(400, "invalid room or from"));
     }
-    if let Some(h) = holder(&node.members.read().unwrap(), name, None) {
-        return Err(ApiError::new(409, format!("{name} is already held here by {h}; invite with a name nobody holds")));
+    for n in &names {
+        if let Some(h) = holder(&node.members.read().unwrap(), n, None) {
+            return Err(ApiError::new(409, format!("{n} is already held here by {h}; invite with a name nobody holds")));
+        }
     }
     if name.len() + room.len() + from.len() > 200 {
         return Err(ApiError::new(400, "name, room and from are too long for an invite"));
@@ -379,12 +409,13 @@ pub fn invite(node: &Node, body: &Value) -> Result<Value, ApiError> {
     let nonce = islandmail_core::random_bytes::<16>();
     let inv = Invite {
         nonce,
+        for_key: bound.map(|k| k[..4].try_into().unwrap()),
         network, node: own_entry(node)?, relay: node.opts.relay.clone(), name: name.into(),
         from: (!from.is_empty()).then(|| from.into()), room: (!room.is_empty()).then(|| room.into()), exp: exp_s as i64 * 1000,
     };
     let s = encode_invite(&inv, node);
-    node.store.conn().execute("INSERT INTO invites (nonce, name, room, from_, exp) VALUES (?, ?, ?, ?, ?)",
-                              rusqlite::params![b64u(&nonce), name, room, from, inv.exp])?;
+    node.store.conn().execute("INSERT INTO join_invites (nonce, name, room, from_, exp, for_key) VALUES (?, ?, ?, ?, ?, ?)",
+                              rusqlite::params![b64u(&nonce), name, room, from, inv.exp, bound.map(|k| fmt_key(&k))])?;
     Ok(json!({ "invite": s, "exp": islandmail_core::ts_from_millis(inv.exp) }))
 }
 
@@ -415,11 +446,17 @@ pub fn join_prepare(node: &Node, body: &Value) -> Result<JoinPlan, ApiError> {
     if inv.node.key == me_key {
         return Err(ApiError::new(409, "this invite is from this node"));
     }
-    if inv.node.covers(&inv.name) {
-        return Err(ApiError::new(409, format!("the inviting node claims {} itself", inv.name)));
+    if inv.for_key.is_some_and(|k| node.seed.public()[..4] != k) {
+        return Err(ApiError::new(409, format!("this invite is for another node key (starting {}), not this node's {me_key}",
+                                               b64u(&inv.for_key.unwrap()))));
     }
-    if let Some(h) = holder(&node.members.read().unwrap(), &inv.name, Some(&me_key)) {
-        return Err(ApiError::new(409, format!("{} is held here by {h}", inv.name)));
+    for n in split_names(&inv.name).map_err(|e| ApiError::new(400, e))? {
+        if inv.node.covers(&n) {
+            return Err(ApiError::new(409, format!("the inviting node claims {n} itself")));
+        }
+        if let Some(h) = holder(&node.members.read().unwrap(), &n, Some(&me_key)) {
+            return Err(ApiError::new(409, format!("{n} is held here by {h}")));
+        }
     }
     let mut mine = own_entry(node)?;
     mine.name = inv.name.clone();
@@ -437,14 +474,19 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
     };
     let inv = plan.inv;
     let mut added_name = false;
+    let names = split_names(&inv.name).map_err(|e| ApiError::new(400, e))?;
     let list = edit_trust(node, |list, me| {
-        if let Some(h) = holder(list, &inv.name, Some(me)) {
-            return Err(ApiError::new(409, format!("{} is held here by {h}", inv.name)));
+        for n in &names {
+            if let Some(h) = holder(list, n, Some(me)) {
+                return Err(ApiError::new(409, format!("{n} is held here by {h}")));
+            }
         }
         let mine = list.nodes.iter_mut().find(|n| n.key == me).expect("own entry");
-        if !mine.covers(&inv.name) {
-            mine.names.push(inv.name.clone());
-            added_name = true;
+        for n in &names {
+            if !mine.covers(n) {
+                mine.names.push(n.clone());
+                added_name = true;
+            }
         }
         match list.nodes.iter_mut().find(|n| n.key == inv.node.key) {
             Some(n) => *n = inv.node.clone(),
@@ -456,7 +498,7 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
         "joined": joined, "unreachable": why, "reply": if joined { Value::Null } else { plan.reply.into() },
         "network": list.network, "seq": list.seq,
         "inviter": { "name": inv.node.name, "key": inv.node.key, "names": inv.node.names }, "from": inv.from,
-        "name": inv.name, "added_name": added_name, "room": inv.room,
+        "name": inv.name, "names": names, "added_name": added_name, "room": inv.room,
         "relay": { "invite": inv.relay, "node": node.opts.relay },
     }))
 }
@@ -476,10 +518,10 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     let mut row: Option<(String, String)> = None;
     let list = edit_trust(node, |list, _| {
         let db = node.store.conn();
-        let got: Option<(String, String, String, i64, Option<String>)> = db.query_row(
-            "SELECT name, room, from_, exp, spent_by FROM invites WHERE nonce = ?", [&nonce],
-            |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))).ok();
-        let Some((want, room, from, exp, spent)) = got else {
+        let got: Option<(String, String, String, i64, Option<String>, Option<String>)> = db.query_row(
+            "SELECT name, room, from_, exp, spent_by, for_key FROM join_invites WHERE nonce = ?", [&nonce],
+            |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?))).ok();
+        let Some((want, room, from, exp, spent, for_key)) = got else {
             return Err(ApiError::new(403, "no such invite here (unknown nonce)"));
         };
         if let Some(by) = spent {
@@ -489,21 +531,30 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
         if now_millis() >= exp {
             return Err(ApiError::new(403, format!("the invite expired at {}", islandmail_core::ts_from_millis(exp))));
         }
+        if for_key.as_ref().is_some_and(|k| *k != r.node.key) {
+            return Err(ApiError::new(403, "this invite is bound to another node key"));
+        }
         if want != name {
             return Err(ApiError::new(403, format!("the invite was for {want:?}, not {name:?}")));
         }
-        if let Some(h) = holder(list, &name, Some(&r.node.key)) {
-            return Err(ApiError::new(409, format!("{name} is already held here by {h}; refusing to hand it to another node")));
-        }
-        match list.nodes.iter_mut().find(|n| n.key == r.node.key) {
-            Some(n) => {
-                n.addrs = r.node.addrs.clone();
-                if !n.names.iter().any(|e| e.eq_ignore_ascii_case(&name)) { n.names.push(name.clone()); }
+        let names: Vec<String> = want.split(',').map(String::from).collect();
+        for n in &names {
+            if let Some(h) = holder(list, n, Some(&r.node.key)) {
+                return Err(ApiError::new(409, format!("{n} is already held here by {h}; refusing to hand it to another node")));
             }
-            None => list.nodes.push(NodeEntry { name: name.clone(), key: r.node.key.clone(), addrs: r.node.addrs.clone(),
-                                                names: vec![name.clone()] }),
         }
-        let n = db.execute("UPDATE invites SET spent_by = ?, spent_ms = ? WHERE nonce = ? AND spent_by IS NULL",
+        let entry = match list.nodes.iter().position(|n| n.key == r.node.key) {
+            Some(i) => &mut list.nodes[i],
+            None => {
+                list.nodes.push(NodeEntry { name: names[0].clone(), key: r.node.key.clone(), addrs: vec![], names: vec![] });
+                list.nodes.last_mut().unwrap()
+            }
+        };
+        entry.addrs = r.node.addrs.clone();
+        for n in &names {
+            if !entry.names.iter().any(|e| e.eq_ignore_ascii_case(n)) { entry.names.push(n.clone()); }
+        }
+        let n = db.execute("UPDATE join_invites SET spent_by = ?, spent_ms = ? WHERE nonce = ? AND spent_by IS NULL",
                            rusqlite::params![r.node.key, now_millis(), nonce]).map_err(anyhow::Error::from)?;
         if n != 1 { return Err(ApiError::new(409, "this invite was already used")); }
         row = Some((room, from));
@@ -512,7 +563,7 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     let (room, from) = row.expect("set on success");
     tracing::info!("node {} joined with an invite for {name}", r.node.key);
     Ok(json!({ "ok": true, "name": name, "room": (!room.is_empty()).then_some(room), "from": (!from.is_empty()).then_some(from),
-               "node": { "name": name, "key": r.node.key }, "seq": list.seq }))
+               "node": { "name": name.split(',').next().unwrap_or(""), "key": r.node.key }, "seq": list.seq }))
 }
 
 /// POST /api/accepts {reply, ts, sig}: the inviting node could not be reached at join; the owner hands in the reply.
@@ -557,16 +608,71 @@ pub fn handshake(node: &Node, peer: &[u8; 32], req: &[u8]) -> Vec<u8> {
 /// GET /api/invites/joined: nodes that joined with an invite `from` this agent, not yet seen by it.
 pub fn joined_for(node: &Node, from: &str) -> Result<Value, ApiError> {
     let db = node.store.conn();
-    let mut st = db.prepare("SELECT nonce, name, room, spent_by, spent_ms FROM invites
+    let mut st = db.prepare("SELECT nonce, name, room, spent_by, spent_ms FROM join_invites
                              WHERE spent_by IS NOT NULL AND told = 0 AND lower(from_) = lower(?) ORDER BY spent_ms")?;
     let rows = st.query_map([from], |x| Ok(json!({ "nonce": x.get::<_, String>(0)?, "name": x.get::<_, String>(1)?,
         "room": x.get::<_, String>(2)?, "node": x.get::<_, String>(3)?, "at": islandmail_core::ts_from_millis(x.get(4)?) })))?;
     Ok(json!({ "joined": rows.collect::<rusqlite::Result<Vec<_>>>()? }))
 }
 
+/// The room adds this node can make itself: joins with an invite from an agent whose key it holds (identities_dir, or
+/// lent for a session, as for MCPL agents), once every joined name's agent is known here. The node posts the add event and the history
+/// grants as that agent, as its client would, and marks the join seen. Others wait for the agent's own client.
+pub fn complete_held(node: &Node) {
+    let rows: Vec<(String, String, String, String)> = {
+        let db = node.store.conn();
+        let Ok(mut st) = db.prepare("SELECT nonce, name, room, from_ FROM join_invites
+                                     WHERE spent_by IS NOT NULL AND told = 0 AND room != '' AND from_ != ''") else { return };
+        st.query_map([], |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?)))
+            .map(|r| r.filter_map(Result::ok).collect()).unwrap_or_default()
+    };
+    static FAILED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    for (nonce, names, room, from) in rows {
+        if FAILED.lock().unwrap().as_ref().is_some_and(|f| f.contains(&nonce)) { continue; }
+        let agents = node.agents();
+        let names: Vec<String> = names.split(',').map(String::from).collect();
+        if !names.iter().all(|n| islandmail_core::members::named(&agents, n).next().is_some()) { continue; }
+        let Some(who) = islandmail_core::members::named(&agents, &from)
+            .map(|a| crate::node::Caller { key: fmt_key(&a.key), name: a.name.clone(), sub: a.sub.clone(), exp_ms: i64::MAX })
+            .find(|w| node.local_key(w).is_some()) else { continue };
+        match add_as(node, &who, &room, &names) {
+            Ok(note) => {
+                let _ = joined_seen(node, &from, &nonce);
+                tracing::info!("added {} to {room} for {from}, who invited them{note}", names.join(", "));
+            }
+            // Once per join: the agent's own client adds them on its next run instead.
+            Err(e) => if FAILED.lock().unwrap().get_or_insert_default().insert(nonce) {
+                tracing::warn!("adding {} to {room} for {from}: {}", names.join(", "), e.message);
+            },
+        }
+    }
+}
+
+/// A room add made by the node for a held identity: the membership event, then (private room) the history grants.
+fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) -> Result<String, ApiError> {
+    let event = json!({ "op": "add", "members": names });
+    let ev: islandmail_core::room::Event = serde_json::from_value(event.clone()).map_err(|e| ApiError::new(400, format!("{e}")))?;
+    let (members, agents) = (node.members.read().unwrap().clone(), node.agents());
+    let plan = node.room_plan(room, &who.name, Some(&ev), &members, &agents)?;
+    let text = format!("added {}", names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", "));
+    node.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": event }))?;
+    if plan.mode != islandmail_core::Mode::Private {
+        return Ok(String::new());
+    }
+    let keys = node.room_keys(who, room)?;
+    for n in names {
+        for chunk in keys.chunks(500) {
+            let meta = serde_json::to_string(&json!({ "grant": chunk })).expect("JSON");
+            node.post(who, &json!({ "to": n, "thread": room, "mode": "private", "meta": meta,
+                                    "text": format!("key grant: {} earlier messages of {room}", chunk.len()) }))?;
+        }
+    }
+    Ok(format!("; {} earlier messages granted", keys.len()))
+}
+
 /// POST /api/invites/joined {nonce}: this agent has seen (and done the room add for) that join.
 pub fn joined_seen(node: &Node, from: &str, nonce: &str) -> Result<Value, ApiError> {
-    let n = node.store.conn().execute("UPDATE invites SET told = 1 WHERE nonce = ? AND lower(from_) = lower(?) AND spent_by IS NOT NULL",
+    let n = node.store.conn().execute("UPDATE join_invites SET told = 1 WHERE nonce = ? AND lower(from_) = lower(?) AND spent_by IS NOT NULL",
                                       [nonce, from])?;
     Ok(json!({ "updated": n }))
 }
@@ -609,8 +715,12 @@ mod tests {
     }
 
     fn make(n: &Node, name: &str, room: &str) -> String {
-        let body = json!({ "name": name, "room": room, "from": "alice", "ttl_s": 604800 });
-        invite(n, &signed(n, "invite", &format!("{name}|{room}|alice|604800"), body)).unwrap()["invite"].as_str().unwrap().into()
+        make_for(n, name, room, "").unwrap()
+    }
+
+    fn make_for(n: &Node, name: &str, room: &str, key: &str) -> Result<String, ApiError> {
+        let body = json!({ "name": name, "room": room, "from": "alice", "ttl_s": 0, "key": key });
+        Ok(invite(n, &signed(n, "invite", &format!("{name}|{room}|alice|0|{key}"), body))?["invite"].as_str().unwrap().into())
     }
 
     /// A joining node's reply to `inv`, presenting `name`.
@@ -663,6 +773,20 @@ mod tests {
         edit_trust(&a, |list, me| { list.nodes.iter_mut().find(|n| n.key == me).unwrap().names.push("carol".into()); Ok(()) }).unwrap();
         let d = fresh();
         assert!(answer(&a, &d, &reply_of(&d, &inv2, "carol"))["error"].as_str().unwrap().contains("already held"));
+        // Key-bound: only that node may join, and the invite lasts a week (key-less: a day).
+        let (e, f) = (fresh(), fresh());
+        let bound = make_for(&a, "morel,skizy", "", &fmt_key(&e.seed.public())).unwrap();
+        let i = read_invite(&bound, now_millis()).unwrap();
+        println!("key-bound invite for two names: {} chars", bound.len());
+        assert!(bound.len() <= 280 && i.for_key == Some(e.seed.public()[..4].try_into().unwrap()), "{} chars", bound.len());
+        assert!(i.exp - now_millis() > 6 * 24 * 3600 * 1000);
+        assert!(read_invite(&inv2, now_millis()).unwrap().exp - now_millis() <= KEYLESS_LIFE_S * 1000 + 2000);
+        assert!(answer(&a, &f, &reply_of(&f, &bound, "morel,skizy"))["error"].as_str().unwrap().contains("bound to another"));
+        assert!(answer(&a, &e, &reply_of(&e, &bound, "morel"))["error"].as_str().unwrap().contains("not \"morel\""));
+        assert_eq!(answer(&a, &e, &reply_of(&e, &bound, "morel,skizy"))["ok"], true);
+        let names = a.members.read().unwrap().node_by_key(&e.seed.public()).unwrap().names.clone();
+        assert_eq!(names, vec!["morel".to_string(), "skizy".to_string()]);
+        assert!(make_for(&a, "x,x", "", "").is_err() && make_for(&a, "a.", "", "").is_err() && make_for(&a, "q", "", "ed25519:no").is_err());
         // A flood from one key is cut off after a few tries.
         let d = fresh();
         let flood: Vec<Value> = (0..8).map(|_| answer(&a, &d, "imr1junk")).collect();
@@ -678,7 +802,7 @@ mod tests {
         let now = now_millis();
         let body = |name: &str, room: &str| {
             let ts = islandmail_core::now_ts();
-            let arg = format!("{name}|{room}|alice|604800");
+            let arg = format!("{name}|{room}|alice|604800|");
             let st = operator_statement("invite", &fmt_key(&n.seed.public()), &ts, &arg);
             json!({ "name": name, "room": room, "from": "alice", "ttl_s": 604800, "ts": ts, "sig": b64u(&n.seed.sign(st.as_bytes())) })
         };

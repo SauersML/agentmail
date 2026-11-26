@@ -682,7 +682,7 @@ impl Node {
 
     /// The caller's agent key, if this node holds it: an identity named like the caller with the caller's key
     /// (which the token check already tied to the pin or certificate). (key string, seed)
-    fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
+    pub fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
         let held = self.held()
             .into_iter()
             .find(|(n, s)| islandmail_core::addr::same(n, &who.name) && fmt_key(&s.public()) == who.key)

@@ -3,7 +3,9 @@
 with one command, its node presents itself to the inviting node, and the inviting node trusts it for exactly that
 name. Then the inviter's line about the join, private mail both ways, and the room. Refusals: an expired invite, a
 tampered invite, a reused invite, another name than the invited one, a name the inviter holds. An unreachable
-inviter falls back to the reply line and `accept`. A flood of bad join attempts leaves normal sync alone.
+inviter falls back to the reply line and `accept`. A flood of bad join attempts leaves normal sync alone. Last, an
+invite bound to one node key for two names: refused anywhere else, the bound host joins as both, and the inviting
+node (holding alice's key, as for an agent on MCPL) adds them to the room itself.
 
   python3 tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
@@ -87,7 +89,7 @@ def main():
     a_cfg = os.path.join(adir, "config.json")
 
     # Hosts B and C: nothing yet. Their node folders and client folders are made by join.
-    fresh = {h: (os.path.join(work, h, "node", "config.json"), free_port(socket.SOCK_DGRAM), free_port()) for h in "bc"}
+    fresh = {h: (os.path.join(work, h, "node", "config.json"), free_port(socket.SOCK_DGRAM), free_port()) for h in "bcde"}
 
     def cl(host, *args, timeout=150):
         api = a_api if host == "a" else fresh[host][2]
@@ -144,6 +146,10 @@ def main():
         rc, inv, err = cl("a", "invite", "--name", "bob", "--room", "plan", "--config", a_cfg)
         check("alice invites bob into alice/plan", rc == 0 and inv.startswith("im1"), err[-200:])
         check("the invite is one short line", "\n" not in inv and len(inv) <= 260, "%d chars: %s" % (len(inv), inv))
+        some_key = run(bin_, "keygen", os.path.join(work, "some.seed"))
+        rc, kbob, err = cl("a", "invite", "--name", "bob", "--key", some_key, "--room", "plan", "--config", a_cfg)
+        check("bound to a node key it is a few characters longer", rc == 0 and len(kbob) <= len(inv) + 8,
+              "%d chars" % len(kbob))
         rc, out, err = join("b", flip(inv, "im1", NAME_AT))
         check("join refuses a tampered invite", rc != 0 and "signature" in err, err[-200:])
         check("and sets nothing up", not os.path.exists(fresh["b"][0]))
@@ -245,10 +251,50 @@ def main():
         check("as its trust file shows", len(c_ent) == 1 and c_ent[0]["names"] == ["erin"], json.dumps(c_ent))
         rc, out, err = cl("a", "accept", reply, "--config", a_cfg)
         check("accepting the same reply again changes nothing", rc == 0 and len(a_trust_now()["nodes"]) == 3, err[-200:])
+
+        # Key-bound, two names, and the room add made by A's node, which now holds alice's key (identities_dir).
+        node_a.stop()
+        node_a.cfg["identities_dir"] = os.path.join(work, "a", "client", "identities")
+        check("A's node restarts holding alice's key", node_a.start())
+        d_cfg = fresh["d"][0]
+        rc, d_key, err = cl("d", "nodekey", "--config", d_cfg, "--bin", bin_)
+        check("a fresh host prints its node key before it has a node", rc == 0 and d_key.startswith("ed25519:")
+              and not os.path.exists(d_cfg), (d_key + err)[-200:])
+        rc, again, err = cl("d", "nodekey", "--config", d_cfg, "--bin", bin_)
+        check("and the same key next time", again == d_key, again)
+        rc, kinv, err = cl("a", "invite", "--name", "dora,dmitri", "--key", d_key, "--room", "plan", "--config", a_cfg)
+        check("alice invites dora and dmitri into alice/plan for D's node key only", rc == 0 and kinv.startswith("im1")
+              and len(kinv) <= 300 and "only for node" in err, "%d chars %s" % (len(kinv), err[-200:]))
+        rc, out, err = cl("a", "invite", "--name", "x", "--key", "ed25519:nope", "--config", a_cfg)
+        check("an invite for a malformed key is refused", rc != 0 and "--key" in err, err[-200:])
+        rc, out, err = join("c", kinv)
+        check("another node cannot use a key-bound invite", rc != 0 and "another node key" in err, err[-200:])
+        rc, out, err = join("e", kinv)
+        check("nor a fresh host with no key", rc != 0 and "another node key" in err and not os.path.exists(fresh["e"][0]),
+              err[-200:])
+        rc, out, err = join("d", kinv)
+        check("the bound host joins as dora and dmitri", rc == 0 and out.startswith("joined as dora, dmitri"), (out + err)[-300:])
+        d_ent = [n for n in a_trust_now()["nodes"] if n["key"] == d_key]
+        check("A trusts D's node for exactly dora and dmitri", d_ent and d_ent[0]["names"] == ["dora", "dmitri"],
+              json.dumps(d_ent))
+        check("D's client made both identities", all(os.path.exists(os.path.join(work, "d", "client", "identities", n + ".json"))
+                                                    for n in ("dora", "dmitri")))
+        # alice's client does not run here: her node adds both to alice/plan, with the room's history.
+        for n in ("dora", "dmitri"):
+            got, t = wait_for(lambda: [r for r in js("d", "--as", n, "rooms") or [] if r.get("id") == "alice/plan"], timeout=40)
+            check("A's node adds %s to alice/plan by itself" % n, bool(got), "%.1fs" % t)
+        got = [m for m in (js("d", "--as", "dmitri", "room", "read", "alice/plan") or {}).get("messages", [])
+               if m.get("text") == "before bob"]
+        check("dmitri reads the room's earlier post", bool(got))
+        with open(os.path.join(adir, "config.log")) as f:
+            check("A's node logs the add once", f.read().count("added dora, dmitri to alice/plan for alice") == 1)
+        rc, out, err = cl("a", "rooms")
+        check("alice's client does not add them again", "dora" not in err, err[-200:])
         print("sample invite (%d chars): %s" % (len(inv), inv))
+        print("sample key-bound invite (%d chars): %s" % (len(kbob), kbob))
     finally:
         node_a.stop()
-        for h in "bc":
+        for h in "bcde":
             if pid(h):
                 try:
                     os.kill(pid(h), signal.SIGTERM)

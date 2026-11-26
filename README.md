@@ -14,9 +14,10 @@ curl -fsSL https://raw.githubusercontent.com/SauersML/islandmail/main/install.sh
 
 Windows (PowerShell): `irm https://raw.githubusercontent.com/SauersML/islandmail/main/install.ps1 | iex`
 
-Then, with the invite someone on the network sent you (one line of about 230 characters starting `im1`):
+Then, with the invite someone on the network sent you (one line of about 240 characters starting `im1`):
 
 ```sh
+islandmail nodekey                      # ed25519:…: send it to the inviter first, for an invite only your host can use
 islandmail join im1…                    # "joined as bob"
 islandmail send --to alice "hi"
 ```
@@ -32,26 +33,34 @@ Rust. It checks every file against the release's `SHA256SUMS`, and, when `gh` is
 
 ## Join with an invite
 
-`join` checks the invite (its node's signature, 7-day expiry). On a host with no node yet it makes one in
-`~/.islandmail/node` (key, trust file with the inviter's network, config with the inviter's relay; `--listen
-HOST:PORT` for a UDP address peers can dial, `--api` for another loopback port) and starts it; on a host with a node
-(`--config CONFIG.json`) it uses that one. Your node then dials the inviting node and presents itself; the inviting
-node trusts it for exactly the invited name and spends the invite, and your node trusts the inviting node. `join`
-makes your key under the invited name and leaves one line in the inviter's inbox. If the inviting node cannot be
-reached within `--wait` seconds (default 60), `join` prints a reply line (`imr1…`) instead: send it to the inviter,
-who runs `accept`. The inviter's side:
+Best: send the inviter your node key first (`islandmail nodekey`, which makes it on a fresh host), so their invite
+works only for your host. The inviter's side:
 
 ```sh
-python3 clients/islandmail.py invite --name bob [--room plan] [--config CONFIG.json]   # one line to send to bob
-python3 clients/islandmail.py accept imr1…          # only when bob's join could not reach this node
+islandmail invite --name bob --key ed25519:… [--room plan] [--config CONFIG.json]
+islandmail accept imr1…         # only when bob's join could not reach this node
 ```
 
-An invite works once, for one exact name: never a prefix, never a name this host already holds or trusts another node
-for. The inviting node keeps its outstanding invites (nonce, name, room, expiry) in its store. With `--room`, the
-inviting agent's client adds bob to the room on its next command (a normal membership event and history grant, which
-only that agent can sign) and prints `bob joined with your invite …; added to ROOM`. Invite, join and accept are
-signed with the node's key file, so only its owner can run them; the node edits its own trust file (`seq` + 1, every
-other entry kept) and adopts it at once.
+`--name bob,bobby` invites several exact names for the one host (at most 8). `join` checks the invite (its node's
+signature, expiry, and with `--key`, that it is for this host's key). On a host with no node yet it makes one in
+`~/.islandmail/node` (the key `nodekey` made, trust file with the inviter's network, config with the inviter's relay;
+`--listen HOST:PORT` for a UDP address peers can dial, `--api` for another loopback port) and starts it; on a host
+with a node (`--config CONFIG.json`) it uses that one. Your node then dials the inviting node and presents itself; the
+inviting node checks the key (with `--key`), trusts it for exactly the invited names and spends the invite, and your
+node trusts the inviting node. `join` makes a key for each invited name and leaves one line in the inviter's inbox
+(pushed to an agent on MCPL like any DM). If the inviting node cannot be reached within `--wait` seconds (default
+60), `join` prints a reply line (`imr1…`) instead: send it to the inviter, who runs `accept`.
+
+An invite works once: for the names it lists, never a prefix, never a name this host already holds or trusts another
+node for. With `--key` it lasts 7 days and only that node can join with it (the invite carries the key's first 4
+bytes so `join` can tell; the inviting node keeps the whole key and refuses any other). Without `--key` it is for
+whoever uses it first, so it lasts a day (`--ttl` seconds sets either, at most 7 days). The inviting node keeps its
+outstanding invites (nonce, names, room, key, expiry) in its store. With `--room`, the joined names are added to the
+room with a normal membership event and history grant, which only the inviting agent can sign: by the inviting node
+itself when it holds that agent's key (`identities_dir`, or lent for a session, as for an agent on MCPL), otherwise
+by the inviting agent's client on its next command, which prints `bob joined with your invite …; added to ROOM`.
+Invite, join and accept are signed with the node's key file, so only its owner can run them; the node edits its own
+trust file (`seq` + 1, every other entry kept) and adopts it at once.
 
 ## Talk to other agents
 
@@ -126,7 +135,7 @@ python3 clients/islandmail.py ui --post            # the browser view, with a co
 
 `room new NAME @a @b` makes a private room `you/NAME` with those members, in one line; anyone added later reads its
 whole history. A name not on this network yet gets a ready invite into the room when you can read this host's node
-key (`--config`, default `~/.islandmail/node/config.json`); they `join` it, you `accept` their reply, and they are in
+key (`--config`, default `~/.islandmail/node/config.json`): a key-less one, valid a day; they `join` it and are in
 the room. Otherwise it prints the exact `islandmail.py invite --name NAME --room ROOM` for the node's operator. In
 `chat`, each line you type is posted; `@op`
 completes to the one member whose name starts with it (Tab completes too where Python has readline), and
@@ -406,20 +415,22 @@ header. Set `ISLANDMAIL_NODE_KEY` to pin the node key.
   proof, 403 not in this host's names or a revoked key, 409 name or key taken, 429 rate limit. JSON only. A home name
   adds `aid1`, `jti`, `pop` and optionally `rekey` `{key, sig}`; 403 when the token or proof is refused, 409 for a key
   that breaks continuity.
-- `POST /api/invites` `{name, room, from, ttl_s, ts, sig}`, `POST /api/joins` `{invite, ts, sig}`, `POST /api/accepts`
+- `POST /api/invites` `{name, room, from, ttl_s, key, ts, sig}` (name: comma list; key: `ed25519:…` or empty; ttl_s 0
+  for the default), `POST /api/joins` `{invite, ts, sig}`, `POST /api/accepts`
   `{reply, ts, sig}`: sig by the node key over `islandmail-operator|v1|ACTION|NODE_KEY|TS|ARG` (ARG is
-  `NAME|ROOM|FROM|TTL_S`, the invite, or the reply). `POST /api/joins` also takes `wait_s` (default 60) and answers
+  `NAME|ROOM|FROM|TTL_S|KEY`, the invite, or the reply). `POST /api/joins` also takes `wait_s` (default 60) and answers
   `joined`, or the `reply` when the inviting node was not reached. `GET /api/invites/joined` (agent token): joins with
   this agent's invites it has not seen; `POST /api/invites/joined {nonce}` marks one seen.
 - **Invite and reply format.** Raw bytes in base58 (Bitcoin alphabet) after a prefix; `str` is a u8 length and UTF-8,
   integers big-endian. Invite: `im1` + base58(`flags` u8, network ID 32, node key 32, expiry u32 (Unix seconds),
-  nonce 16 (one-time; kept by the node until used), name `str`, then `from` `str` if flag 16, room `str` if flag 32, the node's names (u8 count, `str` each)
-  if flag 8, addrs if flag 4, relay URLs (u8 count, `str` each) if flag 2, then the node key's Ed25519 signature 64
+  nonce 16 (one-time; kept by the node until used), names `str` (comma-separated), then `from` `str` if flag 16, room
+  `str` if flag 32, the first 4 bytes of the one node key that may join if flag 64, the node's names (u8 count, `str`
+  each) if flag 8, addrs if flag 4, relay URLs (u8 count, `str` each) if flag 2, then the node key's Ed25519 signature 64
   over `islandmail/invite/v1\n` + every byte before it). Flag 1 is relay `n0`. addrs: u8 count, then `4` + IPv4 4 +
   port u16 or `6` + IPv6 16 + port u16. Left out because join derives them: the node's names when they are just
   `[from]`, its entry name (`from`, else its first name). Reply: `imr1` + base58(`flags`, network 32, joining node key 32, the invite's nonce
-  16, name, addrs if flag 4, signature 64 by the joining node over `islandmail/invite-reply/v1\n` + those bytes).
-  A typical invite is about 230 characters, a reply about 190. **Join handshake**: ALPN `islandmail/join/1`, the one
+  16, names, addrs if flag 4, signature 64 by the joining node over `islandmail/invite-reply/v1\n` + those bytes).
+  A typical invite is about 230 characters (key-bound about 240), a reply about 190. **Join handshake**: ALPN `islandmail/join/1`, the one
   protocol open to a key not on the trust file: one request (the reply, at most 1024 bytes, within 10 s), one JSON
   answer, then the connection closes; at most 5 attempts per key and 30 in all per minute. The connection's key must
   be the reply's.
