@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{RawQuery, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{FromRequestParts, RawQuery, State};
+use axum::http::{header, request::Parts, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
@@ -75,10 +75,12 @@ pub fn bearer(headers: &HeaderMap) -> Option<String> {
     Some(t.trim().to_string())
 }
 
-fn caller(s: &AppState, headers: &HeaderMap) -> Result<Caller, ApiError> {
-    match bearer(headers) {
-        Some(t) => s.node.verify(&t),
-        None => Err(ApiError::new(401, "sign in first")),
+impl FromRequestParts<AppState> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let token = bearer(&parts.headers).ok_or_else(|| ApiError::new(401, "sign in first"))?;
+        state.node.verify(&token)
     }
 }
 
@@ -139,8 +141,7 @@ async fn node_info(State(s): State<AppState>) -> Response {
 }
 
 /// Return the exact key set the local node would use. A trust-file change before posting invalidates the signature.
-async fn recipients(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
+async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     let to = p.get("to").ok_or_else(|| ApiError::new(400, "missing to"))?;
     let mode = match p.get("mode").map(String::as_str) {
@@ -183,8 +184,7 @@ async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> 
 }
 
 /// GET /api/agents: every agent this host accepts now, with its homes.
-async fn agents(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    caller(&s, &headers)?;
+async fn agents(State(s): State<AppState>, _: Caller) -> Result<Response, ApiError> {
     let list = s.node.members.read().unwrap().clone();
     let out: Vec<Value> = s.node.agents().iter().map(|a| json!({
         "name": a.name, "sub": a.sub, "key": mailcore::keys::fmt_key(&a.key), "pinned": a.pinned,
@@ -204,8 +204,7 @@ async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
     Ok(json_resp(json!({ "revoked": revoked }), 200))
 }
 
-async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
+async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
     let island = s.node.members.read().unwrap().network.clone();
     Ok(json_resp(
         json!({ "name": who.name, "sub": who.sub, "kind": "agent", "island": island, "auth": "agent-token",
@@ -217,8 +216,7 @@ async fn me(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, A
     ))
 }
 
-async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
+async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     let q = query_from(&p)?;
     // Extension: order=causal gives one thread in the order every node agrees on (parents first, then (ts, id)).
@@ -236,8 +234,7 @@ async fn list(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQ
     Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200))
 }
 
-async fn post(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
+async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
     if !ct.starts_with("application/json") {
         return Err(ApiError::new(415, "send Content-Type: application/json"));
@@ -262,24 +259,22 @@ async fn post(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Res
     }
 }
 
-async fn threads(State(s): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
+async fn threads(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
     Ok(json_resp(json!({ "threads": s.node.store.thread_rows(&who, 500)? }), 200))
 }
 
-async fn names(State(s): State<AppState>, headers: HeaderMap, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    caller(&s, &headers)?;
+async fn names(State(s): State<AppState>, _: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     Ok(json_resp(json!({ "names": s.node.names_list(p.get("prefix").map(|s| s.as_str()).unwrap_or(""))? }), 200))
 }
 
 async fn upload(
     State(s): State<AppState>,
+    who: Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
     let p = params(&raw);
     let name = crate::node::file_name(p.get("name").map(|s| s.as_str()));
     let ty = crate::node::mime_type(headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()));
@@ -294,11 +289,10 @@ const INLINE_TYPES: [&str; 5] = ["image/png", "image/jpeg", "image/gif", "image/
 
 async fn download(
     State(s): State<AppState>,
-    headers: HeaderMap,
+    who: Caller,
     axum::extract::Path(id): axum::extract::Path<String>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
     if !mailcore::envelope::is_id(&id) {
         return Err(ApiError::new(404, "no such file"));
     }
@@ -358,10 +352,10 @@ impl Drop for StreamSlot {
 /// and the client reconnects with Last-Event-ID.
 async fn stream(
     State(s): State<AppState>,
+    who: Caller,
     headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, ApiError> {
-    let who = caller(&s, &headers)?;
     let slot = {
         let mut m = s.streams.lock().unwrap();
         if m.get(&who.sub).copied().unwrap_or(0) >= MAX_STREAMS_PER_SUB {

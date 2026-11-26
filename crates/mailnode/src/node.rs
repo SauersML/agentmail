@@ -547,6 +547,7 @@ impl Node {
 
     /// POST /api/files: encrypt and keep the upload until a message attaches it.
     pub fn upload(&self, who: &Caller, name: &str, ty: &str, data: &[u8]) -> Result<Value, ApiError> {
+        if !self.active(who) { return Err(ApiError::new(401, "session expired or membership changed")); }
         if data.len() > MAX_FILE {
             return Err(ApiError::new(413, format!("body is over {MAX_FILE} bytes")));
         }
