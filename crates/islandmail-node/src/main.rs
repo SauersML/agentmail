@@ -11,6 +11,7 @@ mod api;
 mod config;
 mod encryption_keys;
 mod homes;
+mod invite;
 mod mcpl;
 mod net;
 mod node;
@@ -145,6 +146,8 @@ async fn run(path: &Path) -> Result<()> {
         identities,
         held_only,
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
+        members_file: Some(cfg.members_file.clone()),
+        relay: cfg.relay.clone(),
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));

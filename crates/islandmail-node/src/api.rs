@@ -56,6 +56,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recipients", get(recipients))
         .route("/api/agents", get(agents).post(certify))
         .route("/api/revocations", axum::routing::post(revoke))
+        .route("/api/invites", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::invite)))
+        .route("/api/joins", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::join)))
+        .route("/api/accepts", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::accept)))
         .route("/api/messages", get(list).post(post))
         .route("/api/messages/{id}", get(one))
         .route("/api/rooms", get(rooms))
@@ -232,6 +235,17 @@ async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(json!({ "revoked": revoked }), 200))
+}
+
+/// POST /api/invites, /api/joins, /api/accepts: host-owner steps signed with the node key (see invite.rs).
+async fn owner_step(State(s): State<AppState>, headers: HeaderMap, body: Bytes,
+                    step: fn(&Node, &Value) -> Result<Value, ApiError>) -> Result<Response, ApiError> {
+    let v = local_json(&headers, &body)?;
+    let node = s.node.clone();
+    let out = tokio::task::spawn_blocking(move || step(&node, &v))
+        .await
+        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(out, 200))
 }
 
 async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {

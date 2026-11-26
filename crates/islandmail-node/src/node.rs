@@ -71,6 +71,10 @@ pub struct Opts {
     pub held_only: bool,
     /// Base URL written into attachment links.
     pub public_url: String,
+    /// The trust file this node may edit for invite, join and accept (none in unit tests).
+    pub members_file: Option<std::path::PathBuf>,
+    /// Config "relay", told to invited nodes.
+    pub relay: Vec<String>,
 }
 
 /// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.
@@ -97,6 +101,8 @@ pub struct Node {
     pub opts: Opts,
     pub events: broadcast::Sender<i64>,
     pub outbound: mpsc::Sender<Envelope>,
+    /// Wakes the periodic sync early: a newly trusted peer, or a key grant for envelopes not here yet.
+    pub resync: tokio::sync::Notify,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
     auth_seen: Mutex<HashSet<(String, &'static str)>>,
@@ -127,6 +133,7 @@ impl Node {
             opts,
             events,
             outbound,
+            resync: tokio::sync::Notify::new(),
             rates: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
             auth_seen: Mutex::new(HashSet::new()),
@@ -1134,6 +1141,7 @@ impl Node {
         for item in &meta.grant {
             let Some((raw, has_text, _)) = self.store.env_state(&item.env)? else {
                 self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &grant.thread)?;
+                self.resync.notify_one();
                 continue;
             };
             let env: Envelope = serde_json::from_str(&raw)?;

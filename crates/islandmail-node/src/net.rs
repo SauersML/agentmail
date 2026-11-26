@@ -561,7 +561,11 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     // The local trust file, on its own timer: a slow or offline peer never delays a change (a removed agent or
     // node), and open sessions and connections are cut off as soon as it is adopted.
     let gate = ctx.gate.clone();
-    tasks.push(tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || { gate.close_removed(); })));
+    let woken = node.clone();
+    tasks.push(tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || {
+        gate.close_removed();
+        woken.resync.notify_one();
+    })));
 
     let rotating = node.clone();
     tasks.push(tokio::spawn(async move {
@@ -600,7 +604,10 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             });
             blob_cursors = futures::stream::iter(pulls).buffer_unordered(4).collect().await;
             let _ = c.sender.join_peers(peers).await;
-            tokio::time::sleep(every).await;
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = c.node.resync.notified() => {}
+            }
         }
     }));
 
