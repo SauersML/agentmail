@@ -66,7 +66,8 @@ pub struct Posted {
 /// Node settings beyond the store and keys.
 #[derive(Default)]
 pub struct Opts {
-    pub identities: Vec<(String, Seed)>,
+    /// Held identities (identities_dir), re-read while the node runs (Node::set_identities).
+    pub identities: RwLock<Vec<(String, Seed)>>,
     /// Certify only the held identities: refuse certificate requests over the API (config "certify": "identities_dir").
     pub held_only: bool,
     /// Base URL written into attachment links.
@@ -430,7 +431,7 @@ impl Node {
     pub fn certify_identities(&self) {
         let me = self.me();
         let Some(mine) = self.members.read().unwrap().node_by_key(&me).cloned() else { return };
-        for (name, seed) in &self.opts.identities {
+        for (name, seed) in &self.held() {
             if !mine.covers(name) || !islandmail_core::cert::valid_name(name) { continue; }
             let key = fmt_key(&seed.public());
             let ts = now_ts();
@@ -681,9 +682,8 @@ impl Node {
     /// The caller's agent key, if this node holds it: an identity named like the caller with the caller's key
     /// (which the token check already tied to the pin or certificate). (key string, seed)
     fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
-        let held = self.opts
-            .identities
-            .iter()
+        let held = self.held()
+            .into_iter()
             .find(|(n, s)| islandmail_core::addr::same(n, &who.name) && fmt_key(&s.public()) == who.key)
             .map(|(_, s)| (who.key.clone(), s.clone()));
         held.or_else(|| {
@@ -831,7 +831,8 @@ impl Node {
         let certs = crate::homes::current(&self.store, certs, ts)?;
         let at = members.agents(&certs, &|_| None, ts);
         let v = env.verify(&members, &at, now_millis())?;
-        let keys = std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s));
+        let held = self.held();
+        let keys = std::iter::once(&self.seed).chain(held.iter().map(|(_, s)| s));
         let mut body = env.open_for(keys)?;
         if let Some(b) = &body {
             env.check_body(b)?;
@@ -1061,8 +1062,22 @@ pub fn clean_text(v: Option<&Value>, allow_empty: bool) -> Result<String, ApiErr
 }
 
 impl Node {
-    fn local_keys(&self) -> impl Iterator<Item = &Seed> {
-        std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s))
+    fn local_keys(&self) -> Vec<Seed> {
+        std::iter::once(self.seed.clone()).chain(self.held().into_iter().map(|(_, s)| s)).collect()
+    }
+
+    /// The held identities as they are now.
+    pub fn held(&self) -> Vec<(String, Seed)> {
+        self.opts.identities.read().unwrap().clone()
+    }
+
+    /// Adopts a new reading of identities_dir; true when it changed (new names then get certificates).
+    pub fn set_identities(&self, ids: Vec<(String, Seed)>) -> bool {
+        let key = |v: &[(String, Seed)]| v.iter().map(|(n, s)| (n.clone(), fmt_key(&s.public()))).collect::<Vec<_>>();
+        let mut cur = self.opts.identities.write().unwrap();
+        if key(&cur) == key(&ids) { return false; }
+        *cur = ids;
+        true
     }
 
     /// The room as this node folds the membership events it can read. None: a room with no events here (a plain
@@ -1183,7 +1198,7 @@ impl Node {
         let mut out = Vec::new();
         for (env_id, raw, granted) in self.store.room_envelopes(room, who, events_only)? {
             let env: Envelope = serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
-            let ck = match env.content_key(self.local_keys())? {
+            let ck = match env.content_key(self.local_keys().iter())? {
                 Some(k) => islandmail_core::b64u(&k),
                 None => match granted { Some(k) => k, None => continue },
             };
@@ -1544,7 +1559,7 @@ mod tests {
     #[test]
     fn rotating_an_agent_key_revokes_sessions_and_private_history() {
         let (mut node, alice, _, _, _) = setup();
-        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        node.opts.identities.get_mut().unwrap().push(("a.alice".into(), alice.clone()));
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let file = node.upload(&who, "note", "text/plain", b"private").unwrap();
         let private = node.post(&who, &json!({"to": "a.alice", "mode": "private", "text": "archive",
@@ -1563,7 +1578,7 @@ mod tests {
     #[test]
     fn resending_after_enrollment_seals_to_the_current_recipients() {
         let (mut node, alice, _, mut list, _rx) = setup();
-        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        node.opts.identities.get_mut().unwrap().push(("a.alice".into(), alice.clone()));
         let who = node.verify(&agent_token(&alice, &node.me())).unwrap();
         let post = json!({"to":"all","text":"meeting notes"});
         let before = node.post(&who, &post).unwrap();
@@ -1581,7 +1596,7 @@ mod tests {
     #[test]
     fn post_signs_stores_and_announces() {
         let (mut node, alice, _node_b, _list, mut rx) = setup();
-        node.opts.identities.push(("a.alice".into(), alice.clone()));
+        node.opts.identities.get_mut().unwrap().push(("a.alice".into(), alice.clone()));
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(!p.repeated);
@@ -1638,7 +1653,7 @@ mod tests {
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("islandmail-node-test-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
             let (tx, rx) = mpsc::channel(32);
-            let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
+            let opts = Opts { public_url: "http://x".into(), identities: RwLock::new(ids), ..Default::default() };
             let node_seed = Seed::from_bytes(*node_b.bytes());
             (Node::new(Store::open(&path).unwrap(), list.clone(), node_seed, opts, tx), rx)
         };
@@ -1784,7 +1799,7 @@ mod tests {
         let (mut mac, _, _, _) = homes();
         let held = Seed::generate();
         mac.opts.held_only = true;
-        mac.opts.identities.push(("h.held".into(), held.clone()));
+        mac.opts.identities.get_mut().unwrap().push(("h.held".into(), held.clone()));
         let e = mac.certify_request(&proof(&Seed::generate(), "h.walkin", &mac)).unwrap_err();
         assert_eq!(e.status, 403);
         assert!(e.message.contains("identities_dir"), "{}", e.message);
@@ -1856,7 +1871,7 @@ mod tests {
     fn revocation_is_scoped_to_its_node_and_its_time() {
         let (mut mac, pod, ops, _) = homes();
         let dana = Seed::generate();
-        mac.opts.identities.push(("dana".into(), dana.clone()));
+        mac.opts.identities.get_mut().unwrap().push(("dana".into(), dana.clone()));
         let (_, c) = mac.certify(&proof(&dana, "dana", &mac)).unwrap();
         let cert: Cert = serde_json::from_value(c["cert"].clone()).unwrap();
         let who = mac.verify(&token(&dana, "dana", &mac)).unwrap();
@@ -1907,9 +1922,9 @@ mod tests {
     fn one_agent_two_homes() {
         let (mut mac, mut pod, _, _) = homes();
         let (dana, h_bob) = (Seed::generate(), Seed::generate());
-        mac.opts.identities.push(("dana".into(), dana.clone()));
-        pod.opts.identities.push(("dana".into(), dana.clone()));
-        mac.opts.identities.push(("h.bob".into(), h_bob.clone()));
+        mac.opts.identities.get_mut().unwrap().push(("dana".into(), dana.clone()));
+        pod.opts.identities.get_mut().unwrap().push(("dana".into(), dana.clone()));
+        mac.opts.identities.get_mut().unwrap().push(("h.bob".into(), h_bob.clone()));
         mac.certify_identities();
         pod.certify_identities();
         // Certificates replicate both ways; both nodes certify the same name and key without conflict.

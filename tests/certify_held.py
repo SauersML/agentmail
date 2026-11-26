@@ -12,7 +12,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, run, work_directory, write_private_json  # noqa: E402
+from two_nodes import RESULTS, Node, check, free_port, run, wait_for, work_directory, write_private_json  # noqa: E402
 
 
 def main():
@@ -85,6 +85,19 @@ def main():
               [l for l in log.splitlines() if "dev.carol" in l][-1:])
         rc, out = cl(os.path.join(work, "carol"), "--as", "dev.carol", "whoami")
         check("and it does not sign in", rc != 0 and "403" in out, out[-200:])
+        # identities_dir is re-read while the node runs: a fixed file and a new one are certified with no restart.
+        carol["sub"] = "agent:dev.carol"
+        write_private_json(os.path.join(held, "dev.carol.json"), carol)
+        write_private_json(os.path.join(work, "carol", "identities", "dev.carol.json"), carol)
+        rc, out = cl(operator, "newkey", "dev.erin")
+        os.makedirs(os.path.join(work, "erin", "identities"), mode=0o700)
+        with open(os.path.join(held, "dev.erin.json")) as f:
+            write_private_json(os.path.join(work, "erin", "identities", "dev.erin.json"), json.load(f))
+        pid = node.proc.pid
+        for who in ("carol", "erin"):
+            ok, t = wait_for(lambda: cl(os.path.join(work, who), "--as", "dev." + who, "whoami")[0] == 0, timeout=20)
+            check("a %s held file is certified while the node runs" % ("fixed" if who == "carol" else "new"), ok, "%.1fs" % t)
+        check("with no restart", node.proc.pid == pid and node.proc.poll() is None)
         walkin = os.path.join(work, "walkin")
         rc, out = cl(walkin, "--as", "dev.mallory", "whoami")
         check("a walk-in name is refused with 403", rc != 0 and "403" in out and "identities_dir" in out, out[-240:])

@@ -26,6 +26,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 use islandmail_core::keys::fmt_key;
 
+/// How often identities_dir is checked for added, removed or rewritten files.
+const IDENTITIES_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
 const USAGE: &str = "usage:\n  islandmail-node run CONFIG.json\n  islandmail-node keygen SEED_FILE\n  islandmail-node pubkey SEED_FILE\n  \
      islandmail-node network-id\n  islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  islandmail-node revoke CONFIG.json NAME\n  islandmail-node invite-info INVITE";
 
@@ -136,16 +139,8 @@ async fn run(path: &Path) -> Result<()> {
     }
     let held_only = cfg.certify == config::Certify::IdentitiesDir;
     anyhow::ensure!(!held_only || cfg.identities_dir.is_some(), "\"certify\": \"identities_dir\" needs identities_dir");
-    // A held file's sub must be the one this host knows the name by: its pin's, else agent:NAME (what the node
-    // certifies). Any other would sign tokens the node then refuses ("known here with another sub").
-    let identities: Vec<_> = cfg.identities().into_iter().filter_map(|(name, sub, path, seed)| {
-        let pin = members.members.iter().find(|m| islandmail_core::addr::norm(&m.name) == islandmail_core::addr::norm(&name));
-        let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(&name), |m| m.sub.clone());
-        if sub == want { return Some((name, seed)); }
-        tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
-                        to {want:?} and restart the node", path.display());
-        None
-    }).collect();
+    let mut stamp = cfg.identities_stamp();
+    let identities = cfg.held(&members);
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),
@@ -157,7 +152,7 @@ async fn run(path: &Path) -> Result<()> {
     let store = store::Store::open(&cfg.data_dir.join("mail.sqlite"))?;
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
-        identities,
+        identities: std::sync::RwLock::new(identities),
         held_only,
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
         members_file: Some(cfg.members_file.clone()),
@@ -167,6 +162,24 @@ async fn run(path: &Path) -> Result<()> {
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
     node.certify_identities();
     let net = net::start(&cfg, node.clone(), out_rx).await?;
+    // identities_dir is re-read when a file in it is added, removed or rewritten: new held identities are certified
+    // and removed ones no longer held, with no restart (which would drop every MCPL session).
+    let (held_cfg, held_node) = (cfg.clone(), node.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(IDENTITIES_POLL);
+        loop {
+            tick.tick().await;
+            let now = held_cfg.identities_stamp();
+            if now == stamp { continue; }
+            stamp = now;
+            let ids = held_cfg.held(&held_node.members.read().unwrap());
+            let n = ids.len();
+            if held_node.set_identities(ids) {
+                tracing::info!("identities_dir changed: {n} local identities");
+                held_node.certify_identities();
+            }
+        }
+    });
 
     let state = api::AppState {
         node: node.clone(),

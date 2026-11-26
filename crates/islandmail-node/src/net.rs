@@ -765,7 +765,7 @@ mod tests {
         for (i, key) in keys.into_iter().enumerate() {
             cfg.data_dir = dir.join(format!("node-{i}"));
             let (tx, rx) = mpsc::channel(4);
-            let opts = Opts { identities: vec![(format!("a{i}"), agents[i].clone())], ..Opts::default() };
+            let opts = Opts { identities: std::sync::RwLock::new(vec![(format!("a{i}"), agents[i].clone())]), ..Opts::default() };
             let node = Arc::new(Node::new(Store::open(&dir.join(format!("{i}.sqlite")))?, list.clone(), key, opts, tx));
             node.certify_identities();
             let net = start_with(Endpoint::builder(presets::Minimal).clear_ip_transports(), &cfg, node.clone(), rx).await?;

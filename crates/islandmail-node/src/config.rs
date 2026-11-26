@@ -119,6 +119,34 @@ impl Config {
     }
 }
 
+impl Config {
+    /// The identity files the node may hold: those whose sub is the one this host knows the name by (its pin's, else
+    /// agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known here with
+    /// another sub"), so it is refused here with a log line naming the file and the fix.
+    pub fn held(&self, members: &MemberList) -> Vec<(String, Seed)> {
+        self.identities().into_iter().filter_map(|(name, sub, path, seed)| {
+            let norm = islandmail_core::addr::norm;
+            let pin = members.members.iter().find(|m| norm(&m.name) == norm(&name));
+            let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(&name), |m| m.sub.clone());
+            if sub == want { return Some((name, seed)); }
+            tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
+                            to {want:?} (the node re-reads identities_dir within seconds)", path.display());
+            None
+        }).collect()
+    }
+
+    /// Names, sizes and modification times in identities_dir: a change means the files need reading again.
+    pub fn identities_stamp(&self) -> Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)> {
+        let Some(dir) = &self.identities_dir else { return vec![] };
+        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+        let mut v: Vec<_> = rd.flatten()
+            .map(|e| { let m = e.metadata().ok(); (e.file_name(), m.as_ref().map_or(0, |m| m.len()), m.and_then(|m| m.modified().ok())) })
+            .collect();
+        v.sort();
+        v
+    }
+}
+
 /// Refuses a key file other users could read or write (see private_fs), or one that is not a regular file.
 pub fn read_private(path: &Path) -> Result<String> {
     use std::io::Read;
