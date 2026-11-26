@@ -433,7 +433,33 @@ impl Node {
         let members = self.members.read().unwrap().clone();
         let agents = self.agents();
         let me_agent = self.agent_of(&agents, who)?;
-        let recipients = Self::recipients(&members, &agents, &to, &who.name, mode)?;
+        // Room fields: the signed JSON a client sends, or (when the node signs) built from room/reply_to/event.
+        let meta_raw = match body.get("meta") {
+            Some(Value::String(m)) => m.clone(),
+            Some(Value::Null) | None if body.get("signed").is_none() => build_meta(body, &text, &thread)?,
+            Some(Value::Null) | None => String::new(),
+            Some(_) => return Err(ApiError::new(400, "meta must be the JSON text of the room fields")),
+        };
+        let meta = mailcore::room::Meta::parse(&meta_raw).map_err(|e| ApiError::new(400, format!("{e}")))?;
+        let recipients = match &meta.room {
+            Some(room) => {
+                if *room != thread {
+                    return Err(ApiError::new(400, "meta.room must be the thread"));
+                }
+                let plan = self.room_plan(room, &who.name, meta.event.as_ref(), &members, &agents)?;
+                if plan.to != to || plan.mode != mode {
+                    return Err(ApiError::new(400, format!(
+                        "a post in room {room} goes to {:?} in {} mode (GET /api/recipients?room=…)", plan.to, plan.mode.as_str())));
+                }
+                plan.keys
+            }
+            None => {
+                if !meta.grant.is_empty() && mode != Mode::Private {
+                    return Err(ApiError::new(400, "key grants are private mail to the new member"));
+                }
+                Self::recipients(&members, &agents, &to, &who.name, mode)?
+            }
+        };
         // Accept the client signature or sign with the caller's enrolled local key.
         let (ts, attest, salt) = match body.get("signed") {
             Some(s) => {
@@ -455,7 +481,7 @@ impl Node {
                     .filter(|b| b.len() == 16)
                     .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16 bytes, base64url"))?;
                 let key = me_agent.key;
-                let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
+                let digest = mailcore::envelope::post_digest_meta(&salt, &text, &files, &meta_raw)?;
                 let st = PostStatement {
                     from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
@@ -479,7 +505,7 @@ impl Node {
             None => {
                 let (key, seed) = self.local_key(who).ok_or_else(|| ApiError::new(400,
                     "sign the post with your agent key or configure identities_dir on this node"))?;
-                if file_ids.is_empty() {
+                if file_ids.is_empty() && meta.event.is_none() && meta.grant.is_empty() {
                     let since = ts_from_millis(now_millis() - REPEAT_MS);
                     if let Some(row) = self.store.repeat(who, &since, &to, &thread, &text)?
                         .filter(|r| r.mode == mode.as_str() && r.visible_to(who) && r.sealed_to(&recipients)) {
@@ -490,7 +516,7 @@ impl Node {
                 let salt = mailcore::random_bytes::<16>();
                 let t = now_millis();
                 let ts = ts_from_millis(t);
-                let digest = mailcore::envelope::post_digest(&salt, &text, &files)?;
+                let digest = mailcore::envelope::post_digest_meta(&salt, &text, &files, &meta_raw)?;
                 let st = PostStatement {
                     from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
@@ -500,7 +526,7 @@ impl Node {
             }
         };
         let parents = self.store.heads(&thread)?;
-        let b = Body { text: text.clone(), files: files.clone(), salt };
+        let b = Body { text: text.clone(), files: files.clone(), salt, meta: meta_raw.clone() };
         let env = Envelope::seal(
             Draft {
                 thread: &thread,
@@ -521,9 +547,10 @@ impl Node {
             .verify(&members, &agents, now_millis())
             .and_then(|v| env.check_body(&b).map(|_| v))
             .map_err(|e| ApiError::new(503, format!("this node cannot write mail: {e}")))?;
-        let readers = (mode == Mode::Private).then(|| readers_for(&agents, &to, &who.name));
+        let readers = (mode == Mode::Private).then(|| readers_of(&agents, &env));
         let files_json = serde_json::to_string(&files).map_err(anyhow::Error::from)?;
-        let row = match self.store.insert(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis())? {
+        let extra = crate::store::Extra::of(&meta_raw, &meta);
+        let row = match self.store.insert_with(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), &extra)? {
             Some(row) => row,
             None => {
                 let Attest::Agent { sig, .. } = &env.attest;
@@ -533,9 +560,16 @@ impl Node {
                 return Ok(Posted { row, reaches, repeated: true });
             }
         };
+        if !meta.grant.is_empty() {
+            self.apply_grant(&env, &meta, &agents)?;
+        }
         let _ = self.events.send(row.id);
         let _ = self.outbound.try_send(env);
-        let reaches = self.reaches(&to, &who.sub);
+        let reaches = match &meta.room {
+            Some(_) if !to.starts_with("room:") => self.reaches(&to, &who.sub),
+            Some(room) => self.room_reaches(room, &who.name),
+            None => self.reaches(&to, &who.sub),
+        };
         Ok(Posted { row, reaches, repeated: false })
     }
 
@@ -630,10 +664,19 @@ impl Node {
         let at = members.agents(&certs, &|_| None, ts);
         let v = env.verify(&members, &at, now_millis())?;
         let keys = std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s));
-        let body = env.open_for(keys)?;
+        let mut body = env.open_for(keys)?;
         if let Some(b) = &body {
             env.check_body(b)?;
             anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
+        }
+        // Key grants that arrived before the envelope: keep the ones whose key opens it, in its own room.
+        let grants = self.checked_grants(&env)?;
+        if body.is_none() {
+            if let Some((_, b)) = grants.first() {
+                env.check_body(b)?;
+                anyhow::ensure!(b.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
+                body = Some(b.clone());
+            }
         }
         // Keep the carried certificate (best effort: a node at its certificate cap still delivers the mail).
         if let Some(c) = &carried {
@@ -642,13 +685,34 @@ impl Node {
             }
         }
         let files_json = body.as_ref().map(|b| serde_json::to_string(&b.files)).transpose()?.unwrap_or_else(|| "[]".into());
+        let (meta_raw, meta) = match &body {
+            Some(b) => match mailcore::room::Meta::parse(&b.meta) {
+                Ok(m) => (b.meta.clone(), m),
+                Err(e) => {
+                    tracing::warn!("message {} has invalid room fields, shown as plain mail: {e:#}", &env.id[..12]);
+                    (String::new(), Default::default())
+                }
+            },
+            None => (String::new(), Default::default()),
+        };
+        let extra = crate::store::Extra::of(&meta_raw, &meta);
         let text = body.map(|b| b.text);
-        let readers = (env.mode == Mode::Private).then(|| readers_for(&self.agents(), &env.to, &env.from));
+        let agents = self.agents();
+        let readers = (env.mode == Mode::Private).then(|| readers_of(&agents, &env));
         let Some(row) =
-            self.store.insert(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis())?
+            self.store.insert_with(&env, &v, text.as_deref(), &files_json, readers.as_deref(), now_millis(), &extra)?
         else {
             return Ok(None);
         };
+        if env.mode == Mode::Private {
+            let granted: Vec<String> = self.store.grants_for(&env.id)?.into_iter().flat_map(|g| g.2).collect();
+            if !granted.is_empty() {
+                self.store.add_readers(&env.id, &names_with_keys(&agents, &granted))?;
+            }
+        }
+        if !meta.grant.is_empty() {
+            self.apply_grant(&env, &meta, &agents)?;
+        }
         let _ = self.store.seen(&env.from, &v.sender_sub, env.ts_ms());
         let row = Arc::new(row);
         let _ = self.events.send(row.id);
@@ -679,6 +743,59 @@ impl Node {
         out
     }
 
+}
+
+/// ",name,…," readers of a private envelope. A room post (`to` = room:…) is for the agents its content key was
+/// wrapped to (the room's members when it was sent); other private mail for the sender and whom `to` addresses.
+pub fn readers_of(agents: &[Agent], env: &Envelope) -> String {
+    if !env.to.starts_with("room:") {
+        return readers_for(agents, &env.to, &env.from);
+    }
+    let wrapped: Vec<String> = env.keys.iter().map(|w| w.to.trim_end_matches('=').to_string()).collect();
+    let mut names = names_with_keys(agents, &wrapped);
+    names.push(norm(&env.from));
+    names.sort();
+    names.dedup();
+    format!(",{},", names.join(","))
+}
+
+/// Normalized names of the agents whose keys are among `keys` (fmt_key strings).
+pub fn names_with_keys(agents: &[Agent], keys: &[String]) -> Vec<String> {
+    let set: HashSet<&str> = keys.iter().map(|k| k.trim_end_matches('=')).collect();
+    let mut out: Vec<String> = agents.iter().filter(|a| set.contains(fmt_key(&a.key).as_str())).map(|a| norm(&a.name)).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The room fields of a post the node signs itself: from `room` (true, or the room id), `reply_to` and `event`,
+/// with the text's @mentions. Empty when there are none.
+fn build_meta(body: &Value, text: &str, thread: &str) -> Result<String, ApiError> {
+    let mut m = mailcore::room::Meta { mentions: mailcore::room::mentions_in(text), ..Default::default() };
+    match body.get("room") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => {}
+        Some(Value::Bool(true)) => m.room = Some(thread.to_string()),
+        Some(Value::String(r)) => m.room = Some(r.clone()),
+        Some(_) => return Err(ApiError::new(400, "room must be true or the room id")),
+    }
+    if let Some(r) = body.get("reply_to").and_then(|r| r.as_str()) {
+        m.reply_to = Some(r.to_string());
+    }
+    if let Some(e) = body.get("event").filter(|e| !e.is_null()) {
+        m.event = Some(serde_json::from_value(e.clone()).map_err(|e| ApiError::new(400, format!("invalid event: {e}")))?);
+    }
+    if m.is_empty() {
+        return Ok(String::new());
+    }
+    serde_json::to_string(&m).map_err(|e| ApiError::from(anyhow::Error::from(e)))
+}
+
+/// Where a room post goes: its `to`, mode, exact keys and (private rooms) member names.
+pub struct Plan {
+    pub to: String,
+    pub mode: Mode,
+    pub keys: Vec<PublicKey>,
+    pub names: Option<Vec<String>>,
 }
 
 /// ",name1,name2," of the member names a private envelope is for: the sender and every member `to` addresses.
@@ -776,6 +893,175 @@ pub fn clean_text(v: Option<&Value>, allow_empty: bool) -> Result<String, ApiErr
 }
 
 impl Node {
+    fn local_keys(&self) -> impl Iterator<Item = &Seed> {
+        std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s))
+    }
+
+    /// The room as this node folds the membership events it can read. None: a room with no events here (a plain
+    /// thread, or a room this node has not heard of).
+    pub fn room_state(&self, id: &str) -> Result<Option<mailcore::room::State>> {
+        use mailcore::room;
+        if room::dm_pair(id).is_some() {
+            return Ok(Some(room::fold(id, &mut [])));
+        }
+        let rows = self.store.room_events(id)?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let metas: Vec<(String, String, String, room::Meta)> = rows.into_iter()
+            .filter_map(|(e, ts, from, raw)| room::Meta::parse(&raw).ok().map(|m| (e, ts, from, m))).collect();
+        let mut events: Vec<room::Folded> = metas.iter()
+            .filter_map(|(id, ts, from, m)| m.event.as_ref().map(|event| room::Folded { id, ts, from, event })).collect();
+        Ok(Some(room::fold(id, &mut events)))
+    }
+
+    /// Where a post in `room` by `from` goes, with an optional membership event.
+    pub fn room_plan(&self, room: &str, from: &str, event: Option<&mailcore::room::Event>, members: &MemberList,
+                     agents: &[Agent]) -> Result<Plan, ApiError> {
+        let state = self.room_state(room)?;
+        let (private, names) = mailcore::room::plan(room, state.as_ref(), from, event)
+            .map_err(|e| ApiError::new(if e.to_string().contains("no room") { 404 } else { 403 }, format!("{e}")))?;
+        if !private {
+            let keys = Self::recipients(members, agents, "all", from, Mode::Members)?;
+            return Ok(Plan { to: mailcore::room::room_to(room), mode: Mode::Members, keys, names: None });
+        }
+        let names = names.unwrap_or_default();
+        let to = match mailcore::room::dm_pair(room) {
+            Some((a, b)) => if norm(from) == a { b } else { a },
+            None => mailcore::room::room_to(room),
+        };
+        let mut keys = Vec::new();
+        for a in agents.iter().filter(|a| names.contains(&norm(&a.name)) || mailcore::addr::same(&a.name, from)) {
+            keys.push(a.key);
+            keys.extend(a.homes.iter().copied());
+        }
+        keys.sort();
+        keys.dedup();
+        if keys.len() > mailcore::envelope::MAX_KEYS {
+            return Err(ApiError::new(503, "more recipient keys than an envelope holds"));
+        }
+        Ok(Plan { to, mode: Mode::Private, keys, names: Some(names) })
+    }
+
+    /// Who a room post reaches: the members (private) or the room's participants, not the sender.
+    fn room_reaches(&self, room: &str, from: &str) -> Vec<String> {
+        let state = self.room_state(room).ok().flatten();
+        let mut out: Vec<String> = match state {
+            Some(s) if s.private() || !s.members.is_empty() => s.members.keys().cloned().collect(),
+            _ => self.store.room_senders(room).unwrap_or_default(),
+        };
+        out.retain(|n| !mailcore::addr::same(n, from));
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Grants held for `env` whose key opens it in its own room, with the bodies they open; others are dropped.
+    fn checked_grants(&self, env: &Envelope) -> Result<Vec<(String, Body)>> {
+        let mut out = Vec::new();
+        for (ck, thread, _) in self.store.grants_for(&env.id)? {
+            let key: Option<[u8; 32]> = mailcore::b64u_decode(&ck).and_then(|k| k.try_into().ok());
+            match key.filter(|_| thread == env.thread).map(|k| env.open_with(&k)) {
+                Some(Ok(b)) if env.check_body(&b).is_ok() => out.push((ck, b)),
+                _ => self.store.drop_grant(&env.id, &ck)?,
+            }
+        }
+        Ok(out)
+    }
+
+    /// A key grant this node can read: the grant envelope's recipients may now read each listed envelope of the
+    /// same room. Grants for envelopes not here yet wait for them (`ingest` checks them on arrival).
+    fn apply_grant(&self, grant: &Envelope, meta: &mailcore::room::Meta, agents: &[Agent]) -> Result<()> {
+        let keys: Vec<String> = grant.keys.iter().map(|w| w.to.trim_end_matches('=').to_string()).collect();
+        let names = names_with_keys(agents, &keys);
+        for item in &meta.grant {
+            let Some((raw, has_text, _)) = self.store.env_state(&item.env)? else {
+                self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &grant.thread)?;
+                continue;
+            };
+            let env: Envelope = serde_json::from_str(&raw)?;
+            let Some(ck) = mailcore::b64u_decode(&item.ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
+            if env.thread != grant.thread || env.mode != Mode::Private {
+                continue;
+            }
+            let Ok(b) = env.open_with(&ck) else { continue };
+            if env.check_body(&b).is_err() {
+                continue;
+            }
+            self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &grant.thread)?;
+            if !has_text {
+                let meta = mailcore::room::Meta::parse(&b.meta).unwrap_or_default();
+                let raw_meta = if meta.is_empty() { String::new() } else { b.meta.clone() };
+                let files = serde_json::to_string(&b.files)?;
+                self.store.fill_body(&item.env, &b.text, &files, &crate::store::Extra::of(&raw_meta, &meta))?;
+            }
+            self.store.add_readers(&item.env, &names)?;
+        }
+        Ok(())
+    }
+
+    /// Content keys of a private room's messages the caller can read, to re-wrap for a new member (key grants).
+    /// A since-join room grants only its membership events, so the new member's node knows the room.
+    pub fn room_keys(&self, who: &Caller, room: &str) -> Result<Vec<Value>, ApiError> {
+        if !self.active(who) {
+            return Err(ApiError::new(401, "session expired or membership changed"));
+        }
+        let state = self.room_state(room)?.ok_or_else(|| ApiError::new(404, format!("no room {room} here")))?;
+        if !state.private() || !state.is_member(&who.name) {
+            return Err(ApiError::new(403, "key grants are for members of a private room"));
+        }
+        let events_only = state.history == mailcore::room::History::SinceJoin;
+        let mut out = Vec::new();
+        for (env_id, raw, granted) in self.store.room_envelopes(room, who, events_only)? {
+            let env: Envelope = serde_json::from_str(&raw).map_err(anyhow::Error::from)?;
+            let ck = match env.content_key(self.local_keys())? {
+                Some(k) => mailcore::b64u(&k),
+                None => match granted { Some(k) => k, None => continue },
+            };
+            out.push(json!({ "env": env_id, "ck": ck }));
+        }
+        Ok(out)
+    }
+
+    /// One room as the caller sees it: kind, topic, members, creator, history, whether the caller is a member.
+    pub fn room_info(&self, who: &Caller, room: &str, senders: &[String]) -> Result<Value, ApiError> {
+        use mailcore::room::Kind;
+        let state = self.room_state(room)?;
+        let me = norm(&who.name);
+        Ok(match state {
+            Some(s) => {
+                let label = match (&s.kind, mailcore::room::dm_pair(room)) {
+                    (Kind::Dm, Some((a, b))) => if a == me { b } else { a },
+                    _ => room.to_string(),
+                };
+                let members: Vec<&String> = s.members.keys().collect();
+                json!({ "id": room, "label": label, "kind": s.kind, "topic": s.topic, "creator": s.creator,
+                        "history": s.history.as_str(), "members": members, "former": s.former,
+                        "member": s.is_member(&who.name), "created": s.created })
+            }
+            None => json!({ "id": room, "label": room, "kind": "open", "topic": "", "creator": null, "history": "full",
+                            "members": senders, "participants": true, "member": senders.iter().any(|n| norm(n) == me),
+                            "created": mailcore::room::creator_of(room).is_none() }),
+        })
+    }
+
+    /// The caller's rooms, latest activity first, with unread counts.
+    pub fn rooms(&self, who: &Caller) -> Result<Vec<Value>, ApiError> {
+        let mut out = Vec::new();
+        for r in self.store.room_rows(who, 500)? {
+            let room = r["room"].as_str().unwrap_or("").to_string();
+            let senders: Vec<String> = r["senders"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let mut info = self.room_info(who, &room, &senders)?;
+            for k in ["n", "unread", "unread_mentions"] {
+                info[k] = r[k].clone();
+            }
+            info["last"] = json!({ "id": r["id"], "ts": r["ts"], "from": r["sender"], "snippet": r["snippet"], "kind": r["last_kind"] });
+            out.push(info);
+        }
+        Ok(out)
+    }
+
     pub fn fmt(&self, r: &Row, max_text: usize) -> String {
         format_message(r, max_text, &self.opts.public_url)
     }
@@ -871,7 +1157,7 @@ mod tests {
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(list);
         let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)), cert: None };
-        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
+        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt), meta: String::new() };
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -940,6 +1226,10 @@ mod tests {
             files: "[]".into(),
             readers: None,
             wrapped_to: String::new(),
+            kind: "mail".into(),
+            meta: None,
+            mentions: None,
+            reply_to: None,
         };
         let out = format_message(&row, 100_000, "http://x");
         let lines: Vec<&str> = out.split(is_line_break).collect();
@@ -960,7 +1250,7 @@ mod tests {
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(&list);
         let sig = mailcore::b64u(&alice.sign(&st));
-        let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt) };
+        let body = Body { text: "deploy now".into(), files: vec![], salt: mailcore::b64u(&salt), meta: String::new() };
         let seal = |parents: Vec<String>, sig: String| {
             Envelope::seal(
                 Draft {
@@ -1389,7 +1679,7 @@ mod tests {
         let st = PostStatement { from: name, sub: &format!("agent:{name}"), to: "all", thread: "t", mode: Mode::Members,
                                  ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&list);
         let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: mailcore::b64u(&agent.sign(&st)), cert };
-        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt) };
+        let body = Body { text: text.into(), files: vec![], salt: mailcore::b64u(&salt), meta: String::new() };
         Envelope::seal(Draft { thread: "t", parents: vec![], ts, from: name, to: "all", mode: Mode::Members, body: &body,
                                blobs: vec![], attest, recipients: &keys }, &writer.seed).unwrap()
     }

@@ -18,6 +18,14 @@ it; nothing else to set up.
   python3 islandmail.py watch --mine --also-from ops. --until   # ... or anything from the ops team
   python3 islandmail.py watch --mine --from-now --exec "python3 wake.py"   # run a command per new mail (JSON on stdin)
 
+  python3 islandmail.py rooms                    # your rooms with unread counts
+  python3 islandmail.py room create plan --private --with ops.orchestrator   (a room named YOU/plan)
+  python3 islandmail.py room send hypha/plan "@ops.orchestrator ready?"     (@name wakes that agent)
+  python3 islandmail.py room read hypha/plan     |  room add / leave / remove / topic / watch --mentions
+  python3 islandmail.py dm hypha "hi"            # the private room of the two of you
+  python3 islandmail.py reply 4711 "agreed"      # in that message's room, same privacy, quoting it
+  python3 islandmail.py ui                       # a link to the read-only room view in a browser
+
   python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
 
 Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
@@ -508,6 +516,11 @@ def _addr(s):
     return s.strip().lower().replace("/", ".")
 
 
+def for_me(m, name):
+    # Mail addressed to the name (or all), a DM to it, or a room post that @mentions it.
+    return addressed_to(m["to"], name) or _addr(name) in [_addr(x) for x in m.get("mentions") or []]
+
+
 def addressed_to(to, name):
     n = _addr(name)
     for item in to.replace(",", " ").split():
@@ -534,9 +547,19 @@ def show(m, out=sys.stdout):
         files = "\n[attachments: %s]" % "; ".join(
             "%s (%d bytes, id %s)" % (f["name"], f["size"], f["id"]) for f in m["files"])
     sender = "%s [%s]" % (_one_line(m["from"]), _one_line(m["sub"]))
-    body = "\n".join("> " + _one_line(line) for line in _BREAKS.split(m["text"] + files))
-    out.write("#%d %sZ from %s to %s, thread \"%s\":\n%s\n\n" % (
-        m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), _one_line(m["thread"]), body))
+    text = m["text"] + files
+    where = "thread \"%s\"" % _one_line(m["thread"])
+    if m.get("room"):
+        where = "room \"%s\"" % _one_line(m["room"])
+    q = m.get("quote")
+    if q:
+        where += ", replying to #%d from %s" % (q["id"], _one_line(q["from"]))
+        text = "\n".join("| " + line for line in _BREAKS.split(q["text"])[:3]) + "\n" + text
+    elif m.get("reply_to"):
+        where += ", replying to a message you cannot see"
+    body = "\n".join("> " + _one_line(line) for line in _BREAKS.split(text))
+    out.write("#%d %sZ from %s to %s, %s:\n%s\n\n" % (
+        m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), where, body))
     out.flush()
 
 
@@ -583,7 +606,9 @@ def norm_text(s):
     return _BIDI.sub("", _CTRL.sub("", s))
 
 
-def signed_block(ident, to, thread, text, files, mode):
+def signed_block(ident, to, thread, text, files, mode, meta="", keys=None):
+    # meta: the room fields as exact JSON text (signed through the digest); keys: the recipients a room post's plan
+    # gave (else asked for by to and mode).
     seed = bytes.fromhex(ident["seed"])
     now = datetime.datetime.now(datetime.timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
@@ -591,10 +616,13 @@ def signed_block(ident, to, thread, text, files, mode):
     digest = hashlib.sha256(pae(b"agent-mail/body-digest/v2", salt, text.encode()))
     for f in files:
         digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))
+    if meta:
+        digest.update(pae(b"agent-mail/body-meta/v1", meta.encode()))
     topic = base64.urlsafe_b64decode(node_info()["network_id"] + "=")
     header = [ident["name"], ident["sub"], to, thread, mode, ts, digest.hexdigest()]
-    query = urllib.parse.urlencode({"to": to, "mode": mode})
-    keys = api(ident, "GET", "/api/recipients?" + query)["keys"]
+    if keys is None:
+        query = urllib.parse.urlencode({"to": to, "mode": mode})
+        keys = api(ident, "GET", "/api/recipients?" + query)["keys"]
     audience = pae(*sorted(base64.urlsafe_b64decode(k + "=") for k in keys))
     statement = pae(b"agent-mail/post/v3", topic, *(s.encode() for s in header), audience, *(f["id"].encode() for f in files))
     return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
@@ -612,20 +640,13 @@ def send_note(reaches, to):
 
 def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
-    to, thread = norm_field(a.to), norm_field(a.thread)
     mode = "private" if getattr(a, "private", False) else "members"
-    files = []
-    if len(a.file or []) > 10:
-        raise Fail("at most 10 attachments per message")
-    for path in a.file or []:
-        with open(path, "rb") as f:
-            data = f.read(MAX_FILE + 1)
-        if len(data) > MAX_FILE:
-            raise Fail("attachment exceeds 25 MiB")
-        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), Upload(os.path.basename(path), data),
-                {"Content-Type": ctype}, timeout=300)
-        files.append(r["file"])
+    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", norm_field(a.to)) \
+            and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
+        # Private mail to one agent with no thread named is the DM room of the two of you.
+        return room_post(ident, dm_id(ident["name"], a.to), text, a.file)
+    to, thread = norm_field(a.to), norm_field(a.thread or "general")
+    files = upload(ident, a.file)
     body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files],
             "signed": signed_block(ident, to, thread, text, files, mode)}
     if mode == "private":
@@ -636,6 +657,350 @@ def send(ident, a):
     print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(reaches, m["to"])), flush=True)
     m["reaches"] = reaches
     return m
+
+
+# ---- rooms ----
+
+
+def dm_id(a, b):
+    # The DM room of two agents: the same id whichever of them asks.
+    x, y = sorted((_addr(a), _addr(b)))
+    return "dm:%s+%s" % (x, y)
+
+
+def mentions_in(text):
+    # @name mentions, as the node reads them: normalized, at most 32.
+    out = []
+    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)", text):
+        name = m.group(1).rstrip(".-").lower()
+        if re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) and name != "all" and name not in out and len(out) < 32:
+            out.append(name)
+    return out
+
+
+def room_id(ident, name, create=False):
+    # A room you create is YOU/NAME. Elsewhere a bare NAME is your room YOU/NAME if you have one, else the open room
+    # (thread) NAME; creator/name and DM ids are used as given.
+    name = norm_field(name)
+    if "/" in name or name.startswith("dm:"):
+        return name
+    mine = "%s/%s" % (ident["name"], name)
+    if create:
+        return mine
+    try:
+        room_info(ident, mine)
+        return mine
+    except Fail as e:
+        if not str(e).startswith("404 "):
+            raise
+    return name
+
+
+def upload(ident, paths):
+    files = []
+    if len(paths or []) > 10:
+        raise Fail("at most 10 attachments per message")
+    for path in paths or []:
+        with open(path, "rb") as f:
+            data = f.read(MAX_FILE + 1)
+        if len(data) > MAX_FILE:
+            raise Fail("attachment exceeds 25 MiB")
+        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)),
+                Upload(os.path.basename(path), data), {"Content-Type": ctype}, timeout=300)
+        files.append(r["file"])
+    return files
+
+
+def meta_json(meta):
+    # The exact text the digest signs; the node parses it and keeps it as sent.
+    return json.dumps(meta, separators=(",", ":"), sort_keys=True)
+
+
+def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=False):
+    # Post in a room: the node says where it goes (to, mode, exact keys) for this room and event; we sign that.
+    text, room = norm_text(text), norm_field(room)
+    meta = {"room": room}
+    if mentions_in(text):
+        meta["mentions"] = mentions_in(text)
+    if reply_to:
+        meta["reply_to"] = reply_to
+    if event:
+        meta["event"] = event
+    raw = meta_json(meta)
+    q = {"room": room}
+    if event:
+        q["event"] = meta_json(event)
+    plan = api(ident, "GET", "/api/recipients?" + urllib.parse.urlencode(q))
+    files = upload(ident, paths)
+    body = {"to": plan["to"], "thread": room, "text": text, "files": [f["id"] for f in files], "mode": plan["mode"],
+            "meta": raw, "signed": signed_block(ident, plan["to"], room, text, files, plan["mode"], raw, plan["keys"])}
+    r = api(ident, "POST", "/api/messages", body)
+    m = r["message"]
+    if not quiet:
+        who = r.get("reaches") or []
+        note = (" for " + ", ".join(who[:12]) + (" and %d more" % (len(who) - 12) if len(who) > 12 else "")) if who else ""
+        print("posted #%d in %s%s" % (m["id"], room_label(ident, room), note), flush=True)
+    return m
+
+
+def room_label(ident, room):
+    if room.startswith("dm:"):
+        pair = room[3:].split("+")
+        other = [p for p in pair if p != _addr(ident["name"])] or pair
+        return "your DM with %s" % other[0]
+    return room
+
+
+def ago(ts):
+    try:
+        t = datetime.datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return ts
+    s = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    if s < 45:
+        return "just now"
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return "%d%s ago" % (s // n, unit)
+    return "1m ago"
+
+
+def room_info(ident, room):
+    return api(ident, "GET", "/api/room?" + urllib.parse.urlencode({"id": room}))["room"]
+
+
+def room_event(ident, name, event, text):
+    room = room_id(ident, name)
+    m = room_post(ident, room, text, event=event, quiet=True)
+    return room, m
+
+
+def cmd_room_create(a):
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name, create=True)
+    with_ = [w for w in re.split(r"[,\s]+", a.with_ or "") if w]
+    event = {"op": "create", "private": a.private, "history": a.history, "members": with_}
+    if a.topic:
+        event["topic"] = norm_field(a.topic)
+    text = "created this %s room" % ("private" if a.private else "open")
+    if with_:
+        text += " with " + ", ".join("@" + w for w in with_)
+    m = room_post(ident, room, text, event=event, quiet=True)
+    print("created %s room %s (#%d)%s" % ("private" if a.private else "open", room, m["id"],
+                                         "; members: " + ", ".join([ident["name"]] + with_) if a.private else ""))
+
+
+def grant_history(ident, room, names):
+    # Re-wrap the room's earlier content keys to each new member (and its home nodes): grant messages only they can
+    # open, sent like mail. Their nodes can then read the history; no message bodies are sent again.
+    keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
+    sent = 0
+    for name in names:
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            raw = meta_json({"grant": chunk})
+            text = "key grant: %d earlier messages of %s" % (len(chunk), room)  # never shown: grants are hidden
+            body = {"to": name, "thread": room, "text": text, "files": [], "mode": "private", "meta": raw,
+                    "signed": signed_block(ident, name, room, text, [], "private", raw)}
+            api(ident, "POST", "/api/messages", body)
+            sent += len(chunk)
+    return len(keys)
+
+
+def cmd_room_add(a):
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name)
+    names = [n for n in a.names if n]
+    info = room_info(ident, room)
+    room_post(ident, room, "added " + ", ".join("@" + n for n in names), event={"op": "add", "members": names}, quiet=True)
+    note = ""
+    if info["kind"] == "private":
+        # Full history: every earlier message; since-join: only the membership events, so they know the room.
+        n = grant_history(ident, room, names)
+        if info.get("history") == "full":
+            note = "; they can read its %d earlier messages" % n
+        else:
+            note = "; they see only messages from now on"
+    print("added %s to %s%s" % (", ".join(names), room, note))
+
+
+def cmd_room_leave(a):
+    ident = load_identity(a.as_)
+    room, _ = room_event(ident, a.name, {"op": "leave"}, "left the room")
+    print("left %s" % room)
+
+
+def cmd_room_remove(a):
+    ident = load_identity(a.as_)
+    room, _ = room_event(ident, a.name, {"op": "remove", "members": a.names}, "removed " + ", ".join(a.names))
+    print("removed %s from %s" % (", ".join(a.names), room))
+
+
+def cmd_room_topic(a):
+    ident = load_identity(a.as_)
+    topic = norm_field(a.text)
+    room, _ = room_event(ident, a.name, {"op": "topic", "topic": topic}, "set the topic: " + topic)
+    print("topic of %s: %s" % (room, topic))
+
+
+def cmd_room_send(a):
+    ident = load_identity(a.as_)
+    text = sys.stdin.read() if a.text == "-" else a.text
+    reply_to = message(ident, a.reply_to)["env"] if a.reply_to else None
+    room_post(ident, room_id(ident, a.name), text, a.file, reply_to=reply_to)
+
+
+def message(ident, mid):
+    return api(ident, "GET", "/api/messages/%d" % mid)["message"]
+
+
+def show_room_header(ident, info):
+    kind = {"dm": "DM", "private": "private", "open": "open"}.get(info["kind"], info["kind"])
+    who = "participants" if info.get("participants") else "members"
+    line = "%s · %s · %s: %s" % (room_label(ident, info["id"]), kind, who, ", ".join(info.get("members") or []) or "none")
+    if info.get("topic"):
+        line += "\ntopic: " + _one_line(info["topic"])
+    if info["kind"] == "private":
+        line += "\nnew members see " + ("the full history" if info.get("history") == "full" else "only later messages")
+    print(line + "\n")
+
+
+def show_compact(m, me, out=sys.stdout):
+    # One room message: a header line the mailbox writes (number, sender, age, reply), then the sender's lines quoted.
+    if m.get("kind") == "event":
+        out.write("#%d — %s %s · %s\n" % (m["id"], _one_line(m["from"]), _one_line(m["text"]), ago(m["ts"])))
+        return
+    head = "#%d %s · %s" % (m["id"], _one_line(m["from"]), ago(m["ts"]))
+    if _addr(me) in [_addr(x) for x in m.get("mentions") or []]:
+        head += " · mentions you"
+    lines = _BREAKS.split(m["text"])
+    q = m.get("quote")
+    if q:
+        head += " · replying to #%d %s" % (q["id"], _one_line(q["from"]))
+        lines = ["| " + l for l in _BREAKS.split(q["text"])[:2]] + lines
+    for f in m.get("files") or []:
+        lines.append("[attachment: %s (%d bytes, id %s)]" % (f["name"], f["size"], f["id"]))
+    out.write(head + "\n" + "\n".join("> " + _one_line(l) for l in lines) + "\n")
+    out.flush()
+
+
+def cmd_room_read(a):
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name)
+    info = room_info(ident, room)
+    q = {"thread": room, "order": "causal", "latest": a.latest}
+    msgs = api(ident, "GET", "/api/messages?" + urllib.parse.urlencode(q))["messages"]
+    if a.json:
+        print(json.dumps({"room": info, "messages": msgs}, indent=1))
+    else:
+        show_room_header(ident, info)
+        for m in msgs:
+            show_compact(m, ident["name"])
+        if not msgs:
+            print("(no messages you can read yet)")
+    if msgs:
+        api(ident, "POST", "/api/room-read", {"room": room, "id": max(m["id"] for m in msgs)})
+
+
+def cmd_room_info(a):
+    ident = load_identity(a.as_)
+    info = room_info(ident, room_id(ident, a.name))
+    if a.json:
+        print(json.dumps(info, indent=1))
+    else:
+        show_room_header(ident, info)
+
+
+def cmd_rooms(a):
+    ident = load_identity(a.as_)
+    rooms = api(ident, "GET", "/api/rooms")["rooms"]
+    if a.json:
+        print(json.dumps(rooms, indent=1))
+        return
+    if not rooms:
+        print("no rooms yet")
+    for r in rooms[: a.limit]:
+        mark = {"dm": "@", "private": "*", "open": "#"}.get(r["kind"], "#")
+        label = r["label"] if r["kind"] == "dm" else r["id"]
+        unread = "%d unread" % r["unread"] if r["unread"] else "read"
+        if r.get("unread_mentions"):
+            unread += " (%d mention you)" % r["unread_mentions"]
+        last = r["last"]
+        snippet = _one_line(last["snippet"])[:60]
+        print("%s %-30s %-24s %s · %s: %s" % (mark, _one_line(label)[:30], unread, ago(last["ts"]), _one_line(last["from"]), snippet))
+
+
+def cmd_dm(a):
+    ident = load_identity(a.as_)
+    text = sys.stdin.read() if a.text == "-" else a.text
+    room_post(ident, dm_id(ident["name"], a.name), text, a.file)
+
+
+def cmd_reply(a):
+    # Answer a message where it was said: its room, the same privacy, quoting it.
+    ident = load_identity(a.as_)
+    m = message(ident, a.id)
+    text = norm_text(sys.stdin.read() if a.text == "-" else a.text)
+    if m.get("room") or m["thread"].startswith("dm:"):
+        room_post(ident, m["thread"], text, a.file, reply_to=m["env"])
+        return
+    # Plain mail: back to the sender and the other recipients, in its thread and mode.
+    me = _addr(ident["name"])
+    # Members mail is readable by every member anyway: answer the sender and named recipients, not "all" again.
+    to = [x for x in [m["from"]] + m["to"].replace(",", " ").split()
+          if _addr(x) != me and not (m["mode"] == "members" and _addr(x) in ("all", "*"))]
+    to = ",".join(dict.fromkeys(to)) or ident["name"]
+    meta = {"reply_to": m["env"]}
+    if mentions_in(text):
+        meta["mentions"] = mentions_in(text)
+    raw = meta_json(meta)
+    files = upload(ident, a.file)
+    body = {"to": to, "thread": m["thread"], "text": text, "files": [f["id"] for f in files], "meta": raw,
+            "signed": signed_block(ident, to, m["thread"], text, files, m["mode"], raw)}
+    if m["mode"] == "private":
+        body["mode"] = "private"
+    r = api(ident, "POST", "/api/messages", body)["message"]
+    print("replied #%d to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
+
+
+def cmd_ui(a):
+    # The view key lasts as long as the agent token that opens it (12 hours), and reads only what you may read.
+    ident = load_identity(a.as_)
+    r = http("POST", MAIL + "/api/ui-sessions", {}, {"Authorization": "Bearer " + token_for(ident, ttl=12 * 3600)})
+    print("%s%s\n(read-only view as %s; the link works until %sZ)" % (MAIL, r["path"], ident["name"], r["expires"][:16]))
+
+
+def cmd_room_watch(a):
+    # Print the room's new messages as they arrive (with --mentions, only those that @mention you).
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name)
+    after = api(ident, "GET", "/api/me")["last_id"]
+    delay = 1
+    while True:
+        try:
+            req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
+                "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
+                "User-Agent": UA})
+            with _opener.open(req, timeout=90) as r:
+                delay = 1
+                for m in stream_messages(r):
+                    after = max(after, m["id"])
+                    if m["thread"] != room or m["from"] == ident["name"]:
+                        continue
+                    if a.mentions and _addr(ident["name"]) not in [_addr(x) for x in m.get("mentions") or []]:
+                        continue
+                    show_compact(m, ident["name"])
+                    if a.until:
+                        return
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code not in (408, 429):
+                raise http_error(e)
+            sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
+        except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException) as e:
+            sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
 
 
 def cmd_ask(a):
@@ -684,7 +1049,7 @@ def cmd_read(a):
     msgs = api(ident, "GET", query(a))["messages"]
     advance_watch_cursor(ident, a, msgs)
     if a.to_me:
-        msgs = [m for m in msgs if addressed_to(m["to"], ident["name"]) and m["from"] != ident["name"]]
+        msgs = [m for m in msgs if for_me(m, ident["name"]) and m["from"] != ident["name"]]
     if a.json:
         print(json.dumps(msgs, indent=1))
     else:
@@ -805,7 +1170,7 @@ def cmd_watch(a):
                         continue
                     own = m["from"] == ident["name"]
                     print_it = not (own and (a.skip_own or a.mine)) and (
-                        not a.mine or addressed_to(m["to"], ident["name"])
+                        not a.mine or for_me(m, ident["name"])
                         or any(m["from"].startswith(x) for x in a.also_from or []))
                     if print_it:
                         show(m)
@@ -909,7 +1274,7 @@ def main():
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)
-    p.add_argument("--thread", default="general")
+    p.add_argument("--thread", help="default general; --private to one agent with no thread: your DM room")
     p.add_argument("--file", action="append")
     p.add_argument("--private", action="store_true", help="only the recipients can read it (agent-mail nodes only)")
     p.add_argument("text", nargs="?", help="the message, or - for stdin")
@@ -943,6 +1308,66 @@ def main():
     p.add_argument("file_id")
     p.add_argument("-o")
     p.set_defaults(fn=cmd_download)
+    room = sub.add_parser("room", help="rooms: create, add, leave, remove, topic, send, read, watch, info")
+    rsub = room.add_subparsers(dest="room_cmd", required=True)
+    p = rsub.add_parser("create", help="a room named YOU/NAME (open unless --private)")
+    p.add_argument("name")
+    p.add_argument("--private", action="store_true", help="invite-only; only members can read it")
+    p.add_argument("--with", dest="with_", help="first members besides you, comma separated")
+    p.add_argument("--history", choices=["full", "since-join"], default="full",
+                   help="what a member added later can read (default full)")
+    p.add_argument("--topic")
+    p.set_defaults(fn=cmd_room_create)
+    p = rsub.add_parser("add", help="add members (any member may)")
+    p.add_argument("name")
+    p.add_argument("names", nargs="+")
+    p.set_defaults(fn=cmd_room_add)
+    p = rsub.add_parser("leave")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_room_leave)
+    p = rsub.add_parser("remove", help="remove members (the creator only)")
+    p.add_argument("name")
+    p.add_argument("names", nargs="+")
+    p.set_defaults(fn=cmd_room_remove)
+    p = rsub.add_parser("topic")
+    p.add_argument("name")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_room_topic)
+    p = rsub.add_parser("send")
+    p.add_argument("name")
+    p.add_argument("text", help="the message, or - for stdin; @name mentions wake that agent")
+    p.add_argument("--file", action="append")
+    p.add_argument("--reply-to", type=int, help="number of the message this answers")
+    p.set_defaults(fn=cmd_room_send)
+    p = rsub.add_parser("read")
+    p.add_argument("name")
+    p.add_argument("--latest", type=int, default=30)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_room_read)
+    p = rsub.add_parser("watch")
+    p.add_argument("name")
+    p.add_argument("--mentions", action="store_true", help="only messages that @mention you")
+    p.add_argument("--until", action="store_true", help="exit after the first message printed")
+    p.set_defaults(fn=cmd_room_watch)
+    p = rsub.add_parser("info")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_room_info)
+    p = sub.add_parser("rooms", help="your rooms, latest first, with unread counts")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_rooms)
+    p = sub.add_parser("dm", help="post in your DM room with one agent")
+    p.add_argument("name")
+    p.add_argument("text")
+    p.add_argument("--file", action="append")
+    p.set_defaults(fn=cmd_dm)
+    p = sub.add_parser("reply", help="answer a message in its room, with the same privacy, quoting it")
+    p.add_argument("id", type=int)
+    p.add_argument("text")
+    p.add_argument("--file", action="append")
+    p.set_defaults(fn=cmd_reply)
+    sub.add_parser("ui", help="print a link to the read-only room view").set_defaults(fn=cmd_ui)
     p = sub.add_parser("watch")
     p.add_argument("--name", default="main", help="resume-file name, so several watchers can coexist")
     p.add_argument("--mine", action="store_true", help="only mail addressed to you (or all), not from you")

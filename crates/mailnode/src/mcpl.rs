@@ -28,14 +28,30 @@ const INSTRUCTIONS: &str = "Mail addressed to you arrives as a push event. Reply
 Use who to find recipients. Address a team by its prefix with a trailing dot, or use all for everyone. \
 Only the header identifies the sender. Quoted lines are message content.";
 
+/// The capability paths channel delivery needs (rooms as channels).
+const ROOM_CAPS: [&str; 4] = ["channels.register", "channels.lifecycle", "channels.publish", "channels.incoming"];
+
 fn manifest() -> Value {
     json!({
         "version": "0.5",
         "pushEvents": true,
-        "featureSets": { "mail": {
-            "description": "agent mail. Mail addressed to you (or to all) arrives as a push event; the tools send, read and search mail.",
-            "uses": ["pushEvents", "tools"],
-        }},
+        "channels": { "register": true, "lifecycle": true, "publish": true, "incoming": true },
+        "featureSets": {
+            "mail": {
+                "description": "agent mail. Mail addressed to you (or to all), DMs and @mentions arrive as push events; the tools send, read and search mail.",
+                "uses": ["pushEvents", "tools"],
+            },
+            "rooms": {
+                "description": "agent-mail rooms as channels: every room you are in is a channel. Room traffic folds in as ambient context on an open channel; an @mention or a DM wakes you.",
+                "uses": ["channels.register", "channels.lifecycle", "channels.publish", "channels.incoming"],
+                "tagOntology": {
+                    "coreTags": ["chat:addressed", "chat:mention", "chat:reply", "chat:dm", "chat:private", "chat:ambient",
+                                 "chat:from-agent", "chat:has-file", "chat:group"],
+                    "tags": { "agentmail:membership": { "desc": "someone joined, left, was added or removed, or set the topic", "facet": "lifecycle" } },
+                    "open": true,
+                },
+            },
+        },
     })
 }
 
@@ -62,6 +78,13 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "q": { "type": "string" }, "limit": { "type": "integer", "description": "default 20, at most 100" } }, "required": ["q"] } },
         { "name": "get", "description": "One message in full, by its number.",
           "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] } },
+        { "name": "rooms", "description": "Your rooms (open rooms, private rooms you are in, DMs), latest activity first, with unread counts.",
+          "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "room_send", "description": "Post in a room (an open room or thread name, creator/name, or a DM id from rooms). @name mentions wake that agent.",
+          "inputSchema": { "type": "object", "properties": {
+            "room": { "type": "string" }, "text": { "type": "string" },
+            "reply_to": { "type": "integer", "description": "Number of the message this answers (optional)" } },
+            "required": ["room", "text"] } },
     ])
 }
 
@@ -122,6 +145,11 @@ struct Conn {
     ready: bool,
     pending: Option<(String, i64, std::time::Instant)>,
     closed: bool,
+    /// Rooms as channels: the room ids registered with the host, the ones it has open, and the register request.
+    channels: std::collections::BTreeMap<String, Value>,
+    open: std::collections::HashSet<String>,
+    registering: Option<String>,
+    registered: bool,
 }
 
 async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut replaced: oneshot::Receiver<()>) {
@@ -138,6 +166,10 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut replaced: ones
         ready: false,
         pending: None,
         closed: false,
+        channels: Default::default(),
+        open: Default::default(),
+        registering: None,
+        registered: false,
     };
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     while !c.closed {
@@ -151,7 +183,7 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut replaced: ones
             },
             ev = events.recv() => match ev {
                 _ if !c.node.active(&c.who) => c.close(4001, "session expired or membership changed"),
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => c.flush_backlog(),
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => { c.sync_channels(); c.flush_backlog() }
                 Err(_) => break,
             },
             _ = trust.changed() => if !c.node.active(&c.who) { c.close(4001, "session expired or membership changed") },
@@ -224,11 +256,30 @@ impl Conn {
             // A response to one of our push/event requests: the cursor moves only on an accepted push.
             let Some(id) = id else { return };
             let key = id.as_str().map(|s| s.to_string()).unwrap_or_else(|| id.to_string());
+            if self.registering.as_deref() == Some(key.as_str()) {
+                self.registering = None;
+                self.registered = msg.get("error").is_none();
+                tracing::info!("mcpl {}: channels/register {}", self.who.name, if self.registered { "accepted" } else { "refused" });
+                if self.registered {
+                    for (room, d) in &self.channels {
+                        if d["initiallyOpen"] == json!(true) {
+                            self.open.insert(room.clone());
+                        }
+                    }
+                    self.flush_backlog();
+                }
+                return;
+            }
             let Some((rpc, m, _)) = self.pending.as_ref() else { return };
             if rpc != &key { return; }
             let m = *m;
             let r = &msg["result"];
-            if r["accepted"] != json!(true) && r["reason"] != json!("duplicate") {
+            let incoming = rpc.starts_with("incoming-");
+            if incoming {
+                if msg.get("error").is_some() {
+                    return self.close(4008, "channel message declined; reconnect to retry");
+                }
+            } else if r["accepted"] != json!(true) && r["reason"] != json!("duplicate") {
                 return self.close(4008, "push declined; reconnect to retry");
             }
             if self.node.store.advance_cursor(&self.who.key, m).is_err() {
@@ -302,6 +353,54 @@ impl Conn {
                 reply(self, r);
                 if self.ready && self.push_allowed() {
                     self.flush_backlog();
+                }
+                if self.ready {
+                    self.sync_channels();
+                }
+            }
+            "channels/list" => {
+                let list: Vec<Value> = self.channels.values().cloned().collect();
+                reply(self, json!({ "channels": list }))
+            }
+            "channels/open" => {
+                if !self.channels_allowed() {
+                    return fail(self, -32017, "channels are not granted".into());
+                }
+                let cid = params["channelId"].as_str().map(String::from)
+                    .or_else(|| params["address"]["room"].as_str().map(|r| format!("room:{r}")));
+                let Some(room) = cid.as_deref().and_then(|c| c.strip_prefix("room:")).map(String::from) else {
+                    return fail(self, -32023, "unknown channel".into());
+                };
+                let Some(d) = self.channels.get(&room).cloned() else { return fail(self, -32023, "unknown channel".into()) };
+                self.open.insert(room.clone());
+                let mut r = json!({ "channel": d });
+                let limit = params["history"]["limit"].as_i64().unwrap_or(0).clamp(0, 100);
+                if limit > 0 {
+                    let q = Query { latest: Some(limit), ..Default::default() };
+                    if let Ok((rows, more)) = self.node.store.thread_causal(&room, &self.who, &q, PUSH_TEXT as i64) {
+                        r["history"] = json!(rows.iter().map(|row| self.incoming_message(row)).collect::<Vec<_>>());
+                        r["historyTruncated"] = json!(more);
+                    }
+                }
+                tracing::info!("mcpl {}: channels/open {room}", self.who.name);
+                reply(self, r);
+                self.flush_backlog();
+            }
+            "channels/close" => {
+                let room = params["channelId"].as_str().and_then(|c| c.strip_prefix("room:")).unwrap_or("").to_string();
+                let closed = self.open.remove(&room);
+                reply(self, json!({ "closed": closed }))
+            }
+            "channels/publish" => {
+                if !self.channels_allowed() {
+                    return fail(self, -32017, "channels are not granted".into());
+                }
+                let room = params["channelId"].as_str().and_then(|c| c.strip_prefix("room:")).unwrap_or("").to_string();
+                let text: Vec<&str> = params["content"].as_array().map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
+                    .unwrap_or_default();
+                match self.room_send(&room, &text.join("\n"), None) {
+                    Ok(row) => reply(self, json!({ "delivered": true, "messageId": row.id.to_string() })),
+                    Err(e) => fail(self, -32603, e.message),
                 }
             }
             "mcpl/manifest" => reply(self, manifest()),
@@ -414,6 +513,26 @@ impl Conn {
                 }
                 Ok(rows.iter().map(|r| self.node.fmt(r, 1000)).collect::<Vec<_>>().join("\n\n"))
             }
+            "rooms" => {
+                let rooms = n.rooms(me)?;
+                if rooms.is_empty() {
+                    return Ok("No rooms yet.".into());
+                }
+                Ok(rooms.iter().map(|r| {
+                    let unread = r["unread"].as_i64().unwrap_or(0);
+                    let mentions = r["unread_mentions"].as_i64().unwrap_or(0);
+                    let topic = r["topic"].as_str().filter(|t| !t.is_empty()).map(|t| format!(" — {t}")).unwrap_or_default();
+                    format!("{} [{}] {} unread{}; members: {}{topic}", r["id"].as_str().unwrap_or(""), r["kind"].as_str().unwrap_or(""),
+                        unread, if mentions > 0 { format!(" ({mentions} mention you)") } else { String::new() },
+                        r["members"].as_array().map(|m| m.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default())
+                }).collect::<Vec<_>>().join("\n"))
+            }
+            "room_send" => {
+                let room = args["room"].as_str().unwrap_or("").to_string();
+                let reply_to = args["reply_to"].as_i64();
+                let row = self.room_send(&room, args["text"].as_str().unwrap_or(""), reply_to)?;
+                Ok(format!("Posted #{} in room {}.", row.id, room))
+            }
             "get" => {
                 let id = args["id"].as_i64().unwrap_or(-1);
                 match n.store.get(id, me)? {
@@ -440,28 +559,166 @@ impl Conn {
         !(major > 0 || minor >= 5)
     }
 
-    fn flush_backlog(&mut self) {
-        if !self.ready || !self.push_allowed() || self.pending.is_some() { return; }
-        let rows = self.node.store.cursor(&self.who.key).and_then(|cursor| {
-            let q = Query { to_me: true, after: Some(cursor), limit: Some(1), ..Default::default() };
-            self.node.store.query(&q, &self.who, PUSH_TEXT as i64)
-        });
-        match rows {
-            Ok((rows, _)) => if let Some(row) = rows.first() { self.push(row); },
-            Err(_) => self.close(1011, "cannot read delivery cursor"),
+    fn channels_allowed(&self) -> bool {
+        self.mcpl && self.grant.as_ref().is_some_and(|g| ROOM_CAPS.iter().all(|c| capability_in(g, c)))
+    }
+
+    /// Post as the connected agent in a room (the node signs: the agent's identity file is in identities_dir).
+    fn room_send(&self, room: &str, text: &str, reply_to: Option<i64>) -> Result<Row, ApiError> {
+        let members = self.node.members.read().unwrap().clone();
+        let plan = self.node.room_plan(room, &self.who.name, None, &members, &self.node.agents())?;
+        let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true });
+        if let Some(id) = reply_to {
+            let q = self.node.store.get(id, &self.who)?.ok_or_else(|| ApiError::new(404, format!("no message #{id}")))?;
+            body["reply_to"] = json!(q.env_id);
         }
+        Ok(self.node.post(&self.who, &body)?.row)
+    }
+
+    /// The channel descriptor of a room (from `Node::rooms`).
+    fn descriptor(r: &Value) -> Value {
+        let id = r["id"].as_str().unwrap_or("");
+        let kind = r["kind"].as_str().unwrap_or("open");
+        let label = match kind {
+            "dm" => format!("@{} (dm)", r["label"].as_str().unwrap_or(id)),
+            _ => format!("#{id}"),
+        };
+        json!({ "id": format!("room:{id}"), "type": "agentmail.room", "label": label, "direction": "bidirectional",
+                "address": { "room": id },
+                "metadata": { "kind": kind, "topic": r["topic"], "members": r["members"], "history": r["history"] },
+                "initiallyOpen": r["member"] == json!(true),
+                "capabilities": { "history": { "maxMessages": 100, "supportsBeforeMessage": false } } })
+    }
+
+    /// Register the agent's rooms as channels once the host grants channels; afterwards announce new ones.
+    fn sync_channels(&mut self) {
+        if !self.ready || !self.channels_allowed() || self.registering.is_some() {
+            return;
+        }
+        let Ok(rooms) = self.node.rooms(&self.who) else { return };
+        let now: std::collections::BTreeMap<String, Value> = rooms.iter()
+            .map(|r| (r["id"].as_str().unwrap_or("").to_string(), Self::descriptor(r))).collect();
+        if !self.registered {
+            let rpc = format!("chreg-{}", mailcore::b64u(&mailcore::random_bytes::<6>()));
+            self.channels = now;
+            let list: Vec<Value> = self.channels.values().cloned().collect();
+            self.send(json!({ "jsonrpc": "2.0", "id": rpc, "method": "channels/register", "params": { "channels": list } }));
+            self.registering = Some(rpc);
+            return;
+        }
+        let added: Vec<Value> = now.iter().filter(|(k, _)| !self.channels.contains_key(*k)).map(|(_, d)| d.clone()).collect();
+        let updated: Vec<Value> = now.iter()
+            .filter(|(k, d)| self.channels.get(*k).is_some_and(|old| old["metadata"] != d["metadata"])).map(|(_, d)| d.clone()).collect();
+        if added.is_empty() && updated.is_empty() {
+            return;
+        }
+        for d in &added {
+            if d["initiallyOpen"] == json!(true) {
+                if let Some(room) = d["address"]["room"].as_str() {
+                    self.open.insert(room.to_string());
+                }
+            }
+        }
+        self.channels = now;
+        let mut p = json!({});
+        if !added.is_empty() { p["added"] = json!(added); }
+        if !updated.is_empty() { p["updated"] = json!(updated); }
+        self.send(json!({ "jsonrpc": "2.0", "method": "channels/changed", "params": p }));
+    }
+
+    /// How a row reaches this agent: (addressed by `to`, mentions it, a DM, a reply to its own message).
+    fn address(&self, r: &Row) -> (bool, bool, bool, bool) {
+        let addressed = mailcore::addr::addressed_to(&r.recipient, &[&self.who.name]);
+        let mention = r.mentions_name(&self.who.name);
+        let dm = mailcore::room::dm_pair(&r.thread).is_some();
+        let reply = r.reply_to.as_deref().and_then(|e| self.node.store.by_env(e, &self.who).ok().flatten())
+            .is_some_and(|q| q.sender_sub == self.who.sub);
+        (addressed, mention, dm, reply)
+    }
+
+    /// MCPL RFC-001 tags and discord-parity wake flags.
+    fn tags(&self, r: &Row) -> (Vec<&'static str>, Value) {
+        let (addressed, mention, dm, reply) = self.address(r);
+        let mut t = vec!["mail"];
+        if mention { t.push("chat:mention"); }
+        if reply { t.push("chat:reply"); }
+        if dm { t.extend(["chat:dm", "chat:private"]); }
+        if addressed || mention || dm || reply { t.push("chat:addressed"); } else { t.push("chat:ambient"); }
+        if !dm && mailcore::room::dm_pair(&r.thread).is_none() { t.push("chat:group"); }
+        t.push("chat:from-agent");
+        if r.files != "[]" { t.push("chat:has-file"); }
+        if r.kind == "event" { t.push("agentmail:membership"); }
+        let meta = json!({ "addressed": addressed || mention || dm || reply, "isMention": mention || reply,
+                           "isExplicitMention": mention, "isReplyToBot": reply, "isDM": dm, "isBot": false,
+                           "room": r.thread, "kind": r.kind });
+        (t, meta)
+    }
+
+    fn incoming_message(&self, r: &Row) -> Value {
+        let (tags, meta) = self.tags(r);
+        json!({ "channelId": format!("room:{}", r.thread), "messageId": r.id.to_string(),
+                "author": { "id": r.sender_sub, "name": r.sender }, "timestamp": r.ts,
+                "content": [{ "type": "text", "text": self.node.fmt(r, PUSH_TEXT) }], "metadata": meta, "tags": tags })
+    }
+
+    /// Deliver the next message after the cursor: on a channel the host has open, every room message (ambient
+    /// context; mentions and DMs flagged so the host can wake); otherwise only mail addressed to the agent, an
+    /// @mention, a DM or a reply to it, as push/event. Messages for neither are passed over.
+    fn flush_backlog(&mut self) {
+        if !self.ready || self.pending.is_some() { return; }
+        let pushing = self.push_allowed();
+        let incoming = self.registered && self.channels_allowed();
+        if !pushing && !incoming { return; }
+        loop {
+            let rows = self.node.store.cursor(&self.who.key).and_then(|cursor| {
+                let q = Query { after: Some(cursor), limit: Some(50), ..Default::default() };
+                self.node.store.query(&q, &self.who, PUSH_TEXT as i64).map(|r| (cursor, r))
+            });
+            let (_, (rows, more)) = match rows {
+                Ok(x) => x,
+                Err(_) => return self.close(1011, "cannot read delivery cursor"),
+            };
+            for row in &rows {
+                let own = row.sender_sub == self.who.sub;
+                let (addressed, mention, dm, reply) = self.address(row);
+                if !own && incoming && self.open.contains(&row.thread) {
+                    return self.push_incoming(row);
+                }
+                if !own && pushing && (addressed || mention || dm || reply) {
+                    return self.push(row);
+                }
+                if self.node.store.advance_cursor(&self.who.key, row.id).is_err() {
+                    return self.close(1011, "cannot save delivery cursor");
+                }
+            }
+            if !more { return; }
+        }
+    }
+
+    fn push_incoming(&mut self, r: &Row) {
+        let rpc = format!("incoming-{}-{}", r.id, mailcore::b64u(&mailcore::random_bytes::<6>()));
+        self.send(json!({ "jsonrpc": "2.0", "id": rpc, "method": "channels/incoming",
+                          "params": { "messages": [self.incoming_message(r)] } }));
+        tracing::info!("mcpl {}: channels/incoming #{} in {}", self.who.name, r.id, r.thread);
+        self.pending = Some((rpc, r.id, std::time::Instant::now()));
     }
 
     fn push(&mut self, r: &Row) {
         let event_id = format!("mail-{}", r.id);
         let rpc = format!("push-{event_id}-{}", mailcore::b64u(&mailcore::random_bytes::<6>()));
         let text = self.node.fmt(r, PUSH_TEXT);
-        let o = json!({ "server": "agentmail", "messageId": r.id, "thread": r.thread, "from": r.sender,
-                        "to": r.recipient, "verified": true, "attest": "agent" });
+        let (tags, meta) = self.tags(r);
+        let mut o = json!({ "server": "agentmail", "messageId": r.id, "thread": r.thread, "from": r.sender,
+                            "to": r.recipient, "verified": true, "attest": "agent",
+                            "channelId": format!("room:{}", r.thread), "mcplChannelId": format!("room:{}", r.thread),
+                            "authorId": r.sender_sub, "authorName": r.sender });
+        if let (Some(o), Some(m)) = (o.as_object_mut(), meta.as_object()) {
+            o.extend(m.clone());
+        }
         self.send(json!({
             "jsonrpc": "2.0", "id": rpc, "method": "push/event",
             "params": { "featureSet": "mail", "eventId": event_id, "timestamp": now_ts(), "origin": o,
-                        "tags": ["mail"], "payload": { "content": [{ "type": "text", "text": text }] } },
+                        "tags": tags, "payload": { "content": [{ "type": "text", "text": text }] } },
         }));
         tracing::info!("mcpl {}: push/event {event_id}", self.who.name);
         self.pending = Some((rpc, r.id, std::time::Instant::now()));

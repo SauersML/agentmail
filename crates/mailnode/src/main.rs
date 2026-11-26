@@ -15,6 +15,7 @@ mod net;
 mod node;
 mod private_fs;
 mod store;
+mod ui;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -148,6 +149,7 @@ async fn run(path: &Path) -> Result<()> {
 
     let state = api::AppState {
         node: node.clone(),
+        ui: Arc::new(Default::default()),
         streams: Arc::new(Mutex::new(Default::default())),
         sockets: Arc::new(Default::default()),
     };

@@ -60,7 +60,16 @@ CREATE TABLE IF NOT EXISTS cursors (sub TEXT PRIMARY KEY, last_id INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS used_tokens (name TEXT NOT NULL, jti TEXT NOT NULL, exp INTEGER NOT NULL,
   PRIMARY KEY (name, jti));
 CREATE INDEX IF NOT EXISTS used_tokens_exp ON used_tokens (exp);
+CREATE TABLE IF NOT EXISTS grants (env_id TEXT NOT NULL, key TEXT NOT NULL, ck TEXT NOT NULL, grant_env TEXT NOT NULL,
+  thread TEXT NOT NULL, PRIMARY KEY (env_id, key));
+CREATE TABLE IF NOT EXISTS room_reads (viewer TEXT NOT NULL, thread TEXT NOT NULL, last_id INTEGER NOT NULL,
+  PRIMARY KEY (viewer, thread));
 ";
+
+/// Room columns added to `messages` after the first release; added in place to an older store.
+const ROOM_COLUMNS: [(&str, &str); 4] = [
+    ("kind", "TEXT NOT NULL DEFAULT 'mail'"), ("meta", "TEXT"), ("mentions", "TEXT"), ("reply_to", "TEXT"),
+];
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
 #[derive(Clone, Debug)]
@@ -78,6 +87,35 @@ pub struct Row {
     pub files: String,
     pub readers: Option<String>,
     pub wrapped_to: String,
+    /// mail (plain), post (a room post), event (membership), grant (key grant: never shown).
+    pub kind: String,
+    /// The signed room fields (`mailcore::room::Meta` JSON), when the body had them.
+    pub meta: Option<String>,
+    /// ",name,name," of the agents mentioned.
+    pub mentions: Option<String>,
+    pub reply_to: Option<String>,
+}
+
+/// Room fields of a row, from its decrypted body.
+#[derive(Default, Debug, Clone)]
+pub struct Extra {
+    pub kind: &'static str,
+    pub meta: Option<String>,
+    pub mentions: Option<String>,
+    pub reply_to: Option<String>,
+}
+
+impl Extra {
+    pub fn of(meta_raw: &str, meta: &mailcore::room::Meta) -> Extra {
+        if meta.is_empty() {
+            return Extra { kind: "mail", ..Default::default() };
+        }
+        let kind = if !meta.grant.is_empty() { "grant" } else if meta.event.is_some() { "event" }
+                   else if meta.room.is_some() { "post" } else { "mail" };
+        let mentions = (!meta.mentions.is_empty())
+            .then(|| format!(",{},", meta.mentions.iter().map(|m| norm(m)).collect::<Vec<_>>().join(",")));
+        Extra { kind, meta: Some(meta_raw.to_string()), mentions, reply_to: meta.reply_to.clone() }
+    }
 }
 
 /// Attachment metadata as clients see it (the blob key never leaves the node).
@@ -96,7 +134,7 @@ pub fn public_files(files: &str) -> serde_json::Value {
 impl Row {
     /// Only originally wrapped keys can read. Private mail also requires the original addressed name.
     pub fn visible_to(&self, viewer: &Caller) -> bool {
-        self.text.is_some() && self.wrapped_to.split(',').any(|k| k == viewer.key)
+        self.text.is_some() && self.kind != "grant" && self.wrapped_to.split(',').any(|k| k == viewer.key)
             && (self.mode == "members"
                 || (self.mode == "private"
                     && self.readers.as_deref().is_some_and(|r| r.contains(&format!(",{},", norm(&viewer.name))))))
@@ -114,12 +152,30 @@ impl Row {
             "id": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
             "text": text, "files": public_files(&self.files),
             "len": self.len, "sub": self.sender_sub, "verified": true,
-            "env": self.env_id, "mode": self.mode, "attest": "agent",
+            "env": self.env_id, "mode": self.mode, "attest": "agent", "kind": self.kind,
         });
         if self.len > shown {
             m["truncated"] = json!(self.len);
         }
+        let meta = self.meta.as_deref().and_then(|r| mailcore::room::Meta::parse(r).ok()).unwrap_or_default();
+        if let Some(r) = &meta.room {
+            m["room"] = json!(r);
+        }
+        if !meta.mentions.is_empty() {
+            m["mentions"] = json!(meta.mentions);
+        }
+        if let Some(r) = &meta.reply_to {
+            m["reply_to"] = json!(r);
+        }
+        if let Some(e) = &meta.event {
+            m["event"] = serde_json::to_value(e).unwrap_or_default();
+        }
         m
+    }
+
+    /// Whether this row mentions `name`.
+    pub fn mentions_name(&self, name: &str) -> bool {
+        self.mentions.as_deref().is_some_and(|m| m.contains(&format!(",{},", norm(name))))
     }
 }
 
@@ -143,11 +199,17 @@ pub struct Store {
 
 const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode, substr(text, 1, ?) AS text, \
                     length(text) AS len, files, readers, \
-                    (SELECT group_concat(rtrim(value->>'to', '=')) FROM json_each(env, '$.keys'))";
+                    (SELECT group_concat(k) FROM (SELECT rtrim(value->>'to', '=') AS k FROM json_each(env, '$.keys') \
+                     UNION SELECT key FROM grants WHERE grants.env_id = messages.env_id)), \
+                    kind, meta, mentions, reply_to";
 
+/// A viewer sees a row its node can read, whose content key was wrapped to the viewer's key (in the envelope or
+/// in a key grant), private rows only when addressed to it; never a key grant itself.
 fn visible_sql() -> &'static str {
-    "(json_extract(env, '$.v') = 3 AND text IS NOT NULL AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
-      AND EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE rtrim(value->>'to', '=') = ?))"
+    "(json_extract(env, '$.v') = 3 AND text IS NOT NULL AND kind != 'grant' \
+      AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
+      AND (EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE rtrim(value->>'to', '=') = ?) \
+           OR EXISTS (SELECT 1 FROM grants g WHERE g.env_id = messages.env_id AND g.key = ?)))"
 }
 
 fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
@@ -165,6 +227,10 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         files: r.get(10)?,
         readers: r.get(11)?,
         wrapped_to: r.get::<_, Option<String>>(12)?.unwrap_or_default(),
+        kind: r.get(13)?,
+        meta: r.get(14)?,
+        mentions: r.get(15)?,
+        reply_to: r.get(16)?,
     })
 }
 
@@ -223,6 +289,12 @@ impl Store {
         anyhow::ensure!(!old_store, "existing database predates local trust; use a new data directory");
         let tx = db.transaction()?;
         tx.execute_batch(SCHEMA)?;
+        for (col, ty) in ROOM_COLUMNS {
+            if !tx.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?")?.exists([col])? {
+                tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {col} {ty}"))?;
+            }
+        }
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS messages_kind ON messages (kind, thread)")?;
         if !tx.prepare("SELECT 1 FROM sqlite_schema WHERE name='pending_blobs'")?.exists([])? {
             tx.execute_batch("
                 CREATE TABLE pending_blobs (id TEXT PRIMARY KEY) WITHOUT ROWID;
@@ -279,6 +351,7 @@ impl Store {
 
     /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key), or if it
     /// is another envelope carrying an agent-signed message already here (stored hidden, see agent_sig).
+    #[allow(dead_code)]
     pub fn insert(
         &self,
         env: &Envelope,
@@ -288,6 +361,21 @@ impl Store {
         readers: Option<&str>,
         received_ms: i64,
     ) -> Result<Option<Row>> {
+        self.insert_with(env, v, text, files, readers, received_ms, &Extra { kind: "mail", ..Default::default() })
+    }
+
+    /// `insert` with the body's room fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with(
+        &self,
+        env: &Envelope,
+        v: &Verified,
+        text: Option<&str>,
+        files: &str,
+        readers: Option<&str>,
+        received_ms: i64,
+        extra: &Extra,
+    ) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
@@ -295,8 +383,8 @@ impl Store {
         let replay = db.prepare("SELECT 1 FROM messages WHERE agent_sig = ?")?.exists([sig])?;
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
-             readers, parents, env, received, blobs, files, agent_sig) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             readers, parents, env, received, blobs, files, agent_sig, kind, meta, mentions, reply_to) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 env.id,
                 env.day(),
@@ -313,7 +401,11 @@ impl Store {
                 received_ms,
                 serde_json::to_string(&env.blobs)?,
                 if replay { "[]" } else { files },
-                (!replay).then_some(sig)
+                (!replay).then_some(sig),
+                if replay || extra.kind.is_empty() { "mail" } else { extra.kind },
+                if replay { None } else { extra.meta.as_deref() },
+                if replay { None } else { extra.mentions.as_deref() },
+                if replay { None } else { extra.reply_to.as_deref() },
             ],
         )?;
         if n == 0 || replay {
@@ -341,11 +433,14 @@ impl Store {
     /// Return rows in local-id order, at most `limit` (1000) or PAGE_CHARS of text.
     pub fn query(&self, q: &Query, viewer: &Caller, text_cap: i64) -> Result<(Vec<Row>, bool)> {
         let mut wh = vec![visible_sql().to_string()];
-        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))), Value::Text(viewer.key.clone())];
+        let mut args: Vec<Value> = vec![Value::Integer(text_cap), Value::Text(format!(",{},", norm(&viewer.name))),
+                                        Value::Text(viewer.key.clone()), Value::Text(viewer.key.clone())];
         if q.to_me {
-            wh.push("sender_sub != ? AND addressed_to(recipient, ?)".into());
+            // Addressed to the viewer, or mentioning it (a room post addresses no one).
+            wh.push("sender_sub != ? AND (addressed_to(recipient, ?) OR instr(mentions, ?) > 0)".into());
             args.push(Value::Text(viewer.sub.clone()));
             args.push(Value::Text(viewer.name.clone()));
+            args.push(Value::Text(format!(",{},", norm(&viewer.name))));
         }
         if let Some(a) = q.after {
             wh.push("id > ?".into());
@@ -407,7 +502,7 @@ impl Store {
             visible_sql()
         ))?;
         let rows = st
-            .query_map(params![format!(",{},", norm(&viewer.name)), viewer.key, limit], |r| {
+            .query_map(params![format!(",{},", norm(&viewer.name)), viewer.key, viewer.key, limit], |r| {
                 Ok(json!({
                     "thread": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "id": r.get::<_, i64>(2)?,
                     "ts": r.get::<_, String>(3)?, "sender": r.get::<_, String>(4)?,
@@ -442,7 +537,7 @@ impl Store {
         let mut bytes = 0;
         let mut more = false;
         for &i in window.iter() {
-            let Some(row) = read.query_row(params![text_cap, nodes[i].0, name, viewer.key], read_row).optional()? else { continue };
+            let Some(row) = read.query_row(params![text_cap, nodes[i].0, name, viewer.key, viewer.key], read_row).optional()? else { continue };
             bytes += row.text.as_deref().map_or(0, str::len) + row.files.len() + 200;
             if rows.len() == limit || (!rows.is_empty() && bytes > PAGE_CHARS) { more = true; break; }
             rows.push(row);
@@ -751,13 +846,152 @@ impl Store {
             .optional()?;
         out.extend(up);
         let mut st = db.prepare(&format!(
-            "SELECT DISTINCT f.value FROM messages m, json_each(m.files) f WHERE f.value->>'id' = ? AND {}
-             ORDER BY m.id, f.key", visible_sql()
+            "SELECT DISTINCT f.value FROM messages, json_each(messages.files) f WHERE f.value->>'id' = ? AND {}
+             ORDER BY messages.id, f.key", visible_sql()
         ))?;
-        for row in st.query_map(params![id, format!(",{},", norm(&viewer.name)), viewer.key], |r| r.get::<_, String>(0))? {
+        for row in st.query_map(params![id, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key], |r| r.get::<_, String>(0))? {
             out.push(serde_json::from_str(&row?)?);
         }
         Ok(out)
+    }
+
+    /* Rooms */
+
+    /// Readable membership events of one room (this node's view): (env id, ts, sender, meta JSON).
+    pub fn room_events(&self, thread: &str) -> Result<Vec<(String, String, String, String)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT env_id, ts, sender, meta FROM messages WHERE kind = 'event' AND thread = ? \
+                                 AND text IS NOT NULL AND meta IS NOT NULL")?;
+        let rows = st.query_map([thread], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// The rooms (threads) with a message the viewer can see, latest first: thread, count, last row fields, the
+    /// viewer's unread count (after its read cursor, not its own), and the distinct senders.
+    pub fn room_rows(&self, viewer: &Caller, limit: i64) -> Result<Vec<serde_json::Value>> {
+        let db = self.db.lock().unwrap();
+        let name = format!(",{},", norm(&viewer.name));
+        let mut st = db.prepare(&format!(
+            "SELECT m.thread, t.n, m.id, m.ts, m.sender, substr(m.text, 1, 300), t.senders,
+                    (SELECT COUNT(*) FROM messages u WHERE u.thread = m.thread AND u.id > COALESCE(
+                        (SELECT last_id FROM room_reads WHERE viewer = ? AND thread = m.thread), 0)
+                        AND u.sender_sub != ? AND u.id IN (SELECT id FROM messages WHERE thread = m.thread AND {vis})),
+                    (SELECT COUNT(*) FROM messages u WHERE u.thread = m.thread AND instr(u.mentions, ?) > 0 AND u.id > COALESCE(
+                        (SELECT last_id FROM room_reads WHERE viewer = ? AND thread = m.thread), 0)
+                        AND u.sender_sub != ? AND u.id IN (SELECT id FROM messages WHERE thread = m.thread AND {vis})),
+                    m.kind
+             FROM (SELECT thread, COUNT(*) AS n, MAX(id) AS last, json_group_array(DISTINCT sender) AS senders
+                   FROM messages WHERE {vis} GROUP BY thread) t
+             JOIN messages m ON m.id = t.last ORDER BY m.id DESC LIMIT ?", vis = visible_sql()))?;
+        let k = &viewer.key;
+        let rows = st
+            .query_map(params![k, viewer.sub, name, k, k, name, k, viewer.sub, name, k, k, name, k, k, limit], |r| {
+                Ok(json!({
+                    "room": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "id": r.get::<_, i64>(2)?,
+                    "ts": r.get::<_, String>(3)?, "sender": r.get::<_, String>(4)?,
+                    "snippet": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    "senders": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(6)?).unwrap_or(json!([])),
+                    "unread": r.get::<_, i64>(7)?, "unread_mentions": r.get::<_, i64>(8)?,
+                    "last_kind": r.get::<_, String>(9)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct senders of a thread's readable rows (an open room's participants).
+    pub fn room_senders(&self, thread: &str) -> Result<Vec<String>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT DISTINCT sender FROM messages WHERE thread = ? AND text IS NOT NULL AND kind != 'grant' ORDER BY sender")?;
+        let rows = st.query_map([thread], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Move the viewer's read cursor of a room forward.
+    pub fn mark_read(&self, viewer: &Caller, thread: &str, id: i64) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("INSERT INTO room_reads (viewer, thread, last_id) VALUES (?, ?, ?) ON CONFLICT(viewer, thread) \
+                    DO UPDATE SET last_id = MAX(last_id, excluded.last_id)", params![viewer.key, thread, id])?;
+        Ok(())
+    }
+
+    /// The visible row of an envelope (for quotes and replies).
+    pub fn by_env(&self, env_id: &str, viewer: &Caller) -> Result<Option<Row>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE env_id = ?"), params![MAX_TEXT, env_id], read_row)
+            .optional()?.filter(|r| r.visible_to(viewer)))
+    }
+
+    /// Envelopes (raw JSON) of a room's private rows the viewer can see, oldest first, for re-wrapping their keys,
+    /// with any content key this node holds from a grant.
+    pub fn room_envelopes(&self, thread: &str, viewer: &Caller, events_only: bool) -> Result<Vec<(String, String, Option<String>)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(&format!(
+            "SELECT env_id, env, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1) FROM messages \
+             WHERE thread = ? AND mode = 'private' AND {} {} ORDER BY ts, env_id", visible_sql(),
+            if events_only { "AND kind = 'event'" } else { "" }))?;
+        let rows = st.query_map(params![thread, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Record a key grant: `keys` may now read `env_id` with content key `ck`. Ok(true) when new.
+    pub fn put_grant(&self, env_id: &str, keys: &[String], ck: &str, grant_env: &str, thread: &str) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        let mut n = 0;
+        for k in keys {
+            n += db.execute("INSERT OR IGNORE INTO grants (env_id, key, ck, grant_env, thread) VALUES (?, ?, ?, ?, ?)",
+                            params![env_id, k, ck, grant_env, thread])?;
+        }
+        Ok(n > 0)
+    }
+
+    /// Grants held for an envelope: (content key, room it was granted in, grantee keys).
+    pub fn grants_for(&self, env_id: &str) -> Result<Vec<(String, String, Vec<String>)>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT ck, thread, group_concat(key) FROM grants WHERE env_id = ? GROUP BY ck, thread")?;
+        let rows = st.query_map([env_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, String>(2)?.split(',').map(String::from).collect()))
+        })?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Forget a grant whose key does not open its envelope (or names another room).
+    pub fn drop_grant(&self, env_id: &str, ck: &str) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM grants WHERE env_id = ? AND ck = ?", params![env_id, ck])?;
+        Ok(())
+    }
+
+    /// The stored envelope JSON, text presence and readers of a row.
+    pub fn env_state(&self, env_id: &str) -> Result<Option<(String, bool, Option<String>)>> {
+        let db = self.db.lock().unwrap();
+        Ok(db.query_row("SELECT env, text IS NOT NULL, readers FROM messages WHERE env_id = ? AND mode != 'dup'",
+                        [env_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?)
+    }
+
+    /// A row this node could not read, opened through a grant: fill in its body.
+    pub fn fill_body(&self, env_id: &str, text: &str, files: &str, extra: &Extra) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("UPDATE messages SET text = ?, files = ?, kind = ?, meta = ?, mentions = ?, reply_to = ? \
+                    WHERE env_id = ? AND text IS NULL AND mode != 'dup'",
+                   params![text, files, extra.kind, extra.meta, extra.mentions, extra.reply_to, env_id])?;
+        Ok(())
+    }
+
+    /// Add names to a private row's readers.
+    pub fn add_readers(&self, env_id: &str, names: &[String]) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let cur: Option<String> = db.query_row("SELECT readers FROM messages WHERE env_id = ?", [env_id], |r| r.get(0))
+            .optional()?.flatten();
+        let mut all: Vec<String> = cur.unwrap_or_default().split(',').filter(|s| !s.is_empty()).map(String::from).collect();
+        all.extend(names.iter().map(|n| norm(n)));
+        all.sort();
+        all.dedup();
+        db.execute("UPDATE messages SET readers = ? WHERE env_id = ?", params![format!(",{},", all.join(",")), env_id])?;
+        Ok(())
     }
 
     pub fn count(&self) -> Result<i64> {

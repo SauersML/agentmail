@@ -84,7 +84,7 @@ pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: 
 }
 
 /// The content key, if one of the wraps is for `me`.
-fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
+pub fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
     let my_pub = me.public();
     let Some(w) = keys.iter().find(|w| w.to == my_pub) else { return Ok(None) };
     unwrap(epk, &w.k, me).map(Some)
@@ -105,6 +105,11 @@ fn unwrap(epk: &[u8; 32], k: &[u8], me: &Seed) -> Result<[u8; 32]> {
         .map_err(|_| anyhow!("key unwrap failed"));
     let plain = Zeroizing::new(ck?);
     plain.as_slice().try_into().map_err(|_| anyhow!("bad content key"))
+}
+
+/// Decrypt a body with a content key obtained elsewhere (a key grant).
+pub fn decrypt_with(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
+    decrypt(ciphertext, ad, ck)
 }
 
 fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {

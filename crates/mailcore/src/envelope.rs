@@ -85,6 +85,12 @@ impl PostStatement<'_> {
 
 /// Hash the encrypted body's public-facing fields using the same length framing as the signature.
 pub fn post_digest(salt: &[u8], text: &str, files: &[serde_json::Value]) -> Result<String> {
+    post_digest_meta(salt, text, files, "")
+}
+
+/// The digest with the body's room fields (`Body::meta`, the exact JSON text the sender signed). Without meta it is
+/// the same digest as before rooms, so earlier messages verify unchanged.
+pub fn post_digest_meta(salt: &[u8], text: &str, files: &[serde_json::Value], meta: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(crate::paseto::pae(&[b"agent-mail/body-digest/v2", salt, text.as_bytes()]));
@@ -93,6 +99,9 @@ pub fn post_digest(salt: &[u8], text: &str, files: &[serde_json::Value]) -> Resu
         let size = file["size"].as_u64().ok_or_else(|| anyhow!("invalid attachment size"))?;
         h.update(crate::paseto::pae(&[field("id")?.as_bytes(), field("name")?.as_bytes(),
             field("type")?.as_bytes(), &size.to_le_bytes()]));
+    }
+    if !meta.is_empty() {
+        h.update(crate::paseto::pae(&[b"agent-mail/body-meta/v1", meta.as_bytes()]));
     }
     Ok(format!("{:x}", h.finalize()))
 }
@@ -140,6 +149,9 @@ pub struct Body {
     /// b64url salt of the sender's digest (Attest::Agent only).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub salt: String,
+    /// Room fields (`room::Meta`) as the JSON text the sender signed; empty for plain mail.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub meta: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,6 +245,24 @@ impl Envelope {
             }
         }
         Ok(None)
+    }
+
+    /// The content key, if one of `local_keys` is a recipient (for re-wrapping it in a key grant).
+    pub fn content_key<'a>(&self, local_keys: impl IntoIterator<Item = &'a Seed>) -> Result<Option<[u8; 32]>> {
+        let (_, epk, _) = self.parts()?;
+        let wraps = self.wraps()?;
+        for key in local_keys {
+            if let Some(ck) = crypto::content_key(&epk, &wraps, key)? {
+                return Ok(Some(ck));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The body under a content key from a grant. Err if the key does not open it.
+    pub fn open_with(&self, ck: &[u8; 32]) -> Result<Body> {
+        let (ct, _, ad) = self.parts()?;
+        Ok(serde_json::from_slice(&crypto::decrypt_with(&ct, &ad, ck)?)?)
     }
 
     fn parts(&self) -> Result<(Vec<u8>, [u8; 32], Vec<u8>)> {
@@ -342,7 +372,7 @@ impl Envelope {
         }
         let Attest::Agent { digest, .. } = &self.attest;
         let salt = b64u_decode(&body.salt).filter(|s| s.len() == 16).ok_or_else(|| anyhow!("invalid salt length"))?;
-        if &post_digest(&salt, &body.text, &body.files)? != digest {
+        if &post_digest_meta(&salt, &body.text, &body.files, &body.meta)? != digest {
             bail!("body does not match the sender's signed digest");
         }
         Ok(())
@@ -381,7 +411,7 @@ mod tests {
         let signer = if from == "a.alice" { &w.alice } else { &w.carol };
         let ts = crate::now_ts();
         let salt = crate::random_bytes::<16>();
-        let body = Body { text: format!("hi from {from}"), salt: b64u(&salt), files: vec![] };
+        let body = Body { text: format!("hi from {from}"), salt: b64u(&salt), files: vec![], meta: String::new() };
         let digest = post_digest(&salt, &body.text, &[]).unwrap();
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
@@ -428,7 +458,7 @@ mod tests {
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
         let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert: None };
-        let body = Body { text: text.into(), files: vec![], salt: b64u(&salt) };
+        let body = Body { text: text.into(), files: vec![], salt: b64u(&salt), meta: String::new() };
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -492,7 +522,7 @@ mod tests {
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
         let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
-        let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt) };
+        let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt), meta: String::new() };
         let mk = |to: &str, thread: &str| {
             Envelope::seal(
                 Draft {
@@ -545,6 +575,17 @@ mod tests {
         let mut e = base.clone();
         e.epk = b64u(&[0u8; 7]);
         assert!(resign(e).verify(&w.members, &pinned(&w.members), now).unwrap_err().to_string().contains("epk"));
+    }
+
+    #[test]
+    fn room_fields_are_covered_by_the_digest() {
+        let salt = [7u8; 16];
+        let plain = post_digest(&salt, "hi", &[]).unwrap();
+        assert_eq!(plain, post_digest_meta(&salt, "hi", &[], "").unwrap(), "no meta: the digest before rooms");
+        let meta = r#"{"room":"hypha/x","mentions":["bob"]}"#;
+        let signed = post_digest_meta(&salt, "hi", &[], meta).unwrap();
+        assert_ne!(signed, plain);
+        assert_ne!(signed, post_digest_meta(&salt, "hi", &[], r#"{"room":"hypha/x"}"#).unwrap());
     }
 
     #[test]
@@ -609,7 +650,7 @@ mod tests {
     fn certified_env(l: &MemberList, agents: &[Agent], writer: &Seed, from: &str, signer: &Seed, to: &str, mode: Mode,
                      ts: String, cert: Option<Cert>) -> Envelope {
         let salt = crate::random_bytes::<16>();
-        let body = Body { text: "hello".into(), files: vec![], salt: b64u(&salt) };
+        let body = Body { text: "hello".into(), files: vec![], salt: b64u(&salt), meta: String::new() };
         let digest = post_digest(&salt, &body.text, &[]).unwrap();
         let recipients = match mode {
             Mode::Members => l.all_keys(),

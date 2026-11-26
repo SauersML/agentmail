@@ -26,6 +26,7 @@ const MAX_STREAMS: usize = 200;
 #[derive(Clone)]
 pub struct AppState {
     pub node: Arc<Node>,
+    pub ui: Arc<crate::ui::Sessions>,
     pub streams: Arc<Mutex<HashMap<String, usize>>>,
     pub sockets: Arc<mcpl::Sockets>,
 }
@@ -56,6 +57,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents).post(certify))
         .route("/api/revocations", axum::routing::post(revoke))
         .route("/api/messages", get(list).post(post))
+        .route("/api/messages/{id}", get(one))
+        .route("/api/rooms", get(rooms))
+        .route("/api/room", get(room))
+        .route("/api/room-keys", get(room_keys))
+        .route("/api/room-read", axum::routing::post(room_read))
+        .route("/api/ui-sessions", axum::routing::post(ui_session))
+        .route("/ui", get(crate::ui::page))
+        .route("/ui/api/me", get(crate::ui::me))
+        .route("/ui/api/rooms", get(crate::ui::rooms))
+        .route("/ui/api/messages", get(crate::ui::messages))
+        .route("/ui/api/files/{id}", get(crate::ui::file))
         .route("/api/threads", get(threads))
         .route("/api/names", get(names))
         .route("/api/stream", get(stream))
@@ -144,6 +156,20 @@ async fn node_info(State(s): State<AppState>) -> Response {
 /// Return the exact key set the local node would use. A trust-file change before posting invalidates the signature.
 async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
+    if let Some(room) = p.get("room") {
+        // A room post: the node says where it goes (to, mode) and the exact keys, given the optional event.
+        let event = match p.get("event") {
+            Some(e) => Some(serde_json::from_str::<mailcore::room::Event>(e)
+                .map_err(|e| ApiError::new(400, format!("invalid event: {e}")))?),
+            None => None,
+        };
+        let members = s.node.members.read().unwrap().clone();
+        let agents = s.node.agents();
+        let plan = s.node.room_plan(room, &who.name, event.as_ref(), &members, &agents)?;
+        let node_keys = s.node.recipient_node_keys(&members, &plan.keys)?;
+        return Ok(json_resp(json!({ "keys": plan.keys.iter().map(|k| mailcore::b64u(k)).collect::<Vec<_>>(),
+            "node_encryption_keys": node_keys, "to": plan.to, "mode": plan.mode.as_str(), "names": plan.names }), 200));
+    }
     let to = p.get("to").ok_or_else(|| ApiError::new(400, "missing to"))?;
     let mode = match p.get("mode").map(String::as_str) {
         Some("private") => mailcore::Mode::Private,
@@ -228,11 +254,11 @@ async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
             return Err(ApiError::new(400, "causal order supports thread, after, before, limit and latest"));
         }
         let (rows, more) = s.node.store.thread_causal(&thread, &who, &q, MAX_TEXT)?;
-        let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();
+        let msgs = messages_json(&s.node, &rows, &who);
         return Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200));
     }
     let (rows, more) = s.node.store.query(&q, &who, MAX_TEXT)?;
-    let msgs: Vec<Value> = rows.iter().map(|r| r.to_message()).collect();
+    let msgs = messages_json(&s.node, &rows, &who);
     Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200))
 }
 
@@ -259,6 +285,68 @@ async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: 
     } else {
         Ok(json_resp(out, 201))
     }
+}
+
+/// Messages as clients see them; a reply carries a short quote of the message it answers, when the viewer can see it.
+pub fn messages_json(node: &Node, rows: &[crate::store::Row], who: &Caller) -> Vec<Value> {
+    rows.iter().map(|r| {
+        let mut m = r.to_message();
+        if let Some(q) = r.reply_to.as_deref().and_then(|e| node.store.by_env(e, who).ok().flatten()) {
+            let text: String = q.text.unwrap_or_default().chars().take(280).collect();
+            m["quote"] = json!({ "id": q.id, "from": q.sender, "ts": q.ts, "text": text });
+        }
+        m
+    }).collect()
+}
+
+async fn one(State(s): State<AppState>, who: Caller, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
+    let id: i64 = id.parse().map_err(|_| ApiError::new(400, "message id must be a number"))?;
+    let row = s.node.store.get(id, &who)?.ok_or_else(|| ApiError::new(404, format!("no message #{id}")))?;
+    Ok(json_resp(json!({ "message": messages_json(&s.node, &[row], &who).pop() }), 200))
+}
+
+async fn rooms(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
+    let node = s.node.clone();
+    let rooms = tokio::task::spawn_blocking(move || node.rooms(&who)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "rooms": rooms }), 200))
+}
+
+async fn room(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
+    let p = params(&raw);
+    let id = p.get("id").ok_or_else(|| ApiError::new(400, "missing id"))?;
+    let senders = s.node.store.room_senders(id)?;
+    let info = s.node.room_info(&who, id, &senders)?;
+    // An undiscoverable private room: only a member (or a former one) learns that it exists.
+    let me = mailcore::addr::norm(&who.name);
+    let private = info["kind"] != "open";
+    let known = info["member"] == true || info["former"].as_array().is_some_and(|f| f.iter().any(|n| n.as_str() == Some(me.as_str())));
+    if (private && !known) || info["created"] == false {
+        return Err(ApiError::new(404, format!("no room {id} here (private rooms are invite-only)")));
+    }
+    Ok(json_resp(json!({ "room": info }), 200))
+}
+
+async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
+    let p = params(&raw);
+    let id = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
+    let node = s.node.clone();
+    let keys = tokio::task::spawn_blocking(move || node.room_keys(&who, &id)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(json!({ "keys": keys }), 200))
+}
+
+/// POST /api/room-read {room, id}: the caller has read the room up to message `id`.
+async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
+    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
+    let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?;
+    let id = v["id"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "id is required"))?;
+    s.node.store.mark_read(&who, room, id)?;
+    Ok(json_resp(json!({ "ok": true }), 200))
+}
+
+/// POST /api/ui-sessions: a read-only key for the /ui page, bound to the caller, for at most 12 hours.
+async fn ui_session(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
+    let (key, exp) = s.ui.open(who);
+    Ok(json_resp(json!({ "key": key, "expires": mailcore::ts_from_millis(exp), "path": format!("/ui#k={key}") }), 201))
 }
 
 async fn threads(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
