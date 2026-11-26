@@ -1193,7 +1193,9 @@ def first_run(config, inv, a):
     cfg = {"data_dir": "data", "api_listen": a.api, "iroh_port": port, "relay": ["n0"] if "n0" in inv["relay"] else [],
            "node_key_file": "node.seed", "members_file": "members.json"}
     for name, obj in (("members.json", trust), ("config.json", cfg)):
-        with open(os.path.join(folder, name), "x", encoding="utf-8") as f:
+        # Owner-only whatever the umask: the node refuses a config or trust file other users can write.
+        fd = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=1)
     log = open(os.path.join(folder, "node.log"), "ab")
     kw = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"

@@ -508,7 +508,10 @@ The threat model, plainly. "Trusted node" means a node listed in this host's tru
   a name such as `conftest.py` or `.envrc` is still the sender's choice, so use `-o PATH` where that matters.
 - **Keys at rest.** The node seed, identity files and data directory must be owner-only (mode bits on Unix, an
   access list on Windows) or the node refuses them. The trust file and config.json are not secret, but whoever can
-  write them controls the node, and the node does not check who can: keep them writable only by its user.
+  write them controls the node: on Unix the node refuses to start with either one writable by group or others, owned
+  by another user than its own or root, or in a folder others can write (not sticky), and says how to fix it
+  (`chmod go-w`); a running node keeps its trust list rather than adopt such a file. Key and identity files must
+  also be owned by the node's user or root.
 - **Not protected:** a compromised host (it reads its mail and signs as the agents whose keys it holds); traffic
   analysis by relays and network observers beyond what padding and cover traffic blur; availability against a hostile
   trusted node or local user.

@@ -364,6 +364,7 @@ static EDIT: Mutex<()> = Mutex::new(());
 fn edit_trust(node: &Node, f: impl FnOnce(&mut MemberList, &str) -> Result<(), ApiError>) -> Result<MemberList, ApiError> {
     let _g = EDIT.lock().unwrap();
     let path = node.opts.members_file.as_deref().ok_or_else(|| ApiError::new(503, "this node has no trust file to edit"))?;
+    crate::private_fs::check_writers(path).map_err(|e| ApiError::new(409, format!("{e:#}")))?;
     let mut list = crate::config::Config::parse_members(&std::fs::read(path).map_err(anyhow::Error::from)?)
         .map_err(|e| ApiError::new(409, format!("trust file is not valid now: {e:#}")))?;
     let cur = node.members.read().unwrap().seq;
@@ -385,7 +386,14 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<(), ApiError> {
     use std::io::Write;
     let tmp = path.with_extension(format!("tmp-{}", b64u(&islandmail_core::random_bytes::<6>())));
     let r = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
+        // Owner-only whatever the umask, so the node never writes a trust file it would then refuse.
+        let mut f = crate::private_fs::options().write(true).create_new(true).open(&tmp)?;
+        // Keep who may read it (iroh-relay's allowlist, say); never group or other write.
+        #[cfg(unix)]
+        if let Ok(md) = std::fs::metadata(path) {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(md.permissions().mode() & 0o755))?;
+        }
         f.write_all(data)?;
         f.sync_all()?;
         std::fs::rename(&tmp, path)

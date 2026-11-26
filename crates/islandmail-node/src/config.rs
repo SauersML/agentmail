@@ -69,6 +69,8 @@ fn default_sync() -> u64 {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
+        // Whoever can change the config or the trust file decides what this node trusts: only this user (or root).
+        crate::private_fs::check_writers(path).context("refusing the config")?;
         let value = crate::migrate::file(path, crate::migrate::config)?;
         let mut c: Config = serde_json::from_value(value).context("config is not valid")?;
         anyhow::ensure!(c.v == islandmail_core::versions::CONFIG, "config version {} after migration", c.v);
@@ -88,6 +90,7 @@ impl Config {
     }
 
     pub fn members(&self) -> Result<MemberList> {
+        crate::private_fs::check_writers(&self.members_file).context("refusing the trust file")?;
         let value = crate::migrate::file(&self.members_file, crate::migrate::trust)?;
         let list: MemberList = serde_json::from_value(value).context("member list is not valid")?;
         list.validate()?;

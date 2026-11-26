@@ -685,6 +685,7 @@ pub const TRUST_POLL: Duration = Duration::from_secs(1);
 /// `adopted` runs after each adopted change.
 pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) {
     let mut last: Option<Vec<u8>> = None;
+    let mut refused = false;
     let mut tick = tokio::time::interval(TRUST_POLL);
     loop {
         tick.tick().await;
@@ -698,6 +699,14 @@ pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) 
         if last.as_ref() == Some(&raw) {
             continue;
         }
+        if let Err(e) = crate::private_fs::check_writers(&cfg.members_file) {
+            if !refused {
+                tracing::warn!("local trust file refused, keeping the list in use: {e:#}");
+                refused = true;
+            }
+            continue;
+        }
+        refused = false;
         match Config::parse_members(&raw).and_then(|list| node.reload_members(&list)) {
             Ok(true) => {
                 // Held identities newly inside this node's names get their certificates now.

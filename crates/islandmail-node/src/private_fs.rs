@@ -40,6 +40,13 @@ pub fn check_dir(path: &Path) -> Result<()> {
     imp::check(&imp::open_dir(path)?, path)
 }
 
+/// Refuse a file that decides what this node trusts or holds (config, trust file) when another user could change it:
+/// on Unix, group or other write bits on it, or on its folder without the sticky bit, or an owner other than this
+/// user or root. Windows: not checked (access lists there are inherited and checked for key files only).
+pub fn check_writers(path: &Path) -> Result<()> {
+    imp::check_writers(path)
+}
+
 pub fn links(file: &File) -> Result<u64> {
     imp::links(file)
 }
@@ -94,9 +101,34 @@ mod imp {
     }
 
     pub fn check(file: &File, path: &Path) -> Result<()> {
-        let mode = file.metadata()?.permissions().mode() & 0o777;
+        let md = file.metadata()?;
+        let mode = md.permissions().mode() & 0o777;
         anyhow::ensure!(mode & 0o077 == 0, "{} must be private but has mode {mode:o}; run chmod go= on it", path.display());
+        check_owner(&md, path)
+    }
+
+    fn check_owner(md: &std::fs::Metadata, path: &Path) -> Result<()> {
+        let me = unsafe { libc::geteuid() };
+        anyhow::ensure!(md.uid() == me || md.uid() == 0,
+                        "{} is owned by another user (uid {}); it must be this user's (uid {me}) or root's: run chown {me} on it",
+                        path.display(), md.uid());
         Ok(())
+    }
+
+    pub fn check_writers(path: &Path) -> Result<()> {
+        let md = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+        let mode = md.permissions().mode() & 0o7777;
+        anyhow::ensure!(mode & 0o022 == 0,
+                        "{} is writable by other users (mode {:o}); run chmod go-w on it", path.display(), mode & 0o777);
+        check_owner(&md, path)?;
+        // Whoever can write its folder can replace it, unless the folder is sticky (as /tmp is).
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dmd = std::fs::metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
+        let dmode = dmd.permissions().mode() & 0o7777;
+        anyhow::ensure!(dmode & 0o022 == 0 || dmode & 0o1000 != 0,
+                        "{} is in {}, which other users can write (mode {:o}): they could replace it; run chmod go-w on \
+                         that folder or move the file", path.display(), dir.display(), dmode & 0o777);
+        check_owner(&dmd, dir)
     }
 
     pub fn restrict_file(file: &File, _path: &Path) -> Result<()> {
@@ -128,6 +160,10 @@ mod imp {
 mod imp {
     use super::*;
     use std::ffi::OsStr;
+
+    pub fn check_writers(_path: &Path) -> Result<()> {
+        Ok(())
+    }
     use std::io::Error;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
@@ -296,6 +332,34 @@ mod tests {
         assert!(sddl_private("O:S-1-5-21-1-2-3-1001", ME).is_err());
         assert_eq!(sddl_private("O:BAD:P(A;;FA;;;LA)", "S-1-5-21-1-2-3-500"), Ok(()));
         assert_eq!(sddl_private("O:BAD:P(A;;FA;;;LA)", ME), Err("LA".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_and_trust_files_others_can_write_are_refused() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("islandmail-node-writers-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
+        create_dir(&dir)?;
+        let path = dir.join("members.json");
+        std::fs::write(&path, b"{}")?;
+        for (mode, ok) in [(0o644, true), (0o600, true), (0o664, false), (0o646, false), (0o666, false)] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+            let r = check_writers(&path);
+            assert_eq!(r.is_ok(), ok, "mode {mode:o}");
+            if let Err(e) = r {
+                assert!(format!("{e:#}").contains("chmod go-w"), "{e:#}");
+            }
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        // A folder others can write (not sticky): the file could be replaced.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777))?;
+        assert!(format!("{:#}", check_writers(&path).unwrap_err()).contains("replace"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777))?;
+        check_writers(&path)?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        check_writers(&path)?;
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
