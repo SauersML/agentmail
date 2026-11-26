@@ -597,7 +597,11 @@ cannot be migrated and are refused with what to do: move the node folder aside a
 directory belongs to its node key and network. If a peer advertises a truncated trust snapshot, the receiver fetches
 each locally trusted issuer's records separately. Room fields travel as an optional `meta` in the encrypted body
 (JSON text: `room`, `mentions`, `reply_to`, `event`, `grant`), covered by the sender's digest
-(`PAE("islandmail/body-meta/v1", meta)` after the attachments).
+(`PAE("islandmail/body-meta/v1", meta)` after the attachments). The body salt names the node that writes the envelope (`imb1`, 4 random bytes R, then
+the first 8 bytes of SHA-256 of `PAE("islandmail/salt-bind/v1", R, node key)`): it is signed through the digest, so
+a node that opens a message and seals it again as its own, with parents and an envelope id of its choosing, is
+refused by every reader. Builds before it read such a salt like any other, and mail with an unbound salt (from them)
+is read as before.
 
 **CLI.** `islandmail-node run CONFIG`, `keygen SEED_FILE`, `pubkey SEED_FILE`, `network-id`,
 `agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]`, `revoke CONFIG NAME`, `invite-info INVITE`.

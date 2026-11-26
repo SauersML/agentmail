@@ -805,13 +805,21 @@ def norm_text(s):
     return _BIDI.sub("", _CTRL.sub("", s))
 
 
+def bound_salt(node_key):
+    # Names the node that writes the envelope (envelope.rs bound_salt): the salt is signed through the digest, so
+    # another node that opens the message cannot seal it again as its own (its parents, its envelope id).
+    r = os.urandom(4)
+    node = base64.urlsafe_b64decode(node_key.split(":", 1)[1] + "=")
+    return b"imb1" + r + hashlib.sha256(pae(b"islandmail/salt-bind/v1", r, node)).digest()[:8]
+
+
 def signed_block(ident, to, thread, text, files, mode, meta="", keys=None):
     # meta: the room fields as exact JSON text (signed through the digest); keys: the recipients a room post's plan
     # gave (else asked for by to and mode).
     seed = bytes.fromhex(ident["seed"])
     now = datetime.datetime.now(datetime.timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
-    salt = os.urandom(16)
+    salt = bound_salt(node_info()["node"])
     digest = hashlib.sha256(pae(b"islandmail/body-digest/v1", salt, text.encode()))
     for f in files:
         digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))

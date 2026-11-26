@@ -787,7 +787,8 @@ impl Node {
                         return Ok(Posted { row, reaches, repeated: true });
                     }
                 }
-                let salt = islandmail_core::random_bytes::<16>();
+                // Bound to this node: no other node can seal the signed message again as its own.
+                let salt = islandmail_core::envelope::bound_salt(&self.seed.public());
                 let t = now_millis();
                 let ts = ts_from_millis(t);
                 let digest = islandmail_core::envelope::post_digest_meta(&salt, &text, &files, &meta_raw)?;

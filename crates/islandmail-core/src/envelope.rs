@@ -104,6 +104,38 @@ pub fn post_digest_meta(salt: &[u8], text: &str, files: &[serde_json::Value], me
     Ok(format!("{:x}", h.finalize()))
 }
 
+/// The first bytes of a bound salt (`bound_salt`).
+pub const BOUND_SALT_TAG: [u8; 4] = *b"imb1";
+
+/// A body salt that names the node that will write the envelope: `imb1`, 4 random bytes R, then the first 8 bytes of
+/// SHA-256(PAE("islandmail/salt-bind/v1", R, node key)). The salt is under the sender's signature (through the
+/// digest), so a node that opens the message and seals it again as its own (a replay, with parents and an envelope id
+/// of its choosing) is refused by every reader: the writing node is part of what the sender signed. Older builds
+/// read a bound salt as any other salt.
+pub fn bound_salt(node: &PublicKey) -> [u8; 16] {
+    let r = crate::random_bytes::<4>();
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&BOUND_SALT_TAG);
+    out[4..8].copy_from_slice(&r);
+    out[8..].copy_from_slice(&salt_binding(&r, node));
+    out
+}
+
+fn salt_binding(r: &[u8], node: &PublicKey) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(crate::paseto::pae(&[b"islandmail/salt-bind/v1", r, node.as_slice()]));
+    h[..8].try_into().expect("8 bytes")
+}
+
+/// Err when `salt` is a bound salt (`bound_salt`) for another node than `node`. Any other salt passes (mail from
+/// clients and nodes before salts were bound).
+pub fn check_salt_binding(salt: &[u8], node: &PublicKey) -> Result<()> {
+    if salt.len() == 16 && salt[..4] == BOUND_SALT_TAG && salt[8..] != salt_binding(&salt[4..8], node) {
+        bail!("the sender bound this message to another writing node (a replay by another node)");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct WrappedKey {
     /// Opaque slot label (16 bytes, b64url): only the recipient can recompute it (`crypto`).
@@ -442,6 +474,7 @@ impl Envelope {
         if &post_digest_meta(&salt, &body.text, &body.files, &body.meta)? != digest {
             bail!("body does not match the sender's signed digest");
         }
+        check_salt_binding(&salt, &parse_key(&self.node)?)?;
         Ok(())
     }
 }
@@ -587,6 +620,50 @@ mod tests {
         let mut body = o.body.clone();
         body.text = "tampered".into();
         assert!(good.check_body(&o.header, &body).unwrap_err().to_string().contains("digest"));
+    }
+
+    #[test]
+    fn a_bound_salt_stops_another_node_sealing_the_message_again() {
+        let w = world();
+        let other = Seed::generate();
+        let mut members = w.members.clone();
+        members.nodes.push(crate::members::NodeEntry { name: "other".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec![] });
+        let agents = pinned(&members);
+        let keys = members.all_keys();
+        // alice's message, its salt bound to the node that writes it.
+        let make = |salt: [u8; 16]| {
+            let ts = crate::now_ts();
+            let digest = post_digest(&salt, "bound", &[]).unwrap();
+            let st = PostStatement { from: "a.alice", sub: "agent:a.alice@test", to: "all", thread: "t", mode: Mode::Members,
+                                     ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&members);
+            let attest = Attest { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
+            let body = Body { text: "bound".into(), files: vec![], salt: b64u(&salt), meta: String::new() };
+            (Envelope::seal(Draft { thread: "t", parents: vec![], ts, from: "a.alice", to: "all", mode: Mode::Members,
+                                    body: &body, blobs: vec![], attest, recipients: &keys }, &w.node).unwrap(), body)
+        };
+        // `other` opens it and seals the same signed header and body as its own, with parents of its choosing.
+        let replay = |e: &Envelope| {
+            let o = e.open(&other).unwrap().unwrap();
+            let h = o.header;
+            Envelope::seal(Draft { thread: &h.thread, parents: vec!["ab".repeat(32)], ts: e.ts.clone(), from: &h.from,
+                                   to: &h.to, mode: h.mode, body: &o.body, blobs: vec![], attest: h.attest.clone(),
+                                   recipients: &keys }, &other).unwrap()
+        };
+        let verify = |e: &Envelope| e.verify(&members, &agents, crate::now_millis(), [&w.bob]).map(|_| ());
+        let (good, _) = make(bound_salt(&w.node.public()));
+        verify(&good).unwrap();
+        let r = replay(&good);
+        assert_ne!(r.id, good.id);
+        assert!(verify(&r).unwrap_err().to_string().contains("another writing node"));
+        // A salt bound to another node than the writer's is refused at the writer too.
+        let (wrong, _) = make(bound_salt(&other.public()));
+        assert!(verify(&wrong).is_err());
+        // An unbound (random) salt, as older clients and nodes write: still read, as before.
+        let mut legacy = crate::random_bytes::<16>();
+        legacy[0] = b'x';
+        let (old, _) = make(legacy);
+        verify(&old).unwrap();
+        verify(&replay(&old)).unwrap();
     }
 
     #[test]
