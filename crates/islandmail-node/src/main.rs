@@ -133,6 +133,7 @@ async fn run(path: &Path) -> Result<()> {
                 .unwrap_or_else(|_| "islandmail_node=info,iroh=warn,iroh_gossip=warn".into()),
         )
         .init();
+    let open_files = raise_open_files();
     let cfg = config::Config::load(path)?;
     let listen: std::net::SocketAddr = match cfg.api_listen.strip_prefix("localhost:") {
         Some(port) => ([127, 0, 0, 1], port.parse::<u16>().context("invalid api_listen port")?).into(),
@@ -203,10 +204,42 @@ async fn run(path: &Path) -> Result<()> {
         sockets: Arc::new(Default::default()),
     };
     tracing::info!("HTTP API on http://{} ({} envelopes stored)", cfg.api_listen, node.store.count()?);
-    axum::serve(listener, api::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    let cap = api::max_connections(open_files);
+    let hosts = api::allowed_hosts(listen, cfg.public_url.as_deref());
+    tracing::info!("API: at most {cap} connections at once ({open_files} open files allowed); Host {}", hosts.join(", "));
+    api::serve(listener, api::guarded(api::router(state), hosts), cap, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await;
     net.shutdown().await
+}
+
+/// Raises this process's open-file limit toward its hard limit (at most 65536, and 10240 where the system caps
+/// it, as macOS does), since services can start with as few as 256. Returns the limit in force.
+#[cfg(unix)]
+fn raise_open_files() -> u64 {
+    unsafe {
+        let mut r: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) != 0 {
+            return 256;
+        }
+        let want = if r.rlim_max == libc::RLIM_INFINITY { 65536 } else { (r.rlim_max as u64).min(65536) as libc::rlim_t };
+        for target in [want, want.min(10240)] {
+            if r.rlim_cur >= target {
+                break;
+            }
+            let n = libc::rlimit { rlim_cur: target, rlim_max: r.rlim_max };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &n) == 0 {
+                r.rlim_cur = target;
+                break;
+            }
+        }
+        r.rlim_cur as u64
+    }
+}
+
+/// Windows has no small per-process descriptor limit for sockets.
+#[cfg(not(unix))]
+fn raise_open_files() -> u64 {
+    8192
 }

@@ -496,14 +496,17 @@ The threat model, plainly. "Trusted node" means a node listed in this host's tru
   static `/ui` page and the signed owner steps needs an agent's own single-use token. With `"certify": "open"` (the
   default) any of them can claim an unused name in this host's names. The client checks the node's signed proof
   before it sends a token, seed or mail, and again before every long-lived stream token and after any lost
-  connection; that proof is trust on first use unless `ISLANDMAIL_NODE_KEY` is set. The API does not limit idle
-  connections: a local process that holds a few hundred open makes the node run out of file descriptors (it stops
-  answering, and cannot re-read its trust file) until they close. Treat the API as available only against local
-  users you trust.
+  connection; that proof is trust on first use unless `ISLANDMAIL_NODE_KEY` is set. The node raises its open-file
+  limit at start where allowed, serves at most that limit less 128 API connections at once (at most 1024; more wait
+  in the listen backlog, holding no descriptor), and closes a connection that has not sent a request's headers within
+  10 seconds (slowloris). A local process can still keep the API busy for others; treat the API as available only
+  against local users you trust.
 - **Web pages** in the owner's browser cannot use the API: it takes tokens and view keys in the Authorization
-  header (never cookies), the unauthenticated POSTs need a loopback Host and a JSON body, and `/ui` renders message
-  text, names and file names as text, under a CSP with no outside sources. A DNS-rebinding page can still read
-  `GET /api/node` (node key, network ID, this host's names).
+  header (never cookies), the unauthenticated POSTs need a JSON body, and `/ui` renders message text, names and
+  file names as text, under a CSP with no outside sources. Every request, GETs included, must name the node in Host:
+  `127.0.0.1`, `localhost` or `[::1]` with the API port (or config `public_url`'s host and port), so a DNS-rebinding
+  page, which sends its own name, reads nothing. Through an ssh tunnel, forward the same port
+  (`ssh -L 8787:127.0.0.1:8787 HOST`), or set `public_url` to the tunnel's `http://127.0.0.1:PORT`.
 - **Files** are saved under the sender's base name in the current directory and never overwrite an existing file;
   a name such as `conftest.py` or `.envrc` is still the sender's choice, so use `-o PATH` where that matters.
 - **Keys at rest.** The node seed, identity files and data directory must be owner-only (mode bits on Unix, an
@@ -674,4 +677,5 @@ python tests/invite.py --bin target/debug/islandmail-node --islandmail clients/i
 python tests/hub_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/late_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/privacy.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
+python tests/api_guard.py --bin target/debug/islandmail-node
 ```

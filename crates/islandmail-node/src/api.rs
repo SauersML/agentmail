@@ -88,6 +88,134 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The Host header values this node answers to: the loopback names with the API's port (and the listen address as
+/// written), plus config "public_url"'s host and port when set (a tunnel or proxy on another port). A page whose
+/// own name a DNS rebinding pointed at 127.0.0.1 sends that name, so it reads nothing, GETs included.
+pub fn allowed_hosts(listen: std::net::SocketAddr, public_url: Option<&str>) -> Vec<String> {
+    let port = listen.port();
+    let mut out: Vec<String> = ["127.0.0.1", "localhost", "[::1]"].iter().map(|h| format!("{h}:{port}")).collect();
+    out.push(listen.to_string());
+    if port == 80 {
+        out.extend(["127.0.0.1", "localhost", "[::1]"].map(String::from));
+    }
+    if let Some(u) = public_url.and_then(|u| url::Url::parse(u).ok()) {
+        if let Some(h) = u.host_str() {
+            let h = h.to_ascii_lowercase();
+            match u.port() {
+                Some(p) => out.push(format!("{h}:{p}")),
+                None => {
+                    out.push(h.clone());
+                    if let Some(p) = u.port_or_known_default() { out.push(format!("{h}:{p}")); }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a request's Host is one of `allowed` (exactly, ignoring case). A request without one is refused.
+pub fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("").trim().to_ascii_lowercase();
+    !host.is_empty() && allowed.contains(&host)
+}
+
+/// The router behind the Host check (see `allowed_hosts`).
+pub fn guarded(app: Router, allowed: Vec<String>) -> Router {
+    let allowed = Arc::new(allowed);
+    app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
+        let allowed = allowed.clone();
+        async move {
+            if host_allowed(req.headers(), &allowed) {
+                next.run(req).await
+            } else {
+                ApiError::new(403, format!("this node answers requests for Host {} only (config public_url adds one)",
+                                           allowed.join(", "))).into_response()
+            }
+        }
+    }))
+}
+
+/// Time a client has to send each request's headers (and an idle keep-alive connection its next request): a
+/// slowloris connection that trickles bytes is closed after this.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many API connections may be open at once, given the open-file limit: room for the store, the trust file,
+/// QUIC sockets and key files besides them, so idle connections cannot starve those.
+pub fn max_connections(open_files: u64) -> usize {
+    open_files.saturating_sub(128).clamp(16, 1024) as usize
+}
+
+/// An accepted connection, holding one of `serve`'s slots until it closes (an upgraded WebSocket included).
+struct Slot {
+    tcp: tokio::net::TcpStream,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio::io::AsyncRead for Slot {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>)
+        -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for Slot {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8])
+        -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.tcp).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, bufs: &[std::io::IoSlice<'_>])
+        -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.tcp).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.tcp.is_write_vectored()
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
+    }
+}
+
+/// Serves the API: at most `cap` connections at once (a slot is taken before accept, so more wait in the listen
+/// backlog and hold no file descriptor here), each request's headers within HEADER_READ_TIMEOUT. Streams, uploads
+/// and WebSockets run as long as they need. Returns when `shutdown` resolves.
+pub async fn serve(listener: tokio::net::TcpListener, app: Router, cap: usize, shutdown: impl std::future::Future<Output = ()>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(cap));
+    tokio::pin!(shutdown);
+    loop {
+        let permit = tokio::select! {
+            p = slots.clone().acquire_owned() => p.expect("the semaphore is never closed"),
+            _ = &mut shutdown => return,
+        };
+        let tcp = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((tcp, _)) => tcp,
+                Err(e) => {
+                    // EMFILE and the like: back off instead of spinning.
+                    tracing::warn!("API accept failed: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = &mut shutdown => return,
+        };
+        let _ = tcp.set_nodelay(true);
+        let io = hyper_util::rt::TokioIo::new(Slot { tcp, _permit: permit });
+        let svc = hyper_util::service::TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let mut b = hyper::server::conn::http1::Builder::new();
+            b.timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
+            if let Err(e) = b.serve_connection(io, svc).with_upgrades().await {
+                tracing::debug!("API connection: {e}");
+            }
+        });
+    }
+}
+
 pub fn bearer(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let t = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")).unwrap_or(v);
@@ -608,4 +736,43 @@ async fn stream(
     r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream; charset=utf-8"));
     r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, no-transform"));
     Ok(r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(h: &str) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        m.insert(header::HOST, HeaderValue::from_str(h).unwrap());
+        m
+    }
+
+    #[test]
+    fn only_loopback_hosts_with_the_api_port_pass() {
+        let allowed = allowed_hosts("127.0.0.1:8787".parse().unwrap(), None);
+        for ok in ["127.0.0.1:8787", "localhost:8787", "LOCALHOST:8787", "[::1]:8787"] {
+            assert!(host_allowed(&host(ok), &allowed), "{ok}");
+        }
+        // DNS rebinding sends the page's own name; another port is another service (or a page on it).
+        for bad in ["rebind.example:8787", "rebind.example", "127.0.0.1", "localhost", "127.0.0.1:8788",
+                    "localhost.:8787", "127.0.0.1:8787.evil", "evil.localhost:8787", ""] {
+            assert!(!host_allowed(&host(bad), &allowed), "{bad}");
+        }
+        assert!(!host_allowed(&HeaderMap::new(), &allowed), "no Host at all");
+        // Another loopback address as listened on, and config public_url (a tunnel on another port, or a proxy).
+        let allowed = allowed_hosts("127.0.0.2:9000".parse().unwrap(), Some("http://127.0.0.1:18787/"));
+        assert!(host_allowed(&host("127.0.0.2:9000"), &allowed) && host_allowed(&host("127.0.0.1:18787"), &allowed));
+        assert!(!host_allowed(&host("127.0.0.1:8787"), &allowed));
+        let allowed = allowed_hosts("[::1]:8787".parse().unwrap(), Some("https://mail.example.org"));
+        assert!(host_allowed(&host("mail.example.org"), &allowed) && host_allowed(&host("mail.example.org:443"), &allowed));
+        assert!(!host_allowed(&host("other.example.org"), &allowed));
+    }
+
+    #[test]
+    fn connection_cap_leaves_room_for_other_files() {
+        assert_eq!(max_connections(256), 128);
+        assert_eq!(max_connections(100), 16);
+        assert_eq!(max_connections(65536), 1024);
+    }
 }

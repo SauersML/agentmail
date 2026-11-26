@@ -82,6 +82,7 @@ jobs:
           "$py" tests/hub_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/hub-rooms"
           "$py" tests/late_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/late-rooms"
           "$py" tests/privacy.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/privacy"
+          "$py" tests/api_guard.py --bin "$node_bin" --workdir "$RUNNER_TEMP/api-guard"
       - name: Package
         run: |
           mkdir -p out
