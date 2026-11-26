@@ -625,10 +625,19 @@ fn allow(key: &str, max: usize) -> bool {
 
 pub const MAX_JOIN_REQUEST: usize = 1024;
 
+/// Whether `req` is a well-signed reply naming the nonce of an unspent, unexpired invite of this node.
+fn names_open_invite(node: &Node, req: &[u8]) -> bool {
+    let Some(r) = std::str::from_utf8(req).ok().and_then(|r| read_reply(r).ok()) else { return false };
+    node.store.conn().query_row("SELECT 1 FROM join_invites WHERE nonce = ? AND spent_by IS NULL AND exp > ?",
+                                rusqlite::params![b64u(&r.nonce), now_millis()], |_| Ok(())).is_ok()
+}
+
 /// One request on JOIN_ALPN from `peer` (any key): the answer, as JSON bytes. Rate-limited per key and overall.
 pub fn handshake(node: &Node, peer: &[u8; 32], req: &[u8]) -> Vec<u8> {
     let peer = fmt_key(peer);
-    let out = if !allow("join:all", 30) || !allow(&peer, 5) {
+    // Keys cost nothing, so the overall limit is the one that binds; a reply carrying the nonce of an invite still open
+    // here is not counted against it, or anyone could keep every invited node out with 30 bogus attempts a minute.
+    let out = if !allow(&peer, 5) || (!names_open_invite(node, req) && !allow("join:all", 30)) {
         json!({ "error": "too many join attempts; try again in a minute" })
     } else {
         match std::str::from_utf8(req).map_err(|_| ApiError::new(400, "not text")).and_then(|r| admit(node, r, Some(&peer))) {
@@ -828,6 +837,15 @@ mod tests {
         let d = fresh();
         let flood: Vec<Value> = (0..8).map(|_| answer(&a, &d, "imr1junk")).collect();
         assert!(flood.iter().any(|v| v["error"].as_str().unwrap().contains("too many")));
+        // Bogus attempts from many keys fill the overall limit, but a reply to an open invite still gets through
+        // (found by the fuzz/ protocol tests: 30 junk attempts a minute kept every invited node out).
+        for _ in 0..8 {
+            let d = fresh();
+            for _ in 0..5 { answer(&a, &d, "imr1junk"); }
+        }
+        let (inv3, g) = (make(&a, "gail", ""), fresh());
+        assert!(answer(&a, &fresh(), "imr1junk")["error"].as_str().unwrap().contains("too many"));
+        assert_eq!(answer(&a, &g, &reply_of(&g, &inv3, "gail"))["ok"], true);
     }
 
     #[test]
