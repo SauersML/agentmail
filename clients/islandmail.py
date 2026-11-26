@@ -964,6 +964,7 @@ def room_add(ident, room, names, grants=True):
 # ---- joining: invite (signed by our node), join (their node trusts ours, answers with a reply), accept ----
 
 INVITE_PREFIX, REPLY_PREFIX = "islandmail-invite1.", "islandmail-reply1."
+INVITE_TTL = 7 * 86400
 
 
 def default_config():
@@ -1329,16 +1330,19 @@ def network_names(ident):
     return [x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])]
 
 
-def join_link(ident, name, room):
-    # Hook for outsiders: an invite string that lets NAME join this network (the client's `invite` command, when this
-    # client has one). None when it cannot make one; the caller then says how to invite by hand.
-    mint = globals().get("make_invite")
-    if mint is None:
-        return None
+def join_link(ident, name, room, config=None):
+    # A ready invite for NAME into ROOM, signed with this host's node key, when the caller can read that key (the node
+    # operator); else None. owner_step points MAIL at the configured node, so it is put back afterwards.
+    global MAIL
+    mail = MAIL
     try:
-        return mint(ident, name)
-    except Fail:
+        out = owner_step("invite", config, "%s|%s|%s|%d" % (name, room, ident["name"], INVITE_TTL),
+                         {"name": name, "room": room, "from": ident["name"], "ttl_s": INVITE_TTL})
+        return out["invite"], out["exp"]
+    except (Fail, OSError, KeyError):
         return None
+    finally:
+        MAIL = mail
 
 
 def cmd_room_new(a):
@@ -1358,12 +1362,14 @@ def cmd_room_new(a):
     room_post(ident, room, text, event=event, quiet=True)
     print("created %s%s" % (room, " with " + ", ".join("@" + w for w in members) if members else ""))
     for w in outside:
-        link = join_link(ident, w, room)
-        if link:
-            print("  @%s is not on this network yet; send them this join link:\n    %s" % (_one_line(w), link))
+        inv = join_link(ident, w, room, a.config)
+        if inv:
+            print("  @%s is not on this network yet; send them this invite (valid until %s):\n    %s\n"
+                  "  they run: islandmail.py join INVITE; you then run: islandmail.py accept REPLY, and they are in %s"
+                  % (_one_line(w), inv[1], inv[0], room))
         else:
-            print("  @%s is not on this network yet: invite them (islandmail.py invite), then /add %s in the chat"
-                  % (_one_line(w), _one_line(w)))
+            print("  @%s is not on this network yet; the node operator invites them with:\n"
+                  "    islandmail.py invite --name %s --room %s" % (_one_line(w), _one_line(w), room))
     print("  chat: islandmail.py chat %s" % room)
 
 
@@ -1901,7 +1907,7 @@ def main():
     p = sub.add_parser("invite", help="an invite for one agent name (and optionally a room), valid 7 days")
     p.add_argument("--name", required=True, help="the one exact name this node will trust theirs for")
     p.add_argument("--room", help="a room of yours they are added to on accept")
-    p.add_argument("--ttl", type=int, default=7 * 86400, help="seconds it stays valid (default 7 days)")
+    p.add_argument("--ttl", type=int, default=INVITE_TTL, help="seconds it stays valid (default 7 days)")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_invite)
     p = sub.add_parser("accept", help="trust the node that answered your invite, for the invited name only")
@@ -1954,9 +1960,10 @@ def main():
     rsub = room.add_subparsers(dest="room_cmd", required=True)
     p = rsub.add_parser("new", help="a group chat: private room YOU/NAME with @members, in one line")
     p.add_argument("name")
-    p.add_argument("members", nargs="*", help="@name ... (names not on this network get a join link)")
+    p.add_argument("members", nargs="*", help="@name ... (names not on this network get an invite)")
     p.add_argument("--topic")
     p.add_argument("--open", action="store_true", help="an open room anyone on the network can join")
+    p.add_argument("--config", help="this node's config, to sign invites (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_room_new)
     p = rsub.add_parser("create", help="a room named YOU/NAME (open unless --private)")
     p.add_argument("name")

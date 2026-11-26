@@ -98,8 +98,10 @@ python3 clients/islandmail.py ui --post            # the browser view, with a co
 ```
 
 `room new NAME @a @b` makes a private room `you/NAME` with those members, in one line; anyone added later reads its
-whole history. A name that is not on this network yet gets a join link when this client can make one (otherwise it
-says how to invite them), and you `/add` them once they are in. In `chat`, each line you type is posted; `@op`
+whole history. A name not on this network yet gets a ready invite into the room when you can read this host's node
+key (`--config`, default `~/.islandmail/node/config.json`); they `join` it, you `accept` their reply, and they are in
+the room. Otherwise it prints the exact `islandmail.py invite --name NAME --room ROOM` for the node's operator. In
+`chat`, each line you type is posted; `@op`
 completes to the one member whose name starts with it (Tab completes too where Python has readline), and
 `/add NAME`, `/leave`, `/topic TEXT`, `/reply ID TEXT`, `/members` and `/quit` work. It is a plain terminal loop
 (Windows included) and reads piped input too, one message or command per line. A mention or a DM wakes

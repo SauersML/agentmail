@@ -235,7 +235,11 @@ def main():
         check("reply to plain thread mail goes back to its sender in its thread", rc == 0 and got, out[-160:])
 
         issue12_checks(cl, js, req, api, token, bg, orig)
-        group_chat_checks(cl, js, req, api, chat, chat_bg)
+        owner_cfg = os.path.join(work, "mac-owner.json")
+        with open(owner_cfg, "w") as f:
+            json.dump({"api_listen": "127.0.0.1:%d" % api["mac"], "node_key_file": k("mac"),
+                       "members_file": os.path.join(work, "trust.json")}, f)
+        group_chat_checks(cl, js, req, api, chat, chat_bg, owner_cfg)
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-mac"), USER="agent",
                    ISLANDMAIL_URL="https://mail.example.invalid", ISLANDMAIL_AS="hypha")
         p = subprocess.run([sys.executable, im, "ui", "--post"], env=env, capture_output=True, text=True, timeout=60)
@@ -287,13 +291,25 @@ def b32(env):
     return base64.b32encode(bytes.fromhex(env)).decode().lower().rstrip("=")
 
 
-def group_chat_checks(cl, js, req, api, chat, chat_bg):
+def group_chat_checks(cl, js, req, api, chat, chat_bg, owner_cfg):
     """Rooms as a group chat: room new in one line, chat in a terminal (piped here), and posting from /ui."""
     rc, out = cl("hypha", "room", "new", "crew", "@ops.orchestrator", "lab.carol", "@nobody.here", "--topic", "ship it")
     check("room new NAME @a @b makes the room with its members", rc == 0
           and "created hypha/crew with @ops.orchestrator, @lab.carol" in out, out[-240:])
-    check("and says how to bring in a name not on the network", "@nobody.here is not on this network yet" in out
+    check("without the node key, it prints the exact invite command for a name not on the network",
+          "@nobody.here is not on this network yet" in out and "islandmail.py invite --name nobody.here --room hypha/crew" in out
           and "chat: islandmail.py chat hypha/crew" in out, out[-240:])
+    rc, out = cl("hypha", "room", "new", "crew2", "@ops.orchestrator", "@ghost.x", "--config", owner_cfg)
+    inv = next((w for w in out.split() if w.startswith("islandmail-invite1.")), "")
+    try:
+        body = json.loads(base64.urlsafe_b64decode(inv.split(".")[1] + "=" * (-len(inv.split(".")[1]) % 4)))
+    except (ValueError, IndexError):
+        body = {}
+    check("as the node operator, room new prints a ready invite into the new room", rc == 0
+          and body.get("name") == "ghost.x" and body.get("room") == "hypha/crew2" and body.get("from") == "hypha"
+          and "islandmail.py accept REPLY" in out, json.dumps(body)[:200] + out[-200:])
+    check("and still makes the room with the members it knows", (js("hypha", "room", "info", "hypha/crew2") or {})
+          .get("members") == ["hypha", "ops.orchestrator"])
     info = js("hypha", "room", "info", "hypha/crew") or {}
     check("a group chat: private, full history, every member", info.get("kind") == "private" and info.get("history") == "full"
           and info.get("members") == ["hypha", "lab.carol", "ops.orchestrator"] and info.get("topic") == "ship it", json.dumps(info)[:200])
