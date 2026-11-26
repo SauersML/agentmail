@@ -1279,6 +1279,10 @@ def cmd_join(a):
              % (n["name"], n["key"], ", ".join(n["names"]) or "none", out["seq"])]
     if out["added_name"]:
         notes.append("this node may now certify %s" % ", ".join(out["names"]))
+    if out["relay"].get("suggested"):
+        urls = " ".join(out["relay"]["suggested"])
+        notes.append("relay: the inviter suggests relays %s; this host keeps its own. To use them for every node here: "
+                     "islandmail.py relay add %s --config %s" % (urls, urls, config))
     if "n0" in out["relay"]["invite"] and "n0" not in out["relay"]["node"]:
         notes.append("relay: the inviter also uses iroh's public relays; if this host cannot reach it directly, add "
                      "\"relay\": [\"n0\"] to %s and restart the node" % config)
@@ -1316,6 +1320,12 @@ def cmd_join(a):
                 time.sleep(1)
     join_notify(a, ident)
     print("next: %sislandmail.py send --to %s \"hello\"" % (url, who))
+
+
+def cmd_relay(a):
+    # Add relays to this network's relays in the trust file (every node of this host uses them; invites carry them).
+    out = owner_step("relay", a.config, " ".join(a.urls), {"add": a.urls})
+    print("this network's relays here: %s; trust file seq %d" % (", ".join(out["relays"]), out["seq"]))
 
 
 def cmd_accept(a):
@@ -2575,6 +2585,11 @@ def main():
     p.add_argument("--config", help="the node's config (default ~/.islandmail/node/config.json)")
     p.add_argument("--bin", help="fresh host: the islandmail-node binary (default: on PATH)")
     p.set_defaults(fn=cmd_nodekey)
+    p = sub.add_parser("relay", help="relay add URL..: add relays to this network's relays in the trust file")
+    p.add_argument("op", choices=["add"])
+    p.add_argument("urls", nargs="+", metavar="URL")
+    p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
+    p.set_defaults(fn=cmd_relay)
     p = sub.add_parser("accept", help="trust the node that answered your invite, for the invited name only")
     p.add_argument("reply")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")

@@ -382,7 +382,9 @@ cert_dir = "/var/lib/iroh-relay"
 
 Run `iroh-relay --config-path relay.toml` (TCP 80 and 443 and UDP 7842 open), then add
 `"relays": ["https://relay.example.org"]` to the trust file and bump `seq`. Invites made after that carry it, and
-`join` writes it into the joiner's trust file.
+`join` writes it into the joiner's trust file on a fresh host. A host that already has a node keeps its own relays (an
+invite never reroutes an existing node): `join` prints the inviter's other relays, and the host owner adds them with
+`islandmail.py relay add URL... [--config CONFIG]`.
 ## How it stays secure
 
 - **Who can talk.** A node accepts an agent only if its host's trust file pins that name and key, or a node in that

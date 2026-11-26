@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/invites", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::invite)))
         .route("/api/joins", axum::routing::post(join))
         .route("/api/invites/joined", get(joined).post(joined_seen))
+        .route("/api/relays", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::add_relays)))
         .route("/api/accepts", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::accept)))
         .route("/api/messages", get(list).post(post))
         .route("/api/messages/{id}", get(one))

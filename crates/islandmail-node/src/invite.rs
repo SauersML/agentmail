@@ -512,8 +512,13 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
     };
     let inv = plan.inv;
     let mut added_name = false;
+    let mut suggested: Vec<String> = Vec::new();
     let names = split_names(&inv.name).map_err(|e| ApiError::new(400, e))?;
     let list = edit_trust(node, |list, me| {
+        // A fresh host (this node alone on its trust file) takes the inviter's relays: it has no others and may need
+        // them to reach the inviter. An existing host keeps its own: an inviter must not route all of its traffic
+        // through relays of the inviter's choosing. Those it lacks are suggested (`islandmail.py relay add`).
+        let fresh = list.nodes.iter().all(|n| n.key == me);
         for n in &names {
             if let Some(h) = holder(list, n, Some(me)) {
                 return Err(ApiError::new(409, format!("{n} is held here by {h}")));
@@ -533,9 +538,10 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
             Some(n) => *n = inv.node.clone(),
             None => list.nodes.push(inv.node.clone()),
         }
-        // The inviter's relays become this network's relays here too; n0 stays a per-node choice (config "relay").
+        // n0 stays a per-node choice (config "relay").
         for r in inv.relay.iter().filter(|r| *r != "n0") {
-            if !list.relays.contains(r) { list.relays.push(r.clone()); }
+            if list.relays.contains(r) { continue; }
+            if fresh { list.relays.push(r.clone()); } else { suggested.push(r.clone()); }
         }
         Ok(())
     })?;
@@ -544,7 +550,7 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
         "network": list.network, "seq": list.seq,
         "inviter": { "name": inv.node.name, "key": inv.node.key, "names": inv.node.names }, "from": inv.from,
         "name": inv.name, "names": names, "added_name": added_name, "room": inv.room,
-        "relay": { "invite": inv.relay, "node": crate::net::relay_entries(&list, &node.opts.relay) },
+        "relay": { "invite": inv.relay, "node": crate::net::relay_entries(&list, &node.opts.relay), "suggested": suggested },
     }))
 }
 
@@ -610,6 +616,24 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     tracing::info!("node {} joined with an invite for {name}", r.node.key);
     Ok(json!({ "ok": true, "name": name, "room": (!room.is_empty()).then_some(room), "from": (!from.is_empty()).then_some(from),
                "node": { "name": name.split(',').next().unwrap_or(""), "key": r.node.key }, "seq": list.seq }))
+}
+
+/// POST /api/relays {add: [URL, ..], ts, sig} (arg: the URLs joined by spaces): add relays to this network's relays
+/// in the trust file, as the host owner decides (join only suggests an inviter's relays to an existing host).
+pub fn add_relays(node: &Node, body: &Value) -> Result<Value, ApiError> {
+    let add: Vec<String> = body.get("add").and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    operator(node, body, "relay", &add.join(" "))?;
+    if add.is_empty() || !add.iter().all(|r| islandmail_core::members::valid_relay_url(r)) {
+        return Err(ApiError::new(400, "add must list relay origins such as https://relay.example.org"));
+    }
+    let list = edit_trust(node, |list, _| {
+        for r in &add {
+            if !list.relays.contains(r) { list.relays.push(r.clone()); }
+        }
+        Ok(())
+    })?;
+    Ok(json!({ "relays": list.relays, "seq": list.seq }))
 }
 
 /// POST /api/accepts {reply, ts, sig}: the inviting node could not be reached at join; the owner hands in the reply.
@@ -867,6 +891,41 @@ mod tests {
         let (inv3, g) = (make(&a, "gail", ""), fresh());
         assert!(answer(&a, &fresh(), "imr1junk")["error"].as_str().unwrap().contains("too many"));
         assert_eq!(answer(&a, &g, &reply_of(&g, &inv3, "gail"))["ok"], true);
+    }
+
+    #[test]
+    fn only_a_fresh_host_takes_the_inviters_relays() {
+        let a = node_on([6u8; 32], &["alice"]);
+        let url = "https://relay.example.org".to_string();
+        a.members.write().unwrap().relays = vec![url.clone()];
+        let make = |name: &str| invite(&a, &signed(&a, "invite", &format!("{name}|||604800|"), json!({ "name": name, "ttl_s": 604800, "key": "" })))
+            .unwrap()["invite"].as_str().unwrap().to_string();
+        let join = |j: &Node, inv: &str| {
+            let plan = join_prepare(j, &signed(j, "join", inv, json!({ "invite": inv }))).map_err(|e| e.message).unwrap();
+            join_finish(j, plan, Outcome::Unreachable("test".into())).map_err(|e| e.message).unwrap()
+        };
+        // A fresh host: this node alone on its trust file.
+        let fresh = node_on([6u8; 32], &[]);
+        let out = join(&fresh, &make("bob"));
+        assert_eq!(fresh.members.read().unwrap().relays, vec![url.clone()]);
+        assert!(out["relay"]["suggested"].as_array().unwrap().is_empty(), "{out}");
+        // An existing host (it trusts another node already) keeps its relays; the inviter's are only suggested.
+        let old = node_on([6u8; 32], &["carol"]);
+        let other = islandmail_core::keys::Seed::generate();
+        edit_trust(&old, |list, _| {
+            list.nodes.push(NodeEntry { name: "x".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec!["x".into()] });
+            Ok(())
+        }).unwrap();
+        let out = join(&old, &make("dave"));
+        assert!(old.members.read().unwrap().relays.is_empty());
+        assert_eq!(out["relay"]["suggested"], json!([url]), "{out}");
+        // The owner adopts them on purpose.
+        let arg = url.clone();
+        let out = add_relays(&old, &signed(&old, "relay", &arg, json!({ "add": [url] }))).map_err(|e| e.message).unwrap();
+        assert_eq!(out["relays"], json!([url]));
+        assert_eq!(old.members.read().unwrap().relays, vec![url.clone()]);
+        // Not signed by this node's key: refused.
+        assert_eq!(add_relays(&old, &signed(&fresh, "relay", &arg, json!({ "add": [url] }))).unwrap_err().status, 401);
     }
 
     #[test]
