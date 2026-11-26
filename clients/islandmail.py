@@ -275,8 +275,18 @@ def write_private(path, data, *, create=False, create_dirs=True):
         else:
             os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        # On Windows the temporary name cannot be removed while another process has the new file open (a second
+        # first command reading the key just linked): it is one file under two names. Retry for a few seconds.
+        for i in range(100):
+            try:
+                os.unlink(tmp)
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                if os.name != "nt" or i == 99:
+                    raise
+                time.sleep(0.05)
 
 
 HOME_NAME = r"[A-Za-z0-9._-]{1,48}@[a-z0-9.-]{1,64}"

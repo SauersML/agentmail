@@ -105,7 +105,8 @@ def main():
             results = [call.result() for call in calls]
         check("concurrent first commands share a key under a 47-character prefix",
               all(rc == 0 and long_prefix + "a" in out for rc, out in results)
-              and os.listdir(os.path.join(directory, "identities")) == [long_prefix + "a.json"])
+              and os.listdir(os.path.join(directory, "identities")) == [long_prefix + "a.json"],
+              "%r %r" % (results, os.listdir(os.path.join(directory, "identities"))))
 
         # The first command on a fresh host: key, certificate, delivery. No pins anywhere.
         t0 = time.time()
