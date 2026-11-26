@@ -955,7 +955,8 @@ impl Node {
     /// An envelope from a trusted node: opened and verified, or None to keep it sealed.
     fn open_trusted(&self, env: &Envelope, members: &MemberList) -> Result<Option<(Opened, islandmail_core::Verified)>> {
         // Open with a slot for one of this node's keys, or a key grant that arrived before the envelope. Mail this node
-        // cannot open (or that opens but does not verify) is kept and forwarded sealed: no sender, thread or text here.
+        // cannot open is kept and forwarded sealed: no sender, thread or text here. Mail that opens but does not
+        // verify (yet: its sender's certificate may still be on its way) is refused, so a later sync offers it again.
         let opened = match env.open_for(self.opening_keys(env.ts_ms()).iter()) {
             Ok(Some(o)) => Some(o),
             Ok(None) => self.checked_grants(env)?.into_iter().next(),
@@ -965,13 +966,10 @@ impl Node {
             }
         };
         Ok(match opened {
-            Some(o) => match self.verify_read(env, &o, members) {
-                Ok(v) => Some((o, v)),
-                Err(e) => {
-                    tracing::warn!("message {} opens here but does not verify; kept sealed: {e:#}", &env.id[..12]);
-                    None
-                }
-            },
+            Some(o) => {
+                let v = self.verify_read(env, &o, members)?;
+                Some((o, v))
+            }
             None => None,
         })
     }
@@ -1722,10 +1720,9 @@ mod tests {
         let (rows, _) = node.store.query(&crate::store::Query::default(), &who, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
         // The same signature in another base64 spelling is refused outright.
-        // The same signature in another base64 spelling is kept sealed: never shown.
+        // The same signature in another base64 spelling is refused outright.
         let padded = seal(vec![], format!("{sig}=="));
-        let row = node.ingest(padded).unwrap().unwrap();
-        assert!(row.text.is_none() && row.mode == "sealed" && row.sender.is_empty());
+        assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
     }
 
     #[test]
@@ -2119,8 +2116,7 @@ mod tests {
         assert!(pod.take_revocation(&revoked[0]).unwrap());
         assert!(pod.ingest(env_before).unwrap().is_some(), "mail dated before the revocation is still accepted");
         let late = envelope_from(&mac, &dana, "dana", "after", Some(cert));
-        let row = pod.ingest(late).unwrap().unwrap();
-        assert!(row.text.is_none() && row.mode == "sealed", "mail dated after it is kept sealed, never shown");
+        assert!(pod.ingest(late).is_err(), "mail dated after it is refused");
         assert_eq!(status(mac.certify(&proof(&dana, "dana", &mac))), 403, "a revoked key stays revoked");
         let fresh = Seed::generate();
         assert_eq!(mac.certify(&proof(&fresh, "dana", &mac)).unwrap().0, 201, "the name takes a new key");
