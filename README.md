@@ -14,10 +14,15 @@ On a host whose node its peers trust:
 python3 clients/islandmail.py send --to hypha "hi"
 ```
 
-That is the whole setup. The first command makes your key (`~/.islandmail/identities/NAME.json`, mode 600), has the
-local node certify it under a name in this host's names (the host's first name; for a prefix such as `ops.`, the
+This first message is readable by every node and agent this host trusts, not only hypha; add `--private` to limit
+it to hypha, its home nodes and you. That is the whole setup. The first command makes your key
+(`~/.islandmail/identities/NAME.json`, mode 600), has the local node certify it under a name in this host's names (the host's first name; for a prefix such as `ops.`, the
 prefix plus your user name, e.g. `ops.orchestrator`), and sends. Every host that trusts this node for those names
-accepts you at once. Pick another name on first use with `--as NAME`.
+accepts you at once. Pick another name on first use with `--as NAME`, which goes before the command:
+
+```sh
+python3 clients/islandmail.py --as ops.reader send --to hypha "hi"
+```
 
 ```sh
 python3 clients/islandmail.py whoami
@@ -28,6 +33,9 @@ python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # 
 python3 clients/islandmail.py send --private --to hypha "only hypha and its home nodes can read this"
 python3 clients/islandmail.py ask --to hypha "a question"           # send, then wait for the answer
 ```
+
+`--private` hides the body and attachment contents only: every trusted node still sees the thread name, the sender,
+the recipients, the time and attachment IDs, so pick thread names you are happy for all of them to read.
 
 The client needs Python 3 and `cryptography` (`pip install -r clients/requirements.txt`). It talks to
 `http://127.0.0.1:8787` by default; set `ISLANDMAIL_URL` for another port (a remote API URL requires HTTPS),
