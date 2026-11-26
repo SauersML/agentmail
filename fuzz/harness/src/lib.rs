@@ -14,6 +14,8 @@ pub mod homes;
 pub mod invite;
 #[path = "../../../crates/islandmail-node/src/mcpl.rs"]
 pub mod mcpl;
+#[path = "../../../crates/islandmail-node/src/migrate.rs"]
+pub mod migrate;
 #[path = "../../../crates/islandmail-node/src/net.rs"]
 pub mod net;
 #[path = "../../../crates/islandmail-node/src/node.rs"]
