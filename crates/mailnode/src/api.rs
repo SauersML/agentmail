@@ -126,12 +126,18 @@ pub fn query_from(p: &HashMap<String, String>) -> Result<Query, ApiError> {
     })
 }
 
+pub(crate) fn node_encryption_key(node: &Node) -> Option<mailcore::node_key::NodeEncryptionKey> {
+    let epoch = mailcore::now_millis().div_euclid(mailcore::node_key::ROTATION_MS);
+    node.encryption_key.read().unwrap().as_ref().filter(|k| k.epoch == epoch).cloned()
+}
+
 /// Public facts a client needs before it can sign in: the node key (an agent token's aud) and which tokens it takes.
 async fn node_info(State(s): State<AppState>) -> Response {
     let members = s.node.members.read().unwrap();
     json_resp(
         json!({ "node": mailcore::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": mailcore::b64u(&members.topic()),
                 "envelope_version": mailcore::envelope::VERSION,
+                "encryption_key": node_encryption_key(&s.node),
                 "members_seq": members.seq, "auth": ["agent-token"],
                 "names": members.node_by_key(&s.node.seed.public()).map(|n| n.names.clone()).unwrap_or_default(),
                 "agent_token": { "format": "PASETO v4.public", "implicit_assertion": "agentmail-auth-v1",

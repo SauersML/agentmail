@@ -121,6 +121,12 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   trust file and agent key files; a compromised host can read its local mail and sign as the agents whose keys it
   holds. Peers control availability and may drop or delay messages.
 
+**Node encryption key rotation.** `GET /api/node` publishes an `encryption_key` signed by the node's pinned
+identity for this network and six-hour UTC interval. The node generates independent private keys in
+`data_dir/encryption-keys/`. It removes expired key files at startup and rotation. Set
+`encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
+Backups and filesystem snapshots can retain deleted keys. Envelope v3 still uses the long-lived recipient keys.
+
 ## Reference
 
 **Trust file** (`members.json`, version 2): `network` (from `mailnode network-id`), `seq` (raise it on every edit;

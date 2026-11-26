@@ -427,6 +427,9 @@ pub async fn start(cfg: &Config, node: Arc<Node>, outbound: mpsc::Receiver<Envel
 }
 
 async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
+    let keys = crate::encryption_keys::EncryptionKeys::new(&cfg.data_dir, cfg.encryption_key_retention_days)?;
+    let network = node.members.read().unwrap().network.clone();
+    *node.encryption_key.write().unwrap() = Some(keys.rotate(&node.seed, &network, mailcore::now_millis())?);
     let gate = MemberGate { node: node.clone(), open: Default::default() };
     let lookup = MemoryLookup::new();
     let mode = relay_mode(&cfg.relay)?;
@@ -526,6 +529,20 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let gate = ctx.gate.clone();
     tokio::spawn(watch_trust_file(cfg.clone(), node.clone(), move || { gate.close_removed(); }));
 
+    let rotating = node.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let now = mailcore::now_millis();
+            let epoch = now.div_euclid(mailcore::node_key::ROTATION_MS);
+            if rotating.encryption_key.read().unwrap().as_ref().is_some_and(|k| k.epoch == epoch) { continue; }
+            match keys.rotate(&rotating.seed, &network, now) {
+                Ok(record) => *rotating.encryption_key.write().unwrap() = Some(record),
+                Err(e) => tracing::error!("rotating node encryption key: {e:#}"),
+            }
+        }
+    });
+
     // Every sync_secs: anti-entropy with every member node, and re-join the topic so a restarted or new peer is
     // found again.
     let c = ctx.clone();
@@ -602,11 +619,12 @@ mod tests {
             }).collect(),
         };
         std::fs::write(&file, serde_json::to_vec(&list)?)?;
-        let cfg = serde_json::from_value(serde_json::json!({
+        let mut cfg: Config = serde_json::from_value(serde_json::json!({
             "data_dir": dir, "members_file": file, "node_key_file": "unused", "relay": [url], "sync_secs": 1
         }))?;
         let mut hosts = Vec::new();
         for (i, key) in keys.into_iter().enumerate() {
+            cfg.data_dir = dir.join(format!("node-{i}"));
             let (tx, rx) = mpsc::channel(4);
             let opts = Opts { identities: vec![(format!("a{i}"), agents[i].clone())], ..Opts::default() };
             let node = Arc::new(Node::new(Store::open(&dir.join(format!("{i}.sqlite")))?, list.clone(), key, opts, tx));

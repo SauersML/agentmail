@@ -90,6 +90,7 @@ pub struct Node {
     pub trust: watch::Sender<u64>,
     /// Certificates and revocations to gossip (JSON, tagged {"cert": …} or {"revocation": …}).
     pub trust_out: broadcast::Sender<String>,
+    pub encryption_key: RwLock<Option<mailcore::node_key::NodeEncryptionKey>>,
     pub seed: Seed,
     pub opts: Opts,
     pub events: broadcast::Sender<i64>,
@@ -111,6 +112,7 @@ impl Node {
         let (trust_out, _) = broadcast::channel(256);
         let node = Node {
             store,
+            encryption_key: RwLock::new(None),
             roster: RwLock::new(Vec::new()),
             issuance: Mutex::new(()),
             trust: watch::channel(0).0,

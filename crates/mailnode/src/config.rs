@@ -20,6 +20,8 @@ pub struct Config {
     /// Relay origins shared by peers, or "n0" for iroh's public relay set. Empty means direct only.
     #[serde(default)]
     pub relay: Vec<String>,
+    #[serde(default = "default_key_retention")]
+    pub encryption_key_retention_days: u32,
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
     pub members_file: PathBuf,
@@ -37,6 +39,7 @@ pub struct Config {
 fn default_api() -> String {
     "127.0.0.1:8787".into()
 }
+fn default_key_retention() -> u32 { 14 }
 fn default_sync() -> u64 {
     30
 }
