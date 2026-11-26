@@ -4,592 +4,332 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>Islandmail Rooms</title>
+<title>Islandmail</title>
 <style>
 :root {
-  --bg: #ffffff; --side: #f7f7f9; --text: #1f2328; --muted: #6b7080; --faint: #9a9eab;
-  --border: #e7e7ec; --border-strong: #d3d4dc; --hover: #efeff3; --hover-soft: #f8f8fa;
-  --sel: #e9ebfb; --accent: #4f5bd5; --accent-weak: #eceefc; --on-accent: #ffffff;
-  --mention-bg: rgba(79, 91, 213, .055); --flash: rgba(79, 91, 213, .16);
-  --nl: 38%; --av-l: 52%; --input: #ffffff;
-  --sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #ffffff; --side: #f6f6f7; --text: #1d1f23; --muted: #6a6e78; --line: #e6e6ea; --sel: #e8e9ee;
+  --accent: #3f5bd8; --on-accent: #ffffff; --mark: #fff3c4; --input: #ffffff;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #16171a; --side: #1b1c20; --text: #e5e6ea; --muted: #9a9daa; --faint: #6f7280;
-    --border: #2a2c32; --border-strong: #3a3d45; --hover: #24262c; --hover-soft: #1c1d21;
-    --sel: #272b44; --accent: #8c94ff; --accent-weak: #262a45; --on-accent: #12131a;
-    --mention-bg: rgba(140, 148, 255, .07); --flash: rgba(140, 148, 255, .2);
-    --nl: 72%; --av-l: 42%; --input: #141518;
+    --bg: #17181b; --side: #1d1e22; --text: #e4e5e9; --muted: #9a9da6; --line: #2c2e33; --sel: #2b2d33;
+    --accent: #8ea0ff; --on-accent: #111318; --mark: #4a4020; --input: #121316;
     color-scheme: dark;
   }
 }
 * { box-sizing: border-box; }
 html, body { height: 100%; margin: 0; }
-body { background: var(--bg); color: var(--text); font: 15px/1.5 var(--sans); overflow: hidden;
-  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+body { background: var(--bg); color: var(--text); font: 15px/1.5 var(--sans); overflow: hidden; }
 button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
-.num { font-variant-numeric: tabular-nums; }
-.app { display: grid; grid-template-columns: 280px minmax(0, 1fr); height: 100vh; height: 100dvh; }
-
-/* sidebar */
-.side { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--side); border-right: 1px solid var(--border); }
-.side-head { padding: 14px 14px 10px; }
-.brand { font-weight: 650; font-size: 14px; letter-spacing: -.01em; margin: 0 2px 10px; display: flex; align-items: center; gap: 8px; }
-.dot { width: 7px; height: 7px; border-radius: 50%; background: #3fb07a; }
-.dot.off { background: #d9822b; }
-.filter { width: 100%; font: inherit; font-size: 14px; color: var(--text); background: var(--input); border: 1px solid var(--border);
-  border-radius: 8px; padding: 6px 10px; outline: none; }
-.filter:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
-.rooms { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 2px 8px 8px; }
-.room { display: block; width: 100%; text-align: left; padding: 8px 10px; border-radius: 8px; margin: 1px 0; }
-.room:hover { background: var(--hover); }
-.room.sel { background: var(--sel); }
-.room .r1, .room .r2 { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.room .glyph { color: var(--faint); width: 14px; flex: none; display: inline-flex; justify-content: center; font-weight: 600; }
-.room .label { flex: 1; min-width: 0; font-weight: 550; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.room.unread .label { font-weight: 700; }
-.room .when { color: var(--faint); font-size: 12px; flex: none; }
-.room .snip { flex: 1; min-width: 0; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 22px; }
-.room.unread .snip { color: var(--text); }
-.badge { flex: none; min-width: 20px; height: 18px; padding: 0 6px; border-radius: 9px; font-size: 11.5px; font-weight: 650;
-  display: inline-flex; align-items: center; justify-content: center; background: var(--accent-weak); color: var(--accent); }
-.badge.strong { background: var(--accent); color: var(--on-accent); }
-.side-foot { border-top: 1px solid var(--border); padding: 10px 14px; display: flex; align-items: center; gap: 10px; font-size: 13.5px; }
-.side-foot .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.side-foot .sub { color: var(--faint); font-weight: 400; }
-.empty-side { color: var(--muted); font-size: 13.5px; padding: 18px 10px; }
-
-/* main */
-.main { display: grid; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: auto auto minmax(0, 1fr) auto; grid-template-areas: "head" "members" "msgs" "compose"; }
-.head { grid-area: head; display: flex; align-items: flex-start; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--border); min-width: 0; }
-.back { display: none; width: 30px; height: 30px; border-radius: 8px; align-items: center; justify-content: center; font-size: 18px; color: var(--muted); flex: none; }
-.back:hover { background: var(--hover); }
-.head .titles { flex: 1; min-width: 0; }
-.head .t1 { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.head h1 { font-size: 16px; font-weight: 650; margin: 0; letter-spacing: -.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.head .glyph { color: var(--faint); font-weight: 600; display: inline-flex; }
-.kind { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted);
-  border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; flex: none; }
-.topic { color: var(--muted); font-size: 13.5px; margin-top: 1px; overflow-wrap: anywhere; }
-.ro { font-size: 11.5px; color: var(--faint); border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; flex: none; margin-top: 3px; }
-.mtoggle { font-size: 12.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 6px; padding: 1px 8px; flex: none; margin-top: 2px; }
-.mtoggle:hover { background: var(--hover); }
-.members { grid-area: members; display: none; border-bottom: 1px solid var(--border); padding: 10px 20px; overflow-y: auto; max-height: 40vh; font-size: 13.5px; }
-.members.open { display: block; }
-.members h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); font-weight: 650; margin: 6px 0 6px; }
-.members ul { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 14px; }
-.members li { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.members li.gone { color: var(--faint); }
-.members .tag { font-size: 11px; color: var(--faint); }
-.members .hist { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
-.mini { width: 8px; height: 8px; border-radius: 50%; background: hsl(var(--h) 50% var(--av-l)); flex: none; }
-li.gone .mini { background: var(--border-strong); }
-@media (min-width: 1100px) {
-  .main { grid-template-columns: minmax(0, 1fr) 240px; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "head head" "msgs members" "compose members"; }
-  .members, .members.open { display: block; max-height: none; border-bottom: 0; border-left: 1px solid var(--border); padding: 14px 18px; }
-  .members ul { display: block; }
-  .members li { padding: 3px 0; }
-  .mtoggle { display: none; }
-}
-.scroll { grid-area: msgs; overflow-y: auto; overflow-x: hidden; min-height: 0; position: relative; }
-.list { padding: 4px 0 18px; }
+input, textarea { font: inherit; color: var(--text); background: var(--input); }
 [hidden] { display: none !important; }
-/* composer */
-.compose { grid-area: compose; padding: 8px 20px 16px; }
-.compose .box { border: 1px solid var(--border-strong); border-radius: 12px; background: var(--input); display: flex; align-items: flex-end; gap: 8px; padding: 6px 6px 6px 12px; }
-.compose .box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
-.compose textarea { flex: 1; min-width: 0; border: 0; outline: none; resize: none; background: transparent; color: var(--text);
-  font: inherit; line-height: 1.45; max-height: 160px; padding: 5px 0; }
-.compose .send { flex: none; background: var(--accent); color: var(--on-accent); border-radius: 8px; padding: 5px 12px; font-size: 13.5px; font-weight: 600; }
-.compose .send:disabled { opacity: .45; cursor: default; }
-.compose .hint { font-size: 11.5px; color: var(--faint); margin: 5px 4px 0; display: flex; gap: 10px; flex-wrap: wrap; }
-.compose .err { color: #c0473a; }
-.replying { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--muted); margin: 0 4px 6px; min-width: 0; }
-.replying .q { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.replying button { color: var(--faint); font-size: 14px; padding: 0 4px; }
-.sugg { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 4px 6px; }
-.sugg button { font-size: 12.5px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 9px; background: var(--side); }
-.sugg button.on { border-color: var(--accent); color: var(--accent); }
-.msg .act { visibility: hidden; font-size: 12px; color: var(--faint); margin-left: 8px; border-radius: 6px; padding: 0 6px; }
-.msg:hover .act, .msg:focus-within .act { visibility: visible; }
-.msg .act:hover { background: var(--hover); color: var(--text); }
-.newroom { flex: none; font-size: 12.5px; font-weight: 600; color: var(--accent); border: 1px solid var(--border); border-radius: 7px; padding: 2px 9px; margin-left: auto; background: var(--input); }
-.newroom:hover { background: var(--accent-weak); }
-.room .udot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); flex: none; }
-/* dialog */
-.modal { position: fixed; inset: 0; background: rgba(10, 12, 20, .38); display: grid; place-items: center; padding: 16px; z-index: 20; }
-.modal form { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 20px 22px; box-shadow: 0 12px 40px rgba(0, 0, 0, .18); }
-.modal h2 { margin: 0 0 14px; font-size: 16px; letter-spacing: -.01em; }
-.modal label { display: block; font-size: 12.5px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
-.modal input { width: 100%; font: inherit; font-size: 14px; color: var(--text); background: var(--input); border: 1px solid var(--border-strong); border-radius: 8px; padding: 7px 10px; outline: none; }
-.modal input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
-.modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-.modal .row button { border-radius: 8px; padding: 6px 14px; font-size: 13.5px; font-weight: 600; }
-.modal .ok { background: var(--accent); color: var(--on-accent); }
-.modal .cancel { color: var(--muted); }
-.modal .msgline { font-size: 13px; color: var(--muted); margin-top: 10px; min-height: 1em; }
-.more { display: block; margin: 14px auto 4px; font-size: 13px; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 4px 12px; }
-.more:hover { background: var(--hover); color: var(--text); }
-.placeholder { grid-column: 1 / -1; grid-row: 1 / -1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
+.app { display: grid; grid-template-columns: 300px minmax(0, 1fr); height: 100vh; height: 100dvh; }
 
-/* messages */
-.day { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 12px; font-weight: 600; margin: 18px 20px 4px; }
-.day::before, .day::after { content: ""; flex: 1; height: 1px; background: var(--border); }
-.msg { display: grid; grid-template-columns: 34px minmax(0, 1fr); column-gap: 12px; padding: 1px 20px 1px 17px; border-left: 3px solid transparent; }
-.msg.first { margin-top: 10px; padding-top: 3px; }
-.msg:hover { background: var(--hover-soft); }
-.msg.mention { border-left-color: var(--accent); background: var(--mention-bg); }
-.msg.flash, .event.flash { animation: flash 1.8s ease-out; }
-@keyframes flash { 0%, 30% { background: var(--flash); } 100% { background: transparent; } }
-.av { width: 34px; height: 34px; border-radius: 8px; display: grid; place-items: center; font-weight: 650; font-size: 14px;
-  color: #fff; background: hsl(var(--h) 45% var(--av-l)); margin-top: 2px; user-select: none; }
-.gt { color: transparent; font-size: 10.5px; text-align: right; padding-top: 4px; user-select: none; }
-.msg:hover .gt { color: var(--faint); }
-.body { min-width: 0; }
-.meta { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
-.name { font-weight: 650; color: hsl(var(--h) 55% var(--nl)); overflow-wrap: anywhere; }
-.time { color: var(--faint); font-size: 12px; cursor: default; }
+.side { display: flex; flex-direction: column; min-height: 0; background: var(--side); border-right: 1px solid var(--line); }
+.side-top { display: flex; gap: 8px; padding: 12px; }
+.find { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; font-size: 14px; outline: none; }
+.find:focus, .to:focus, .rname:focus { border-color: var(--accent); }
+.btn { background: var(--accent); color: var(--on-accent); border-radius: 8px; padding: 6px 12px; font-size: 14px; font-weight: 600; }
+.btn:disabled { opacity: .5; cursor: default; }
+.list { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
+.conv { display: flex; align-items: center; gap: 8px; width: 100%; text-align: left; padding: 8px 10px; border-radius: 8px; }
+.conv:hover { background: var(--sel); }
+.conv.sel { background: var(--sel); }
+.conv .c { flex: 1; min-width: 0; }
+.conv .n, .conv .s { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv .n { font-weight: 500; }
+.conv .s { color: var(--muted); font-size: 13px; }
+.conv.unread .n { font-weight: 700; }
+.conv .w { color: var(--muted); font-size: 12px; align-self: flex-start; margin-top: 2px; }
+.count { min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--accent); color: var(--on-accent);
+  font-size: 12px; font-weight: 700; text-align: center; line-height: 20px; }
+.me { padding: 10px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+.empty { color: var(--muted); padding: 24px 16px; text-align: center; }
+
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.head { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--line); min-height: 52px; }
+.back { display: none; font-size: 20px; color: var(--muted); padding: 0 6px; }
+.title { flex: 1; min-width: 0; }
+.title b { display: block; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.title span { display: block; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.link { color: var(--muted); font-size: 13px; text-decoration: underline; text-underline-offset: 2px; }
+.details { padding: 10px 20px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.details div { margin: 2px 0; }
+.scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; padding: 8px 0 16px; }
+.earlier { display: block; margin: 8px auto; color: var(--muted); font-size: 13px; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; }
+
+.msg { padding: 1px 20px; }
+.msg.first { margin-top: 10px; }
+.day { text-align: center; color: var(--muted); font-size: 12px; font-weight: 600; margin: 18px 0 6px; }
+.who { font-weight: 650; margin-right: 8px; }
+.at { color: var(--muted); font-size: 12px; }
 .text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.text a { color: var(--accent); text-decoration: none; border-bottom: 1px solid var(--accent-weak); }
-.text a:hover { border-bottom-color: var(--accent); }
-.at { color: var(--accent); background: var(--accent-weak); border-radius: 4px; padding: 0 2px; font-weight: 550; }
-.at.me { background: var(--accent); color: var(--on-accent); }
-.event { text-align: center; color: var(--muted); font-size: 13px; padding: 6px 20px; overflow-wrap: anywhere; }
-.event .name { font-weight: 600; }
-.msg.reply .body { padding-left: 14px; border-left: 2px solid var(--border); }
-.re { font-size: 12px; color: var(--muted); margin: 1px 0 2px; }
-.quote { border-left: 2px solid var(--border-strong); padding: 1px 10px; margin: 3px 0 5px; color: var(--muted); font-size: 13.5px; cursor: pointer; border-radius: 0 6px 6px 0; }
-.quote:hover { background: var(--hover); }
-.quote .qf { font-weight: 600; font-size: 12.5px; }
-.quote .qt { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; }
-.files { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 2px; }
-.file { display: flex; flex-direction: column; gap: 6px; max-width: 100%; }
-.chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; border: 1px solid var(--border); border-radius: 8px;
-  padding: 5px 10px; font-size: 13px; color: var(--text); text-decoration: none; background: var(--bg); }
-a.chip:hover { background: var(--hover); border-color: var(--border-strong); }
-.chip .fn { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-family: var(--mono); font-size: 12.5px; }
-.chip .sz { color: var(--muted); flex: none; }
-.thumb { display: block; max-width: min(360px, 100%); max-height: 360px; border-radius: 8px; border: 1px solid var(--border); background: var(--hover); }
-.thumb.loading { width: 200px; height: 120px; }
+.text a { color: var(--accent); }
+.text .mine { background: var(--mark); border-radius: 3px; }
+.msg.event { color: var(--muted); font-size: 13px; text-align: center; }
+.msg.reply { padding-left: 34px; }
+.quote { border-left: 2px solid var(--line); padding-left: 8px; margin: 2px 0; color: var(--muted); font-size: 13px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.rep { visibility: hidden; color: var(--muted); font-size: 12px; margin-left: 8px; }
+.msg:hover .rep { visibility: visible; }
+.file { display: inline-block; margin: 4px 8px 0 0; color: var(--accent); font-size: 13px; }
+.thumb { display: block; max-width: min(320px, 100%); max-height: 320px; margin-top: 4px; border-radius: 6px; border: 1px solid var(--line); }
 
-/* gate */
-.gate { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); padding: 16px; z-index: 10; }
-.gate .card { max-width: 440px; border: 1px solid var(--border); border-radius: 10px; padding: 24px 26px; background: var(--side); }
-.gate h2 { margin: 0 0 8px; font-size: 16px; }
-.gate p { margin: 0; color: var(--muted); }
-.gate code { font-family: var(--mono); font-size: 13px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; display: inline-block; margin-top: 8px; overflow-wrap: anywhere; }
+.compose { padding: 8px 20px 14px; border-top: 1px solid var(--line); }
+.compose .row { display: flex; gap: 8px; align-items: flex-end; }
+.compose textarea { flex: 1; min-width: 0; resize: none; border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+  line-height: 1.4; max-height: 40vh; outline: none; }
+.compose textarea:focus { border-color: var(--accent); }
+.note { color: var(--muted); font-size: 12.5px; margin-top: 4px; min-height: 1em; }
+.note .err { color: #c2413a; }
+.replying { color: var(--muted); font-size: 13px; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.newform { padding: 16px 20px; display: grid; gap: 8px; }
+.to, .rname { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; outline: none; }
+.blank { flex: 1; display: grid; place-items: center; color: var(--muted); padding: 24px; text-align: center; }
+.gate { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); padding: 16px; }
+.gate p { color: var(--muted); max-width: 420px; }
+.gate code { display: block; margin-top: 8px; color: var(--text); overflow-wrap: anywhere; }
 
-@media (max-width: 699px) {
+@media (max-width: 700px) {
   .app { grid-template-columns: minmax(0, 1fr); }
   .main { display: none; }
-  .app.show-room .side { display: none; }
-  .app.show-room .main { display: grid; }
-  .back { display: inline-flex; }
-  .head { padding: 10px 12px; }
-  .msg { padding-right: 12px; padding-left: 9px; }
-  .day { margin-left: 12px; margin-right: 12px; }
-  .members { padding: 10px 16px; }
+  .app.open .side { display: none; }
+  .app.open .main { display: flex; }
+  .back { display: block; }
+  .head, .msg, .compose, .details, .newform { padding-left: 12px; padding-right: 12px; }
+  .msg.reply { padding-left: 26px; }
 }
 </style>
 </head>
 <body>
 <div class="app" id="app">
   <aside class="side">
-    <div class="side-head">
-      <div class="brand"><span class="dot" id="dot"></span>Rooms<button class="newroom" id="newroom" type="button" hidden>New room</button></div>
-      <input class="filter" id="filter" type="search" placeholder="Filter rooms" autocomplete="off" spellcheck="false">
+    <div class="side-top">
+      <input class="find" id="find" type="search" placeholder="Search" autocomplete="off" spellcheck="false" aria-label="Search conversations">
+      <button class="btn" id="new" type="button" hidden>New</button>
     </div>
-    <nav class="rooms" id="rooms"></nav>
-    <div class="side-foot" id="foot"></div>
+    <nav class="list" id="list"></nav>
+    <div class="me" id="me"></div>
   </aside>
   <main class="main" id="main"></main>
 </div>
+<datalist id="people"></datalist>
 <script>
 'use strict';
-const POLL_ROOMS = 5000, POLL_ROOM = 3000, PAGE = 60, GROUP_MS = 5 * 60 * 1000;
+// Everything from the network (message text, names, file names, topics) goes into the page as text nodes only.
+const PAGE = 60;
+const $ = id => document.getElementById(id);
 const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
-const S = { me: null, rooms: [], cur: null, info: null, msgs: [], byId: new Map(), more: false, token: 0, loaded: false,
-  pinned: true, busyRooms: false, busyRoom: false, membersOpen: false };
-const blobs = new Map(), blobReady = new Map();
-const appEl = document.getElementById('app'), roomsEl = document.getElementById('rooms'), mainEl = document.getElementById('main');
-const filterEl = document.getElementById('filter'), footEl = document.getElementById('foot'), dotEl = document.getElementById('dot');
-let scrollEl = null, listEl = null, moreBtn = null;
+const appEl = $('app'), listEl = $('list'), mainEl = $('main'), findEl = $('find');
+const S = { me: null, rooms: [], roomsRaw: '', rows: new Map(), cur: null, info: null, infoRaw: '', msgs: [], byEnv: new Map(),
+  nodes: new Map(), maxSeq: 0, more: false, loaded: false, token: 0, replyTo: null, readAt: '' };
+let V = null; // the open conversation's elements
 
-/* ---------- key ---------- */
+/* ---------- key and requests ---------- */
 function ssGet(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
 function ssSet(k, v) { try { if (v == null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v); } catch (e) {} }
-function hashParams() { return new URLSearchParams(location.hash.replace(/^#/, '')); }
+const hashParams = () => new URLSearchParams(location.hash.replace(/^#/, ''));
 let KEY = null;
-(function initKey() {
+(function () {
   const p = hashParams(), k = p.get('k');
   if (k) {
-    KEY = k; ssSet('amui.k', k); p.delete('k');
+    KEY = k; ssSet('amui.k', k);
     const room = p.get('room');
     history.replaceState(null, '', location.pathname + location.search + (room ? '#room=' + encodeURIComponent(room) : ''));
   } else KEY = ssGet('amui.k');
 })();
-
-function gate(title, cmdIntro) {
+function gate(title, intro) {
   if (document.querySelector('.gate')) return;
-  const g = el('div', 'gate'), c = el('div', 'card');
-  c.append(el('h2', null, title), el('p', null, cmdIntro), el('code', null, 'python3 clients/islandmail.py ui --post'));
+  const g = el('div', 'gate'), c = el('div');
+  c.append(el('h2', null, title), el('p', null, intro), el('code', null, 'python3 clients/islandmail.py ui --post'));
   g.append(c); document.body.append(g);
 }
-const noKey = () => gate('Islandmail rooms', 'Open this page with the link from:');
-const expired = () => { ssSet('amui.k', null); gate('Link expired', "This view's key expired or was revoked. Get a new link:"); };
-
-async function req(path) {
-  const r = await fetch(path, { headers: { Authorization: 'Bearer ui.' + KEY }, cache: 'no-store' });
-  if (r.status === 401) { expired(); throw new Error('unauthorized'); }
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r;
-}
-async function send(path, body) {
-  const r = await fetch(path, { method: 'POST', headers: { Authorization: 'Bearer ui.' + KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body), cache: 'no-store' });
-  if (r.status === 401) { expired(); throw new Error('unauthorized'); }
-  let j = {}; try { j = await r.json(); } catch (e) {}
+const expired = () => { ssSet('amui.k', null); gate('Link expired', 'This link expired. Get a new one with:'); };
+async function call(path, body) {
+  const opt = { headers: { Authorization: 'Bearer ui.' + KEY }, cache: 'no-store' };
+  if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const r = await fetch(path, opt);
+  if (r.status === 401) { expired(); throw new Error('link expired'); }
+  const raw = await r.text();
+  let j = {}; try { j = JSON.parse(raw); } catch (e) {}
   if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-  return j;
+  return { j, raw };
 }
-async function api(path) {
-  try { const j = await (await req(path)).json(); dotEl.classList.remove('off'); return j; }
-  catch (e) { dotEl.classList.add('off'); throw e; }
-}
+const qs = o => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
+const blobs = new Map();
 function fileUrl(id) {
   if (!/^[0-9a-f]{64}$/i.test(id)) return Promise.reject(new Error('bad id'));
   if (!blobs.has(id)) {
-    blobs.set(id, req('/ui/api/files/' + id).then(r => r.blob()).then(b => { const u = URL.createObjectURL(b); blobReady.set(id, u); return u; })
+    blobs.set(id, fetch('/ui/api/files/' + id, { headers: { Authorization: 'Bearer ui.' + KEY }, cache: 'no-store' })
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); }).then(b => URL.createObjectURL(b))
       .catch(e => { blobs.delete(id); throw e; }));
   }
   return blobs.get(id);
 }
 
 /* ---------- formatting ---------- */
-const fMD = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric' });
-const fMDY = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', month: 'short', day: 'numeric', year: 'numeric' });
-const fDay = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'short', month: 'short', day: 'numeric' });
-const fDayY = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-function rel(ts) {
-  const t = Date.parse(ts); if (!t) return '';
-  const s = (Date.now() - t) / 1000;
-  if (s < 60) return 'now';
-  if (s < 3600) return Math.floor(s / 60) + 'm';
-  if (s < 86400) return Math.floor(s / 3600) + 'h';
-  if (s < 7 * 86400) return Math.floor(s / 86400) + 'd';
-  const d = new Date(t);
-  return d.getUTCFullYear() === new Date().getUTCFullYear() ? fMD.format(d) : fMDY.format(d);
+const fTime = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+const fDate = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+const fWeek = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const fDay = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric' });
+const fFull = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+const when = ts => { const t = Date.parse(ts); return isNaN(t) ? null : new Date(t); };
+const dayKey = d => d ? d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate() : '';
+function shortWhen(ts) {
+  const d = when(ts); if (!d) return '';
+  const now = new Date();
+  if (dayKey(d) === dayKey(now)) return fTime.format(d);
+  if (now - d < 6 * 86400000) return fWeek.format(d);
+  return fDate.format(d);
 }
-const abs = ts => (ts || '').replace('T', ' ').replace(/\.\d+Z$|Z$/, '') + ' UTC';
-const hm = ts => (ts || '').slice(11, 16);
-const dayOf = ts => (ts || '').slice(0, 10);
-function dayLabel(ts) {
-  const now = Date.now(), today = new Date(now).toISOString().slice(0, 10), yest = new Date(now - 86400000).toISOString().slice(0, 10);
-  const d = dayOf(ts);
-  if (d === today) return 'Today';
-  if (d === yest) return 'Yesterday';
-  const dt = new Date(d + 'T00:00:00Z');
-  return dt.getUTCFullYear() === new Date(now).getUTCFullYear() ? fDay.format(dt) : fDayY.format(dt);
+function dayLabel(d) {
+  const now = new Date(), y = new Date(now - 86400000);
+  return dayKey(d) === dayKey(now) ? 'Today' : dayKey(d) === dayKey(y) ? 'Yesterday' : fDay.format(d);
 }
-function size(n) {
-  if (!(n >= 0)) return '';
-  if (n < 1024) return n + ' B';
-  if (n < 1048576) return (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
-  return (n / 1048576).toFixed(1) + ' MB';
-}
-function hue(name) { let h = 0; for (const c of String(name)) h = (h * 31 + c.codePointAt(0)) >>> 0; return h % 360; }
-function tint(e, name) { e.style.setProperty('--h', hue(name)); return e; }
-const nameEl = n => tint(el('span', 'name', n), n);
-function lockSvg() {
-  const ns = 'http://www.w3.org/2000/svg', s = document.createElementNS(ns, 'svg');
-  s.setAttribute('viewBox', '0 0 16 16'); s.setAttribute('width', '12'); s.setAttribute('height', '12'); s.setAttribute('aria-label', 'private');
-  const p = document.createElementNS(ns, 'path');
-  p.setAttribute('d', 'M4.5 7V5a3.5 3.5 0 0 1 7 0v2h.5A1 1 0 0 1 13 8v6a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1zm1.5 0h4V5a2 2 0 0 0-4 0z');
-  p.setAttribute('fill', 'currentColor'); s.append(p); return s;
-}
-function glyph(kind) {
-  const g = el('span', 'glyph');
-  if (kind === 'dm') g.textContent = '@'; else if (kind === 'private') g.append(lockSvg()); else g.textContent = '#';
-  return g;
-}
-const kindName = k => k === 'dm' ? 'DM' : k === 'private' ? 'private' : 'open';
-
+const oneLine = s => String(s || '').replace(/\s+/g, ' ');
 function renderText(box, text) {
   const re = /https?:\/\/[^\s<>"'`]+|@[A-Za-z0-9][\w.\-\/:@]*/g, me = S.me && S.me.name;
   let i = 0, m;
   while ((m = re.exec(text))) {
     const tok = m[0];
-    if (tok[0] === '@' && m.index > 0 && /[\w.]/.test(text[m.index - 1])) continue;
-    if (m.index > i) box.append(text.slice(i, m.index));
     if (tok[0] === '@') {
       const nm = tok.slice(1).replace(/[.\-:\/]+$/, '');
-      box.append(el('span', nm === me ? 'at me' : 'at', '@' + nm), tok.slice(1 + nm.length));
-    } else {
-      let url = tok.replace(/[.,;:!?'"\]}>]+$/, '');
-      if (url.endsWith(')') && !url.includes('(')) url = url.slice(0, -1);
-      const a = el('a', null, url); a.href = url; a.rel = 'noopener noreferrer'; a.target = '_blank';
-      box.append(a, tok.slice(url.length));
+      if (nm !== me || (m.index > 0 && /[\w.]/.test(text[m.index - 1]))) continue;
+      box.append(text.slice(i, m.index), el('span', 'mine', '@' + nm));
+      i = m.index + 1 + nm.length; re.lastIndex = i; continue;
     }
-    i = m.index + tok.length;
+    let url = tok.replace(/[.,;:!?'"\]}>]+$/, '');
+    if (url.endsWith(')') && !url.includes('(')) url = url.slice(0, -1);
+    const a = el('a', null, url); a.href = url; a.rel = 'noopener noreferrer'; a.target = '_blank';
+    box.append(text.slice(i, m.index), a);
+    i = m.index + url.length; re.lastIndex = i;
   }
   if (i < text.length) box.append(text.slice(i));
 }
 
-/* ---------- rooms ---------- */
-function renderRooms() {
-  roomsEl.replaceChildren();
-  if (!S.rooms.length) { roomsEl.append(el('div', 'empty-side', 'No rooms yet. Messages you can read appear here.')); return; }
-  const list = visibleRooms();
-  if (!list.length) { roomsEl.append(el('div', 'empty-side', 'No rooms match.')); return; }
-  for (const r of list) {
-    const b = el('button', 'room' + (r.id === S.cur ? ' sel' : '') + (r.unread > 0 ? ' unread' : ''));
-    b.type = 'button'; b.dataset.id = r.id; b.onclick = () => selectRoom(r.id);
-    const r1 = el('div', 'r1'), r2 = el('div', 'r2');
-    r1.append(glyph(r.kind), el('span', 'label', r.label || r.id));
-    if (r.unread > 0 && r.id !== S.cur) r1.append(el('span', 'udot'));
-    if (r.last) { const w = el('span', 'when num', rel(r.last.ts)); w.title = abs(r.last.ts); r1.append(w); }
-    const sn = r.last ? (r.last.kind === 'event' ? r.last.from + ' ' + (r.last.snippet || '') : r.last.from + ': ' + (r.last.snippet || '')) : (r.topic || '');
-    r2.append(el('span', 'snip', sn.replace(/\s+/g, ' ')));
-    if (r.unread_mentions > 0) r2.append(el('span', 'badge strong num', '@' + r.unread_mentions));
-    else if (r.unread > 0) r2.append(el('span', 'badge num', r.unread > 99 ? '99+' : String(r.unread)));
-    b.append(r1, r2); roomsEl.append(b);
-  }
+/* ---------- conversation list (keyed rows, updated in place) ---------- */
+const roomName = r => r.label || r.id;
+function roomSig(r) {
+  const l = r.last || {};
+  return [roomName(r), r.unread || 0, l.ts, l.from, l.snippet, l.kind, r.topic, r.id === S.cur].join('\u0001');
 }
-function visibleRooms() {
-  const q = filterEl.value.trim().toLowerCase();
-  return S.rooms.filter(r => !q || (r.label || r.id).toLowerCase().includes(q));
+function fillRow(b, r) {
+  const c = el('span', 'c'), l = r.last;
+  c.append(el('span', 'n', roomName(r)),
+           el('span', 's', l ? oneLine((l.kind === 'event' ? l.from + ' ' : l.from + ': ') + (l.snippet || '')) : oneLine(r.topic)));
+  const kids = [c, el('span', 'w', l ? shortWhen(l.ts) : '')];
+  if (r.unread > 0 && r.id !== S.cur) kids.push(el('span', 'count', r.unread > 99 ? '99+' : String(r.unread)));
+  b.className = 'conv' + (r.id === S.cur ? ' sel' : '') + (r.unread > 0 && r.id !== S.cur ? ' unread' : '');
+  b.replaceChildren(...kids);
+}
+function renderList() {
+  const q = findEl.value.trim().toLowerCase();
+  const shown = S.rooms.filter(r => !q || roomName(r).toLowerCase().includes(q) || r.id.toLowerCase().includes(q));
+  const live = new Set();
+  let at = listEl.firstChild;
+  if (at && at.classList.contains('empty')) { at.remove(); at = listEl.firstChild; }
+  for (const r of shown) {
+    live.add(r.id);
+    let row = S.rows.get(r.id);
+    if (!row) {
+      const b = el('button'); b.type = 'button'; b.onclick = () => openRoom(r.id);
+      row = { b, sig: '' }; S.rows.set(r.id, row);
+    }
+    const sig = roomSig(r);
+    if (row.sig !== sig) { fillRow(row.b, r); row.sig = sig; }
+    if (row.b !== at) listEl.insertBefore(row.b, at); else at = at.nextSibling;
+  }
+  for (const [id, row] of S.rows) if (!live.has(id)) { row.b.remove(); if (!S.rooms.some(r => r.id === id)) S.rows.delete(id); }
+  if (!shown.length) listEl.append(el('div', 'empty', S.rooms.length ? 'Nothing matches.' : 'No conversations yet.'));
 }
 async function pollRooms() {
-  if (S.busyRooms || !KEY) return; S.busyRooms = true;
   try {
-    const j = await api('/ui/api/rooms'); S.rooms = j.rooms || []; renderRooms();
-    const lr = S.rooms.find(r => r.id === S.cur);
-    if (lr && S.info && !S.info.n) renderMembers();
-  } catch (e) {} finally { S.busyRooms = false; }
+    const { j, raw } = await call('/ui/api/rooms');
+    if (raw === S.roomsRaw) return;
+    S.roomsRaw = raw; S.rooms = j.rooms || [];
+    renderList();
+  } catch (e) {}
 }
 
-/* ---------- room pane ---------- */
-function placeholder(text) {
-  mainEl.replaceChildren(el('div', 'placeholder', text)); scrollEl = listEl = moreBtn = null;
-}
-function roomMeta() { return Object.assign({}, S.rooms.find(r => r.id === S.cur) || {}, S.info || {}); }
-function renderHead() {
-  const r = roomMeta(), h = el('header', 'head');
-  const back = el('button', 'back', '←'); back.type = 'button'; back.title = 'Back to rooms'; back.onclick = closeRoom;
-  const t = el('div', 'titles'), t1 = el('div', 't1');
-  t1.append(glyph(r.kind), el('h1', null, r.label || S.cur), el('span', 'kind', kindName(r.kind)));
-  t.append(t1); if (r.topic) t.append(el('div', 'topic', r.topic));
-  const mt = el('button', 'mtoggle num', ((r.members || []).length) + ' ' + (r.participants ? 'participants' : 'members'));
-  mt.type = 'button'; mt.onclick = () => { S.membersOpen = !S.membersOpen; document.getElementById('members').classList.toggle('open', S.membersOpen); };
-  h.append(back, t, mt);
-  if (!canPost()) h.append(el('span', 'ro', 'read-only'));
+/* ---------- open conversation ---------- */
+const canPost = () => !!(S.me && S.me.post);
+const meta = () => Object.assign({}, S.rooms.find(r => r.id === S.cur) || {}, S.info || {});
+function blank(text) { V = null; mainEl.replaceChildren(el('div', 'blank', text)); }
+function header(title, sub, withDetails) {
+  const h = el('header', 'head'), back = el('button', 'back', '←'), t = el('div', 'title');
+  back.type = 'button'; back.setAttribute('aria-label', 'Back'); back.onclick = closeRoom;
+  t.append(el('b', null, title)); if (sub) t.append(el('span', null, sub));
+  h.append(back, t);
+  if (withDetails) { const d = el('button', 'link', 'details'); d.type = 'button'; d.onclick = toggleDetails; h.append(d); }
   return h;
 }
-function renderMembers() {
-  const box = document.getElementById('members'); if (!box) return;
-  const r = roomMeta(), me = S.me && S.me.name; box.replaceChildren();
-  const li = (n, gone) => {
-    const x = el('li', gone ? 'gone' : null); x.append(tint(el('span', 'mini'), n), el('span', null, n));
-    if (!gone && n === r.creator) x.append(el('span', 'tag', 'creator'));
-    if (n === me) x.append(el('span', 'tag', 'you'));
-    return x;
+function fillHead() {
+  const r = meta(), n = (r.members || []).length;
+  const sub = r.topic || (r.kind === 'dm' ? '' : n + (n === 1 ? ' person' : ' people'));
+  const h = header(roomName(r), sub, true);
+  V.head.replaceWith(h); V.head = h;
+  if (!V.details.hidden) fillDetails();
+}
+function fillDetails() {
+  const r = meta(), d = V.details, line = (k, v) => { const x = el('div'); x.append(el('b', null, k + ': '), String(v)); d.append(x); };
+  d.replaceChildren();
+  line(r.participants ? 'Participants' : 'Members', (r.members || []).join(', ') || 'none');
+  if (r.former && r.former.length) line('Left', r.former.join(', '));
+  line('Room', r.id || S.cur);
+  if (r.kind === 'private') line('New members see', r.history === 'since-join' ? 'only later messages' : 'the full history');
+  if (S.me) line('You', S.me.name + (canPost() ? '' : ' (read-only link)') + ', link expires ' + (when(S.me.expires) ? fFull.format(when(S.me.expires)) : ''));
+}
+function toggleDetails() { V.details.hidden = !V.details.hidden; if (!V.details.hidden) fillDetails(); }
+function composer(onSend, placeholder) {
+  const wrap = el('div', 'compose'), rep = el('div', 'replying'), row = el('div', 'row'), ta = el('textarea'), btn = el('button', 'btn', 'Send');
+  const note = el('div', 'note');
+  ta.rows = 1; ta.placeholder = placeholder; ta.setAttribute('aria-label', 'Message'); btn.type = 'button'; rep.hidden = true;
+  row.append(ta, btn); wrap.append(rep, row, note);
+  const c = { wrap, ta, btn, rep, note };
+  const grow = () => { ta.style.height = 'auto'; ta.style.height = ta.scrollHeight + 2 + 'px'; };
+  const go = async () => {
+    const text = ta.value.trim(); if (!text || btn.disabled) return;
+    btn.disabled = true; note.replaceChildren();
+    try { await onSend(text); ta.value = ''; grow(); }
+    catch (e) { note.replaceChildren(el('span', 'err', 'Not sent: ' + e.message)); }
+    finally { btn.disabled = false; ta.focus(); }
   };
-  box.append(el('h3', null, (r.participants ? 'Participants' : 'Members') + ' · ' + (r.members || []).length));
-  const ul = el('ul'); (r.members || []).forEach(n => ul.append(li(n, false))); box.append(ul);
-  if (r.former && r.former.length) { box.append(el('h3', null, 'Left')); const u2 = el('ul'); r.former.forEach(n => u2.append(li(n, true))); box.append(u2); }
-  if (r.kind === 'private') box.append(el('div', 'hist', r.history === 'since-join' ? 'New members see only later messages' : 'New members see full history'));
-}
-function buildPane() {
-  const head = renderHead(), mem = el('aside', 'members' + (S.membersOpen ? ' open' : '')); mem.id = 'members';
-  scrollEl = el('div', 'scroll'); listEl = el('div', 'list');
-  moreBtn = el('button', 'more', 'Load earlier messages'); moreBtn.type = 'button'; moreBtn.onclick = loadEarlier; moreBtn.hidden = true;
-  scrollEl.append(moreBtn, listEl);
-  scrollEl.addEventListener('scroll', () => { S.pinned = nearBottom(); });
-  mainEl.replaceChildren(head, mem, scrollEl); renderMembers();
-  if (canPost()) mainEl.append(buildComposer());
-}
-const canPost = () => !!(S.me && S.me.post);
-
-/* ---------- composer ---------- */
-let C = null;
-function memberNames() { const r = roomMeta(); return (r.members || []).filter(n => !S.me || n !== S.me.name); }
-function buildComposer() {
-  const wrap = el('div', 'compose'), rep = el('div', 'replying'), sugg = el('div', 'sugg'), box = el('div', 'box');
-  const ta = el('textarea'); ta.rows = 1; ta.placeholder = 'Message ' + (roomMeta().label || S.cur); ta.setAttribute('aria-label', 'Message');
-  const btn = el('button', 'send', 'Send'); btn.type = 'button';
-  const hint = el('div', 'hint'); hint.append(el('span', null, 'Enter to send · Shift+Enter for a new line · @ to mention'));
-  const err = el('span', 'err'); hint.append(err);
-  rep.hidden = true; sugg.hidden = true;
-  box.append(ta, btn); wrap.append(rep, sugg, box, hint);
-  C = { ta, btn, rep, sugg, err, replyTo: null, pick: 0, opts: [] };
-  const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(160, ta.scrollHeight) + 'px'; };
-  ta.addEventListener('input', () => { grow(); suggest(); C.err.textContent = ''; });
+  ta.addEventListener('input', grow);
   ta.addEventListener('keydown', ev => {
-    if (!C.sugg.hidden && (ev.key === 'Tab' || (ev.key === 'Enter' && !ev.shiftKey))) { ev.preventDefault(); takeSuggestion(C.opts[C.pick]); return; }
-    if (!C.sugg.hidden && (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft')) { ev.preventDefault(); C.pick = (C.pick + (ev.key === 'ArrowRight' ? 1 : C.opts.length - 1)) % C.opts.length; drawSugg(); return; }
-    if (ev.key === 'Escape') { if (!C.sugg.hidden) { C.sugg.hidden = true; } else setReply(null); return; }
-    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); submit(); }
+    if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); go(); }
+    if (ev.key === 'Escape') setReply(null);
   });
-  btn.onclick = submit;
-  return wrap;
-}
-function mentionAt() {
-  const v = C.ta.value.slice(0, C.ta.selectionStart), m = /(^|[^\w.])@([\w.-]*)$/.exec(v);
-  return m ? { start: v.length - m[2].length - 1, frag: m[2].toLowerCase() } : null;
-}
-function suggest() {
-  const at = mentionAt();
-  C.opts = at ? memberNames().filter(n => n.toLowerCase().startsWith(at.frag)).slice(0, 6) : [];
-  C.pick = 0; drawSugg();
-}
-function drawSugg() {
-  C.sugg.replaceChildren(); C.sugg.hidden = !C.opts.length;
-  C.opts.forEach((n, i) => { const b = el('button', i === C.pick ? 'on' : null, '@' + n); b.type = 'button';
-    b.onmousedown = ev => { ev.preventDefault(); takeSuggestion(n); }; C.sugg.append(b); });
-}
-function takeSuggestion(n) {
-  const at = mentionAt(); if (!at || !n) return;
-  const v = C.ta.value, end = C.ta.selectionStart, ins = '@' + n + ' ';
-  C.ta.value = v.slice(0, at.start) + ins + v.slice(end); const p = at.start + ins.length;
-  C.ta.setSelectionRange(p, p); C.opts = []; drawSugg(); C.ta.focus();
+  btn.onclick = go;
+  return c;
 }
 function setReply(m) {
-  if (!C) return; C.replyTo = m ? m.id : null; C.rep.replaceChildren(); C.rep.hidden = !m;
-  if (!m) return;
-  const x = el('button', null, '×'); x.type = 'button'; x.title = 'Cancel reply'; x.onclick = () => setReply(null);
-  C.rep.append(el('span', null, '↳ Replying to'), nameEl(m.from), el('span', 'q', (m.text || '').replace(/\s+/g, ' ')), x);
-  C.ta.focus();
+  if (!V || !V.c) return;
+  S.replyTo = m ? m.id : null; V.c.rep.hidden = !m;
+  if (m) { V.c.rep.textContent = 'Replying to ' + m.from + ': ' + oneLine(m.text); V.c.ta.focus(); }
 }
-async function submit() {
-  const text = C.ta.value.trim(); if (!text || C.btn.disabled) return;
-  C.btn.disabled = true; C.err.textContent = '';
-  try {
-    await send('/ui/api/messages', { room: S.cur, text, reply_to: C.replyTo || undefined });
-    C.ta.value = ''; C.ta.style.height = 'auto'; setReply(null); S.pinned = true;
-    await pollRoom(); toBottom(); pollRooms();
-  } catch (e) { C.err.textContent = 'Not sent: ' + e.message; }
-  finally { C.btn.disabled = false; C.ta.focus(); }
+function buildView() {
+  const scroll = el('div', 'scroll'), more = el('button', 'earlier', 'Show earlier messages'), msgs = el('div');
+  more.type = 'button'; more.hidden = true; more.onclick = loadEarlier;
+  scroll.append(more, msgs);
+  V = { head: el('header'), details: el('div', 'details'), scroll, more, msgs, c: null, pinned: true };
+  V.details.hidden = true;
+  scroll.addEventListener('scroll', () => { V.pinned = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }, { passive: true });
+  mainEl.replaceChildren(V.head, V.details, scroll);
+  fillHead();
+  if (canPost()) {
+    V.c = composer(async text => {
+      await call('/ui/api/messages', { room: S.cur, text, reply_to: S.replyTo || undefined });
+      setReply(null); V.pinned = true; await pollRoom(); pollRooms();
+    }, 'Message ' + roomName(meta()));
+    mainEl.append(V.c.wrap);
+  }
 }
 
-/* ---------- new room ---------- */
-function newRoomDialog() {
-  const m = el('div', 'modal'), f = el('form'), msg = el('div', 'msgline');
-  const field = (label, ph) => { const l = el('label', null, label), i = el('input'); i.placeholder = ph; i.autocomplete = 'off'; i.spellcheck = false; f.append(l, i); return i; };
-  f.append(el('h2', null, 'New room'));
-  const name = field('Name', 'release-plan'), who = field('Members', '@ops.bob @dev.carol'), topic = field('Topic (optional)', 'What this room is for');
-  const ok = el('button', 'ok', 'Create'), cancel = el('button', 'cancel', 'Cancel'), row = el('div', 'row');
-  ok.type = 'submit'; cancel.type = 'button'; row.append(cancel, ok); f.append(msg, row); m.append(f);
-  const close = () => m.remove();
-  cancel.onclick = close; m.onclick = ev => { if (ev.target === m) close(); };
-  f.onkeydown = ev => { if (ev.key === 'Escape') close(); };
-  f.onsubmit = async ev => {
-    ev.preventDefault(); ok.disabled = true; msg.textContent = '';
-    try {
-      const members = who.value.split(/[\s,]+/).map(x => x.replace(/^@/, '')).filter(Boolean);
-      const j = await send('/ui/api/rooms/new', { name: name.value.trim(), members, topic: topic.value.trim() });
-      await pollRooms(); selectRoom(j.room);
-      if (j.unknown && j.unknown.length) { msg.textContent = 'Not on this network yet: ' + j.unknown.join(', ') + '. Invite them with islandmail.py invite.'; ok.disabled = false; ok.textContent = 'Done'; f.onsubmit = e => { e.preventDefault(); close(); }; }
-      else close();
-    } catch (e) { msg.textContent = e.message; ok.disabled = false; }
-  };
-  document.body.append(m); name.focus();
-}
-document.getElementById('newroom').onclick = newRoomDialog;
-async function markRead() {
-  if (!S.cur || !S.maxSeq || document.hidden || S.readSeq === S.cur + ':' + S.maxSeq) return;
-  S.readSeq = S.cur + ':' + S.maxSeq;
-  try { await send('/ui/api/read', { room: S.cur, seq: S.maxSeq }); const r = S.rooms.find(x => x.id === S.cur); if (r) { r.unread = 0; r.unread_mentions = 0; renderRooms(); } } catch (e) {}
-}
-const nearBottom = () => !scrollEl || scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight < 90;
-const toBottom = () => { if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight; };
-
-function buildNodes(arr, prev) {
-  const frag = document.createDocumentFragment(), me = S.me && S.me.name;
-  for (const m of arr) {
-    const day = dayOf(m.ts);
-    if (!prev || dayOf(prev.ts) !== day) frag.append(el('div', 'day', dayLabel(m.ts)));
-    if (m.kind === 'event') {
-      const e = el('div', 'event'); e.dataset.id = m.id; e.title = abs(m.ts);
-      e.append(nameEl(m.from), ' ' + (m.text || '')); frag.append(e); prev = m; continue;
-    }
-    const grouped = prev && prev.kind !== 'event' && prev.from === m.from && dayOf(prev.ts) === day && Date.parse(m.ts) - Date.parse(prev.ts) < GROUP_MS;
-    const row = el('div', 'msg' + (grouped ? '' : ' first') + (me && (m.mentions || []).includes(me) ? ' mention' : ''));
-    row.dataset.id = m.id;
-    const body = el('div', 'body');
-    if (grouped) { const g = el('div', 'gt num', hm(m.ts)); g.title = abs(m.ts); row.append(g); }
-    else {
-      row.append(tint(el('div', 'av', (Array.from(m.from || '?')[0] || '?').toUpperCase()), m.from));
-      const meta = el('div', 'meta'), t = el('span', 'time num', rel(m.ts));
-      t.dataset.ts = m.ts; t.title = abs(m.ts); meta.append(nameEl(m.from), t); body.append(meta);
-    }
-    if (canPost()) {
-      const a = el('button', 'act', 'Reply'); a.type = 'button'; a.onclick = () => setReply(m);
-      (body.querySelector('.meta') || body).append(a);
-    }
-    if (m.reply_to) {
-      row.classList.add('reply');
-      if (!m.quote) { const x = el('div', 're', '↳ a reply to a message you cannot read'); x.title = 're ' + m.reply_to; body.append(x); }
-    }
-    if (m.quote) {
-      const q = el('div', 'quote'); q.title = 'Reply to ' + (m.quote.id || m.reply_to || '') + ' · click to jump to it';
-      q.append(el('div', 'qf', (m.quote.from || '')), el('div', 'qt', m.quote.text || ''));
-      q.onclick = () => jumpTo(m.quote.id); body.append(q);
-    }
-    if (m.text) { const tx = el('div', 'text'); renderText(tx, m.text); body.append(tx); }
-    if (m.files && m.files.length) body.append(buildFiles(m.files));
-    row.append(body); frag.append(row); prev = m;
-  }
-  return frag;
-}
-function buildFiles(files) {
-  const box = el('div', 'files');
-  for (const f of files) {
-    const wrap = el('div', 'file'), chip = el('a', 'chip');
-    chip.href = '#'; chip.append(el('span', 'fn', f.name || 'file'), el('span', 'sz num', size(f.size)));
-    chip.title = 'Download ' + (f.name || 'file');
-    chip.onclick = ev => {
-      if (chip.dataset.ready) return;
-      ev.preventDefault();
-      fileUrl(f.id).then(u => { chip.href = u; chip.download = f.name || 'file'; chip.dataset.ready = '1'; chip.click(); }).catch(() => {});
-    };
-    if (/^image\/(png|jpeg|gif|webp)$/.test(f.type || '')) {
-      const img = el('img', 'thumb'); img.alt = f.name || 'image';
-      const ready = blobReady.get(f.id);
-      const set = u => { img.src = u; img.classList.remove('loading'); };
-      img.addEventListener('load', () => { if (S.pinned) toBottom(); });
-      if (ready) set(ready); else { img.classList.add('loading'); fileUrl(f.id).then(set).catch(() => img.remove()); }
-      const a = el('a'); a.target = '_blank'; a.rel = 'noopener noreferrer'; a.href = '#'; a.append(img);
-      a.onclick = ev => { const u = blobReady.get(f.id); if (u) a.href = u; else ev.preventDefault(); };
-      wrap.append(a);
-    }
-    wrap.append(chip); box.append(wrap);
-  }
-  return box;
-}
-function jumpTo(id) {
-  const t = listEl && listEl.querySelector('[data-id="' + String(id).replace(/[^a-z0-9]/g, '') + '"]');
-  if (!t) return;
-  t.scrollIntoView({ block: 'center', behavior: 'smooth' });
-  t.classList.remove('flash'); void t.offsetWidth; t.classList.add('flash');
-}
-function rerender() {
-  listEl.replaceChildren(buildNodes(S.msgs, null));
-  moreBtn.hidden = !S.more;
-}
-function ingest(arr) {
-  const fresh = [];
-  for (const m of arr || []) {
-    S.maxSeq = Math.max(S.maxSeq || 0, m.seq || 0);
-    if (!S.byId.has(m.env)) { S.byId.set(m.env, m); fresh.push(m); }
-  }
-  return fresh;
-}
-// The node's display order (islandmail-core order.rs): signed time (clamped to 5 min after receipt: order_ts), ties by
-// hash, each reply right under its parent and that parent's earlier replies.
+/* ---------- messages: one node per message, built once, moved or rebuilt only when its neighbours change ---------- */
+// The node's display order (islandmail-core order.rs): signed time (clamped: order_ts), ties by hash, each reply
+// right under its parent and that parent's earlier replies.
 function displayOrder(arr) {
   const at = m => (m.order_ts || m.ts) + ' ' + m.env, cmp = (a, b) => (at(a) < at(b) ? -1 : at(a) > at(b) ? 1 : 0);
   const byShort = new Map(arr.map(m => [m.id, m])), kids = new Map(), roots = [];
@@ -604,107 +344,194 @@ function displayOrder(arr) {
   roots.forEach(walk); arr.filter(m => !seen.has(m.env)).sort(cmp).forEach(walk);
   return out;
 }
-const qs = o => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
-
-async function selectRoom(id) {
+function msgNode(m, newDay, first) {
+  const d = when(m.ts), row = el('div', 'msg' + (first ? ' first' : ''));
+  if (newDay) row.append(el('div', 'day', d ? dayLabel(d) : ''));
+  if (m.kind === 'event') { row.classList.add('event'); row.append(m.from + ' ' + (m.text || '')); return row; }
+  if (m.reply_to) row.classList.add('reply');
+  if (first) {
+    const top = el('div'), t = el('span', 'at', d ? fTime.format(d) : '');
+    if (d) t.title = fFull.format(d);
+    top.append(el('span', 'who', m.from), t);
+    if (canPost()) { const r = el('button', 'rep', 'reply'); r.type = 'button'; r.onclick = () => setReply(m); top.append(r); }
+    row.append(top);
+  } else if (d) row.title = fFull.format(d);
+  if (m.quote) {
+    const q = el('div', 'quote', (m.quote.from || '') + ': ' + oneLine(m.quote.text));
+    q.title = 'Reply to ' + (m.quote.id || m.reply_to || ''); q.onclick = () => jumpTo(m.quote.id); row.append(q);
+  }
+  if (m.text) { const x = el('div', 'text'); renderText(x, m.text); row.append(x); }
+  for (const f of m.files || []) row.append(fileNode(f));
+  return row;
+}
+function fileNode(f) {
+  const box = el('div'), a = el('a', 'file', '\u{1F4CE} ' + (f.name || 'file'));
+  a.href = '#';
+  a.onclick = ev => { if (a.dataset.ready) return; ev.preventDefault();
+    fileUrl(f.id).then(u => { a.href = u; a.download = f.name || 'file'; a.dataset.ready = '1'; a.click(); }).catch(() => {}); };
+  box.append(a);
+  if (/^image\/(png|jpeg|gif|webp)$/.test(f.type || '')) {
+    const img = el('img', 'thumb'); img.alt = f.name || 'image';
+    img.addEventListener('load', () => { if (V && V.pinned) toBottom(); });
+    fileUrl(f.id).then(u => { img.src = u; }).catch(() => img.remove());
+    box.append(img);
+  }
+  return box;
+}
+function jumpTo(id) {
+  const m = S.msgs.find(x => x.id === id), n = m && S.nodes.get(m.env);
+  if (n) n.node.scrollIntoView({ block: 'center' });
+}
+// Bring the list in line with S.msgs, touching only nodes that are new, moved or whose day/grouping changed. The
+// message at the top of the view stays where it is unless the view follows the bottom.
+function sync() {
+  const box = V.msgs, sc = V.scroll;
+  let anchor = null, anchorTop = 0;
+  if (!V.pinned) {
+    const top = sc.getBoundingClientRect().top;
+    for (const n of box.children) { const b = n.getBoundingClientRect(); if (b.bottom > top) { anchor = n; anchorTop = b.top; break; } }
+  }
+  let prev = null, at = box.firstChild;
+  const live = new Set();
+  for (const m of S.msgs) {
+    const d = when(m.ts), pd = prev && when(prev.ts);
+    const newDay = !prev || dayKey(d) !== dayKey(pd);
+    const first = m.kind !== 'event' && (newDay || !prev || prev.kind === 'event' || prev.from !== m.from || !!m.reply_to
+      || !!prev.reply_to || (d && pd && d - pd > 5 * 60000));
+    const sig = (newDay ? 'd' : '') + (first ? 'f' : '');
+    let n = S.nodes.get(m.env);
+    if (!n || n.sig !== sig) {
+      const node = msgNode(m, newDay, first);
+      if (n) { if (n.node === at) at = node; n.node.replaceWith(node); }
+      n = { node, sig }; S.nodes.set(m.env, n);
+    }
+    live.add(m.env);
+    if (n.node !== at) box.insertBefore(n.node, at); else at = at.nextSibling;
+    prev = m;
+  }
+  for (const [env, n] of S.nodes) if (!live.has(env)) { n.node.remove(); S.nodes.delete(env); }
+  V.more.hidden = !S.more;
+  if (V.pinned) toBottom();
+  else if (anchor && anchor.isConnected) sc.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
+}
+const toBottom = () => { if (V) V.scroll.scrollTop = V.scroll.scrollHeight; };
+function ingest(arr) {
+  let n = 0;
+  for (const m of arr || []) {
+    S.maxSeq = Math.max(S.maxSeq, m.seq || 0);
+    if (!S.byEnv.has(m.env)) { S.byEnv.set(m.env, m); n++; }
+  }
+  if (n) S.msgs = displayOrder([...S.byEnv.values()]);
+  return n;
+}
+function setInfo(room) {
+  const raw = JSON.stringify(room || null);
+  if (raw === S.infoRaw) return;
+  S.info = room || null; S.infoRaw = raw;
+  if (V) fillHead();
+}
+async function markRead() {
+  if (!S.cur || !S.maxSeq || document.hidden || S.readAt === S.cur + ':' + S.maxSeq) return;
+  S.readAt = S.cur + ':' + S.maxSeq;
+  try {
+    await call('/ui/api/read', { room: S.cur, seq: S.maxSeq });
+    const r = S.rooms.find(x => x.id === S.cur); if (r) r.unread = 0;
+    renderList();
+  } catch (e) {}
+}
+async function openRoom(id) {
   if (!id) return;
   const token = ++S.token;
-  S.cur = id; S.info = null; S.msgs = []; S.byId = new Map(); S.maxSeq = 0; S.more = false; S.loaded = false; S.pinned = true;
+  Object.assign(S, { cur: id, info: null, infoRaw: '', msgs: [], byEnv: new Map(), nodes: new Map(), maxSeq: 0, more: false,
+                     loaded: false, replyTo: null });
   history.replaceState(null, '', location.pathname + location.search + '#room=' + encodeURIComponent(id));
-  appEl.classList.add('show-room'); renderRooms(); buildPane();
-  listEl.append(el('div', 'placeholder', 'Loading…'));
+  appEl.classList.add('open'); renderList(); buildView();
+  V.msgs.append(el('div', 'blank', 'Loading…'));
   try {
-    const j = await api('/ui/api/messages?' + qs({ room: id, limit: PAGE }));
+    const { j } = await call('/ui/api/messages?' + qs({ room: id, limit: PAGE }));
     if (token !== S.token) return;
-    S.info = j.room || null; S.msgs = displayOrder(ingest(j.messages)); S.more = !!j.more; S.loaded = true;
-    buildPane(); rerender(); toBottom(); S.pinned = true; markRead();
+    V.msgs.replaceChildren(); setInfo(j.room); ingest(j.messages); S.more = !!j.more; S.loaded = true;
+    V.pinned = true; sync(); markRead();
+    if (V.c && window.matchMedia('(min-width: 701px)').matches) V.c.ta.focus();
   } catch (e) {
-    if (token === S.token && listEl) listEl.replaceChildren(el('div', 'placeholder', 'Could not load this room.'));
+    if (token === S.token && V) V.msgs.replaceChildren(el('div', 'blank', 'Could not open this conversation: ' + e.message));
   }
 }
 function closeRoom() {
-  S.token++; S.cur = null; S.info = null; S.loaded = false; appEl.classList.remove('show-room');
+  S.token++; S.cur = null; S.loaded = false; appEl.classList.remove('open');
   history.replaceState(null, '', location.pathname + location.search);
-  placeholder('Select a room to read.'); renderRooms();
+  blank(S.rooms.length ? 'Pick a conversation.' : ''); renderList();
 }
 async function loadEarlier() {
   if (!S.loaded || !S.msgs.length) return;
-  const token = S.token; moreBtn.disabled = true; moreBtn.textContent = 'Loading…';
-  try {
-    const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: PAGE, before: S.msgs[0].seq }));
-    if (token !== S.token) return;
-    const fresh = ingest(j.messages), oldH = scrollEl.scrollHeight, oldTop = scrollEl.scrollTop;
-    S.msgs = displayOrder(fresh.concat(S.msgs)); S.more = !!j.more;
-    rerender(); scrollEl.scrollTop = scrollEl.scrollHeight - oldH + oldTop;
-  } catch (e) {} finally { if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load earlier messages'; } }
-}
-async function pollRoom() {
-  if (S.busyRoom || !S.loaded || !S.cur) return; S.busyRoom = true;
   const token = S.token;
+  V.more.disabled = true;
+  try {
+    const { j } = await call('/ui/api/messages?' + qs({ room: S.cur, limit: PAGE, before: S.msgs[0].seq }));
+    if (token !== S.token) return;
+    S.more = !!j.more; ingest(j.messages); V.pinned = false; sync();
+  } catch (e) {} finally { if (V) V.more.disabled = false; }
+}
+let roomBusy = false;
+async function pollRoom() {
+  if (roomBusy || !S.loaded || !S.cur) return;
+  roomBusy = true; const token = S.token;
   try {
     for (let round = 0; round < 5; round++) {
-      const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: 100, since: S.maxSeq || 0 }));
+      const { j } = await call('/ui/api/messages?' + qs({ room: S.cur, limit: 100, since: S.maxSeq }));
       if (token !== S.token) return;
-      if (j.room) {
-        const before = JSON.stringify(S.info); S.info = j.room;
-        if (before !== JSON.stringify(j.room)) { mainEl.replaceChild(renderHead(), mainEl.querySelector('.head')); renderMembers(); }
-      }
-      const fresh = ingest(j.messages);
-      if (fresh.length) {
-        const pin = nearBottom(), top = scrollEl.scrollTop;
-        S.msgs = displayOrder(S.msgs.concat(fresh));
-        rerender();
-        if (pin) toBottom(); else scrollEl.scrollTop = top;
-        markRead();
-      }
+      setInfo(j.room);
+      if (ingest(j.messages)) { sync(); markRead(); }
       if (!j.more) break;
     }
-  } catch (e) {} finally { S.busyRoom = false; }
+  } catch (e) {} finally { roomBusy = false; }
 }
-function refreshTimes() {
-  if (!listEl) return;
-  for (const t of listEl.querySelectorAll('.time[data-ts]')) t.textContent = rel(t.dataset.ts);
+
+/* ---------- new conversation ---------- */
+function dmId(a, b) { a = a.trim().toLowerCase(); b = b.trim().toLowerCase(); return 'dm:' + (a <= b ? a + '+' + b : b + '+' + a); }
+function newConversation() {
+  S.token++; S.cur = null; S.loaded = false; appEl.classList.add('open'); renderList();
+  const form = el('div', 'newform'), to = el('input', 'to'), name = el('input', 'rname');
+  to.placeholder = 'To: a name, or several for a group'; to.setAttribute('list', 'people'); to.autocomplete = 'off'; to.spellcheck = false;
+  name.placeholder = 'Group name (letters, digits, - . _)'; name.hidden = true; name.autocomplete = 'off'; name.spellcheck = false;
+  form.append(to, name);
+  const names = () => to.value.split(/[\s,]+/).map(x => x.replace(/^@/, '')).filter(Boolean);
+  to.addEventListener('input', () => { name.hidden = names().length < 2; });
+  const c = composer(async text => {
+    const who = names();
+    if (!who.length) throw new Error('say who it is for');
+    let room;
+    if (who.length === 1) room = dmId(S.me.name, who[0]);
+    else {
+      const r = (await call('/ui/api/rooms/new', { name: name.value.trim(), members: who })).j;
+      room = r.room;
+      if (r.unknown && r.unknown.length) alert('Not on this network yet: ' + r.unknown.join(', '));
+    }
+    await call('/ui/api/messages', { room, text });
+    S.roomsRaw = ''; await pollRooms(); openRoom(room);
+  }, 'Message');
+  V = null;
+  mainEl.replaceChildren(header('New conversation', '', false), form, el('div', 'blank'), c.wrap);
+  to.focus();
 }
 
 /* ---------- boot ---------- */
-function renderFoot() {
-  footEl.replaceChildren();
-  if (!S.me) return;
-  const av = tint(el('div', 'av', (Array.from(S.me.name || '?')[0] || '?').toUpperCase()), S.me.name);
-  av.style.width = av.style.height = '28px'; av.style.fontSize = '13px'; av.style.marginTop = '0';
-  const who = el('div', 'who'); who.append(S.me.name + ' ', el('span', 'sub', canPost() ? 'chatting' : 'reading'));
-  document.getElementById('newroom').hidden = !canPost();
-  who.title = (S.me.sub || '') + (S.me.expires ? '\nlink expires ' + abs(S.me.expires) : '');
-  footEl.append(av, who);
-}
-filterEl.addEventListener('input', renderRooms);
-document.addEventListener('keydown', ev => {
-  const inInput = ev.target === filterEl;
-  if (ev.target !== filterEl && ev.target.closest && ev.target.closest('textarea, input, .modal')) return;
-  if (ev.key === '/' && !inInput && !ev.metaKey && !ev.ctrlKey) { ev.preventDefault(); filterEl.focus(); return; }
-  if (ev.key === 'Escape' && inInput) { filterEl.value = ''; renderRooms(); filterEl.blur(); return; }
-  let d = 0;
-  if (ev.altKey && ev.key === 'ArrowDown') d = 1; else if (ev.altKey && ev.key === 'ArrowUp') d = -1;
-  else if (!inInput && !ev.metaKey && !ev.ctrlKey && !ev.altKey) { if (ev.key === 'j') d = 1; else if (ev.key === 'k') d = -1; }
-  if (!d) return;
-  const list = visibleRooms(); if (!list.length) return;
-  ev.preventDefault();
-  const i = list.findIndex(r => r.id === S.cur);
-  const next = list[Math.max(0, Math.min(list.length - 1, i < 0 ? 0 : i + d))];
-  if (next && next.id !== S.cur) { selectRoom(next.id); const b = roomsEl.querySelector('.room.sel'); if (b) b.scrollIntoView({ block: 'nearest' }); }
-});
+findEl.addEventListener('input', renderList);
+findEl.addEventListener('keydown', ev => { if (ev.key === 'Escape') { findEl.value = ''; renderList(); } });
+$('new').onclick = newConversation;
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollRooms(); pollRoom(); } });
-
 async function boot() {
-  if (!KEY) { noKey(); return; }
-  placeholder('Select a room to read.');
-  try { S.me = await api('/ui/api/me'); renderFoot(); } catch (e) { if (document.querySelector('.gate')) return; }
+  if (!KEY) { gate('Islandmail', 'Open this page with the link from:'); return; }
+  blank('');
+  try { S.me = (await call('/ui/api/me')).j; } catch (e) { return; }
+  $('me').textContent = S.me.name + (canPost() ? '' : ' · read-only');
+  $('new').hidden = !canPost();
+  const dl = $('people'); for (const a of S.me.agents || []) { if (a !== S.me.name) { const o = el('option'); o.value = a; dl.append(o); } }
   await pollRooms();
   const want = hashParams().get('room');
-  if (want) selectRoom(want);
-  setInterval(() => { if (!document.hidden) pollRooms(); }, POLL_ROOMS);
-  setInterval(() => { if (!document.hidden) pollRoom(); }, POLL_ROOM);
-  setInterval(refreshTimes, 30000);
+  if (want) openRoom(want); else blank(S.rooms.length ? 'Pick a conversation.' : '');
+  setInterval(() => { if (!document.hidden) pollRooms(); }, 5000);
+  setInterval(() => { if (!document.hidden) pollRoom(); }, 3000);
 }
 boot();
 </script>

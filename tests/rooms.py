@@ -252,6 +252,8 @@ def main():
             page = r.read().decode()
             check("/ui shows a reply's parent as a quote, its id only on hover", "'\u21b3 re ' + m.reply_to" not in page
                   and "'Reply to ' + (m.quote.id" in page)
+            check("/ui puts network text into the page as text only (no innerHTML)", "innerHTML" not in page
+                  and "outerHTML" not in page and "insertAdjacentHTML" not in page)
             check("/ui serves an HTML page", r.status == 200 and r.headers["Content-Type"].startswith("text/html")
                   and "<html" in page.lower() and "default-src 'none'" in r.headers["Content-Security-Policy"])
         rc, out = cl("alice", "ui")
