@@ -530,9 +530,12 @@ function buildNodes(arr, prev) {
       const a = el('button', 'act', 'Reply'); a.type = 'button'; a.onclick = () => setReply(m);
       (body.querySelector('.meta') || body).append(a);
     }
-    if (m.reply_to) { row.classList.add('reply'); body.append(el('div', 're num', '↳ re ' + m.reply_to)); }
+    if (m.reply_to) {
+      row.classList.add('reply');
+      if (!m.quote) { const x = el('div', 're', '↳ a reply to a message you cannot read'); x.title = 're ' + m.reply_to; body.append(x); }
+    }
     if (m.quote) {
-      const q = el('div', 'quote'); q.title = 'Jump to quoted message';
+      const q = el('div', 'quote'); q.title = 'Reply to ' + (m.quote.id || m.reply_to || '') + ' · click to jump to it';
       q.append(el('div', 'qf', (m.quote.from || '')), el('div', 'qt', m.quote.text || ''));
       q.onclick = () => jumpTo(m.quote.id); body.append(q);
     }
