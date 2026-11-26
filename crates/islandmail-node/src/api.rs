@@ -57,7 +57,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(agents).post(certify))
         .route("/api/revocations", axum::routing::post(revoke))
         .route("/api/invites", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::invite)))
-        .route("/api/joins", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::join)))
+        .route("/api/joins", axum::routing::post(join))
+        .route("/api/invites/joined", get(joined).post(joined_seen))
         .route("/api/accepts", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::accept)))
         .route("/api/messages", get(list).post(post))
         .route("/api/messages/{id}", get(one))
@@ -267,6 +268,30 @@ async fn owner_step(State(s): State<AppState>, headers: HeaderMap, body: Bytes,
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(out, 200))
+}
+
+/// POST /api/joins {invite, ts, sig, wait_s?}: check the invite, present this node to the inviting node (up to wait_s,
+/// default 60), and trust it unless it refused. Unreachable: the answer carries the reply for `accept` instead.
+async fn join(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
+    let v = local_json(&headers, &body)?;
+    let wait = Duration::from_secs(v.get("wait_s").and_then(|x| x.as_u64()).unwrap_or(60).clamp(1, 120));
+    let node = s.node.clone();
+    let plan = tokio::task::spawn_blocking(move || crate::invite::join_prepare(&node, &v))
+        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let outcome = crate::net::dial_join(&s.node, &plan.inv.node, &plan.reply, wait).await;
+    let node = s.node.clone();
+    let out = tokio::task::spawn_blocking(move || crate::invite::join_finish(&node, plan, outcome))
+        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    Ok(json_resp(out, 200))
+}
+
+async fn joined(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
+    Ok(json_resp(crate::invite::joined_for(&s.node, &who.name)?, 200))
+}
+
+async fn joined_seen(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
+    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body must be JSON {nonce}"))?;
+    Ok(json_resp(crate::invite::joined_seen(&s.node, &who.name, v["nonce"].as_str().unwrap_or(""))?, 200))
 }
 
 async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {

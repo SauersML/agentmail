@@ -1,20 +1,25 @@
-//! One-step joining: an invite (signed by the inviting node), the joiner's reply (signed by the joining node), and the
-//! trust-file edits each step makes. The host owner asks for each step over the loopback API with a request signed by
-//! this node's key (`operator_statement`), as `islandmail.py invite / join / accept` do. The node writes its own
-//! trust file (seq + 1, other entries kept) and adopts it at once.
+//! One-step joining. The inviting node issues an invite with a one-time nonce and keeps it (table `invites`). The
+//! joining node dials the inviting node on JOIN_ALPN, the one request an untrusted key may make, and presents a
+//! reply: its node key, addrs, the invited name and the nonce, signed by its node key (the QUIC handshake also proves
+//! the key). The inviting node checks the nonce (issued here, unexpired, unused), the name (exactly the invited one,
+//! held by nobody else here), trusts the joining node for exactly that name and spends the nonce under one lock,
+//! then answers. When the inviting node cannot be reached, join prints the reply instead and the inviter runs
+//! `accept REPLY`, which runs the same check. The room add is made by the inviting agent's own client on its next run
+//! (GET /api/invites/joined lists the joins it has not seen), since only that agent can sign it.
 //!
-//! Both are short base58 strings of raw bytes (str = u8 length + UTF-8; u32 big-endian):
+//! Host-owner steps (invite, join, accept) arrive over the loopback API signed with this node's key
+//! (`operator_statement`). The node writes its own trust file (seq + 1, other entries kept) and adopts it at once.
 //!
-//!   im1 + base58(flags u8 | network 32 | node key 32 | exp u32 (unix s) | ticket 16 | name str
+//! Both strings are base58 of raw bytes (str = u8 length + UTF-8; u32 big-endian):
+//!
+//!   im1 + base58(flags u8 | network 32 | node key 32 | exp u32 (unix s) | nonce 16 | name str
 //!                | [from str] | [room str] | [names: n u8, n str] | [addrs] | [relay URLs: n u8, n str] | sig 64)
-//!   imr1 + base58(flags u8 | network 32 | node key 32 | exp u32 | ticket 16 | name str | [room str] | [addrs] | sig 64)
+//!   imr1 + base58(flags u8 | network 32 | node key 32 | nonce 16 | name str | [addrs] | sig 64)
 //!
 //! flags: 1 relay n0, 2 relay URLs, 4 addrs, 8 names, 16 from, 32 room. addrs = n u8, then per address 4 | IPv4 4 |
 //! port u16 or 6 | IPv6 16 | port u16. sig is the node key's Ed25519 signature over "islandmail/invite/v1\n" (reply:
 //! "islandmail/invite-reply/v1\n") + every byte before it. Derived, not sent: the inviting node's names default to
-//! [from], its entry name is from (else its first name); the joining node's entry name is the invited name. The ticket
-//! is the first 16 bytes of the inviting node's (deterministic) signature over network, exp, name and room, so accept
-//! checks that its own node issued the invite, still unexpired, without keeping any state.
+//! [from], its entry name is from (else its first name); the joining node's entry name is the invited name.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -32,7 +37,6 @@ pub const INVITE_PREFIX: &str = "im1";
 pub const REPLY_PREFIX: &str = "imr1";
 const INVITE_CTX: &[u8] = b"islandmail/invite/v1\n";
 const REPLY_CTX: &[u8] = b"islandmail/invite-reply/v1\n";
-const TICKET_CTX: &[u8] = b"islandmail/invite-ticket/v1\n";
 pub const MAX_INVITE_LIFE_MS: i64 = 7 * 24 * 3600 * 1000;
 const SKEW_MS: i64 = 300_000;
 const N0: u8 = 1;
@@ -56,18 +60,17 @@ pub struct Invite {
     /// A room the joined agent is added to on accept.
     pub room: Option<String>,
     pub exp: i64,
-    pub ticket: [u8; 16],
+    /// One-time: the inviting node keeps it until a node joins with it.
+    pub nonce: [u8; 16],
 }
 
 #[derive(Clone, Debug)]
 pub struct Reply {
     pub network: String,
-    /// The joining node: its key and addrs (accept trusts it for the invite's name only).
+    /// The joining node: its key and addrs (it is trusted for the invite's name only).
     pub node: NodeEntry,
     pub name: String,
-    pub room: Option<String>,
-    pub exp: i64,
-    pub ticket: [u8; 16],
+    pub nonce: [u8; 16],
 }
 
 /* base58 (Bitcoin alphabet) */
@@ -160,13 +163,6 @@ fn network_bytes(n: &str) -> Result<[u8; 32], String> {
     b64u_decode(n).and_then(|b| b.try_into().ok()).ok_or_else(|| "invalid network ID".into())
 }
 
-/// The ticket only the inviting node can make: it ties name, room and expiry to this node and network.
-fn ticket(node: &Node, network: &[u8; 32], exp_s: u32, name: &str, room: &str) -> [u8; 16] {
-    let mut w = W::default();
-    w.put(TICKET_CTX).put(network).put(&exp_s.to_be_bytes()).str(name).str(room);
-    node.seed.sign(&w.0)[..16].try_into().unwrap()
-}
-
 fn seal(prefix: &str, ctx: &[u8], mut w: W, node: &Node) -> String {
     let sig = node.seed.sign(&[ctx, &w.0].concat());
     w.put(&sig);
@@ -202,7 +198,7 @@ fn encode_invite(inv: &Invite, node: &Node) -> String {
         | if inv.from.is_some() { FROM } else { 0 } | if inv.room.is_some() { ROOM } else { 0 };
     let mut w = W::default();
     w.put(&[flags]).put(&network_bytes(&inv.network).expect("own network")).put(&key_bytes(&inv.node.key))
-        .put(&((inv.exp / 1000) as u32).to_be_bytes()).put(&inv.ticket).str(&inv.name);
+        .put(&((inv.exp / 1000) as u32).to_be_bytes()).put(&inv.nonce).str(&inv.name);
     if let Some(f) = &inv.from { w.str(f); }
     if let Some(r) = &inv.room { w.str(r); }
     if !derived {
@@ -225,7 +221,7 @@ pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
     let network = b64u(&r.arr::<32>()?);
     let key = fmt_key(&r.arr::<32>()?);
     let exp = u32::from_be_bytes(r.arr()?) as i64 * 1000;
-    let ticket = r.arr::<16>()?;
+    let nonce = r.arr::<16>()?;
     let name = r.str().map_err(bad)?;
     let from = if flags & FROM != 0 { Some(r.str().map_err(bad)?) } else { None };
     let room = if flags & ROOM != 0 { Some(r.str().map_err(bad)?) } else { None };
@@ -236,7 +232,7 @@ pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
     if flags & URLS != 0 { for _ in 0..r.u8()? { relay.push(r.str().map_err(bad)?); } }
     if !r.0.is_empty() || flags & !63 != 0 { return Err("invite is malformed".into()); }
     let node_name = from.clone().or_else(|| names.first().map(|n| n.trim_end_matches('.').to_string())).unwrap_or("peer".into());
-    let inv = Invite { network, node: NodeEntry { name: node_name, key, addrs, names }, relay, name, from, room, exp, ticket };
+    let inv = Invite { network, node: NodeEntry { name: node_name, key, addrs, names }, relay, name, from, room, exp, nonce };
     check_entry(&inv.node).map_err(bad)?;
     if !valid_name(&inv.name) {
         return Err("invite is malformed".into());
@@ -251,11 +247,9 @@ pub fn read_invite(s: &str, now: i64) -> Result<Invite, String> {
 }
 
 fn encode_reply(r: &Reply, node: &Node) -> String {
-    let flags = if r.node.addrs.is_empty() { 0 } else { ADDRS } | if r.room.is_some() { ROOM } else { 0 };
     let mut w = W::default();
-    w.put(&[flags]).put(&network_bytes(&r.network).expect("own network")).put(&key_bytes(&r.node.key))
-        .put(&((r.exp / 1000) as u32).to_be_bytes()).put(&r.ticket).str(&r.name);
-    if let Some(room) = &r.room { w.str(room); }
+    w.put(&[if r.node.addrs.is_empty() { 0 } else { ADDRS }]).put(&network_bytes(&r.network).expect("own network"))
+        .put(&key_bytes(&r.node.key)).put(&r.nonce).str(&r.name);
     if !r.node.addrs.is_empty() { w.addrs(&r.node.addrs); }
     seal(REPLY_PREFIX, REPLY_CTX, w, node)
 }
@@ -275,13 +269,19 @@ pub fn read_reply(s: &str) -> Result<Reply, String> {
     let flags = r.u8()?;
     let network = b64u(&r.arr::<32>()?);
     let key = fmt_key(&r.arr::<32>()?);
-    let exp = u32::from_be_bytes(r.arr()?) as i64 * 1000;
-    let ticket = r.arr::<16>()?;
+    let nonce = r.arr::<16>()?;
     let name = r.str().map_err(bad)?;
-    let room = if flags & ROOM != 0 { Some(r.str().map_err(bad)?) } else { None };
     let addrs = if flags & ADDRS != 0 { r.addrs().map_err(bad)? } else { vec![] };
-    if !r.0.is_empty() || flags & !(ADDRS | ROOM) != 0 || !valid_name(&name) { return Err("reply is malformed".into()); }
-    Ok(Reply { network, node: NodeEntry { name: name.clone(), key, addrs, names: vec![] }, name, room, exp, ticket })
+    if !r.0.is_empty() || flags & !ADDRS != 0 || !valid_name(&name) { return Err("reply is malformed".into()); }
+    Ok(Reply { network, node: NodeEntry { name: name.clone(), key, addrs, names: vec![] }, name, nonce })
+}
+
+/* the store: outstanding invites */
+
+pub fn init(db: &rusqlite::Connection) -> anyhow::Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS invites (nonce TEXT PRIMARY KEY, name TEXT NOT NULL, room TEXT NOT NULL,
+                      from_ TEXT NOT NULL, exp INTEGER NOT NULL, spent_by TEXT, spent_ms INTEGER, told INTEGER NOT NULL DEFAULT 0);")?;
+    Ok(())
 }
 
 /// What the host owner signs with the node key to ask for one step: action is invite, join or accept.
@@ -376,17 +376,32 @@ pub fn invite(node: &Node, body: &Value) -> Result<Value, ApiError> {
     }
     let network = node.members.read().unwrap().network.clone();
     let exp_s = ((now_millis() + 999) / 1000 + ttl) as u32;
+    let nonce = islandmail_core::random_bytes::<16>();
     let inv = Invite {
-        ticket: ticket(node, &network_bytes(&network).map_err(|e| ApiError::new(500, e))?, exp_s, name, room),
+        nonce,
         network, node: own_entry(node)?, relay: node.opts.relay.clone(), name: name.into(),
         from: (!from.is_empty()).then(|| from.into()), room: (!room.is_empty()).then(|| room.into()), exp: exp_s as i64 * 1000,
     };
-    Ok(json!({ "invite": encode_invite(&inv, node), "exp": islandmail_core::ts_from_millis(inv.exp) }))
+    let s = encode_invite(&inv, node);
+    node.store.conn().execute("INSERT INTO invites (nonce, name, room, from_, exp) VALUES (?, ?, ?, ?, ?)",
+                              rusqlite::params![b64u(&nonce), name, room, from, inv.exp])?;
+    Ok(json!({ "invite": s, "exp": islandmail_core::ts_from_millis(inv.exp) }))
 }
 
-/// POST /api/joins {invite, ts, sig}: trust the inviting node, make sure this node may certify the invited name, and
-/// answer with a reply for the inviter.
-pub fn join(node: &Node, body: &Value) -> Result<Value, ApiError> {
+/// A join on its way: the checked invite and the reply this node presents to the inviting node.
+pub struct JoinPlan {
+    pub inv: Invite,
+    pub reply: String,
+}
+
+/// What the inviting node said to the presented reply, or why it could not be asked.
+pub enum Outcome {
+    Answered(Value),
+    Unreachable(String),
+}
+
+/// POST /api/joins {invite, ts, sig}, first half: check the invite and make the reply. Nothing changes yet.
+pub fn join_prepare(node: &Node, body: &Value) -> Result<JoinPlan, ApiError> {
     let raw = arg_str(body, "invite").trim();
     operator(node, body, "join", raw)?;
     let inv = read_invite(raw, now_millis()).map_err(|e| ApiError::new(400, e))?;
@@ -403,6 +418,24 @@ pub fn join(node: &Node, body: &Value) -> Result<Value, ApiError> {
     if inv.node.covers(&inv.name) {
         return Err(ApiError::new(409, format!("the inviting node claims {} itself", inv.name)));
     }
+    if let Some(h) = holder(&node.members.read().unwrap(), &inv.name, Some(&me_key)) {
+        return Err(ApiError::new(409, format!("{} is held here by {h}", inv.name)));
+    }
+    let mut mine = own_entry(node)?;
+    mine.name = inv.name.clone();
+    let reply = encode_reply(&Reply { network, node: mine, name: inv.name.clone(), nonce: inv.nonce }, node);
+    Ok(JoinPlan { inv, reply })
+}
+
+/// Second half: unless the inviting node refused, trust it and make sure this node may certify the invited name.
+pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Value, ApiError> {
+    let (joined, why) = match outcome {
+        Outcome::Answered(v) if v["ok"] == true => (true, None),
+        Outcome::Answered(v) => return Err(ApiError::new(409, format!("the inviting node refused: {}",
+                                                                      v["error"].as_str().unwrap_or("no reason given")))),
+        Outcome::Unreachable(why) => (false, Some(why)),
+    };
+    let inv = plan.inv;
     let mut added_name = false;
     let list = edit_trust(node, |list, me| {
         if let Some(h) = holder(list, &inv.name, Some(me)) {
@@ -419,38 +452,45 @@ pub fn join(node: &Node, body: &Value) -> Result<Value, ApiError> {
         }
         Ok(())
     })?;
-    let mine = list.node_by_key(&node.seed.public()).cloned().expect("own entry");
-    let reply = Reply { network: network.clone(), node: mine, name: inv.name.clone(), room: inv.room.clone(), exp: inv.exp,
-                        ticket: inv.ticket };
     Ok(json!({
-        "reply": encode_reply(&reply, node), "network": network, "seq": list.seq,
+        "joined": joined, "unreachable": why, "reply": if joined { Value::Null } else { plan.reply.into() },
+        "network": list.network, "seq": list.seq,
         "inviter": { "name": inv.node.name, "key": inv.node.key, "names": inv.node.names }, "from": inv.from,
         "name": inv.name, "added_name": added_name, "room": inv.room,
         "relay": { "invite": inv.relay, "node": node.opts.relay },
     }))
 }
 
-/// POST /api/accepts {reply, ts, sig}: trust the joining node for exactly the name this node's invite offered.
-pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
-    let raw = arg_str(body, "reply").trim();
-    operator(node, body, "accept", raw)?;
-    let r = read_reply(raw).map_err(|e| ApiError::new(400, e))?;
-    let me_key = fmt_key(&node.seed.public());
-    let network = node.members.read().unwrap().network.clone();
-    let exp_s = (r.exp / 1000) as u32;
-    if r.network != network || r.node.key == me_key
-        || ticket(node, &network_bytes(&network).map_err(|e| ApiError::new(500, e))?, exp_s, &r.name,
-                  r.room.as_deref().unwrap_or("")) != r.ticket {
-        return Err(ApiError::new(400, "this reply answers no invite of this node (another node's, or altered)"));
+/// Trust the node of `reply` for exactly the name of the invite whose nonce it carries, and spend that nonce, both
+/// under the trust-edit lock. `peer`: the key the QUIC handshake proved, for a reply that arrived over JOIN_ALPN.
+fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError> {
+    let r = read_reply(reply).map_err(|e| ApiError::new(400, e))?;
+    if peer.is_some_and(|p| p != r.node.key) {
+        return Err(ApiError::new(403, "the reply names another node key than the connection"));
     }
-    if now_millis() >= r.exp {
-        return Err(ApiError::new(400, format!("the invite expired at {}", islandmail_core::ts_from_millis(r.exp))));
+    if r.network != node.members.read().unwrap().network || r.node.key == fmt_key(&node.seed.public()) {
+        return Err(ApiError::new(400, "this reply answers no invite of this node"));
     }
-    let inv = &r;
+    let nonce = b64u(&r.nonce);
     let name = r.name.clone();
+    let mut row: Option<(String, String)> = None;
     let list = edit_trust(node, |list, _| {
-        if list.network != inv.network {
-            return Err(ApiError::new(409, "the invite was for another network"));
+        let db = node.store.conn();
+        let got: Option<(String, String, String, i64, Option<String>)> = db.query_row(
+            "SELECT name, room, from_, exp, spent_by FROM invites WHERE nonce = ?", [&nonce],
+            |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?))).ok();
+        let Some((want, room, from, exp, spent)) = got else {
+            return Err(ApiError::new(403, "no such invite here (unknown nonce)"));
+        };
+        if let Some(by) = spent {
+            if by == r.node.key { row = Some((room, from)); return Ok(()); }  // the same node again: nothing to do
+            return Err(ApiError::new(409, "this invite was already used"));
+        }
+        if now_millis() >= exp {
+            return Err(ApiError::new(403, format!("the invite expired at {}", islandmail_core::ts_from_millis(exp))));
+        }
+        if want != name {
+            return Err(ApiError::new(403, format!("the invite was for {want:?}, not {name:?}")));
         }
         if let Some(h) = holder(list, &name, Some(&r.node.key)) {
             return Err(ApiError::new(409, format!("{name} is already held here by {h}; refusing to hand it to another node")));
@@ -460,12 +500,75 @@ pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
                 n.addrs = r.node.addrs.clone();
                 if !n.names.iter().any(|e| e.eq_ignore_ascii_case(&name)) { n.names.push(name.clone()); }
             }
-            None => list.nodes.push(NodeEntry { name: r.node.name.clone(), key: r.node.key.clone(), addrs: r.node.addrs.clone(),
+            None => list.nodes.push(NodeEntry { name: name.clone(), key: r.node.key.clone(), addrs: r.node.addrs.clone(),
                                                 names: vec![name.clone()] }),
         }
+        let n = db.execute("UPDATE invites SET spent_by = ?, spent_ms = ? WHERE nonce = ? AND spent_by IS NULL",
+                           rusqlite::params![r.node.key, now_millis(), nonce]).map_err(anyhow::Error::from)?;
+        if n != 1 { return Err(ApiError::new(409, "this invite was already used")); }
+        row = Some((room, from));
         Ok(())
     })?;
-    Ok(json!({ "name": name, "room": inv.room, "node": { "name": r.node.name, "key": r.node.key }, "seq": list.seq }))
+    let (room, from) = row.expect("set on success");
+    tracing::info!("node {} joined with an invite for {name}", r.node.key);
+    Ok(json!({ "ok": true, "name": name, "room": (!room.is_empty()).then_some(room), "from": (!from.is_empty()).then_some(from),
+               "node": { "name": name, "key": r.node.key }, "seq": list.seq }))
+}
+
+/// POST /api/accepts {reply, ts, sig}: the inviting node could not be reached at join; the owner hands in the reply.
+pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
+    let raw = arg_str(body, "reply").trim();
+    operator(node, body, "accept", raw)?;
+    admit(node, raw, None)
+}
+
+/// At most `max` events per key in the last minute.
+fn allow(key: &str, max: usize) -> bool {
+    static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<i64>>>> = std::sync::OnceLock::new();
+    let now = now_millis();
+    let mut m = SEEN.get_or_init(Default::default).lock().unwrap();
+    if m.len() > 10_000 { m.retain(|_, v| v.iter().any(|&t| t > now - 60_000)); }
+    let v = m.entry(key.to_string()).or_default();
+    v.retain(|&t| t > now - 60_000);
+    if v.len() >= max { return false; }
+    v.push(now);
+    true
+}
+
+pub const MAX_JOIN_REQUEST: usize = 1024;
+
+/// One request on JOIN_ALPN from `peer` (any key): the answer, as JSON bytes. Rate-limited per key and overall.
+pub fn handshake(node: &Node, peer: &[u8; 32], req: &[u8]) -> Vec<u8> {
+    let peer = fmt_key(peer);
+    let out = if !allow("join:all", 30) || !allow(&peer, 5) {
+        json!({ "error": "too many join attempts; try again in a minute" })
+    } else {
+        match std::str::from_utf8(req).map_err(|_| ApiError::new(400, "not text")).and_then(|r| admit(node, r, Some(&peer))) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::info!("join attempt from {peer} refused: {}", e.message);
+                json!({ "error": e.message })
+            }
+        }
+    };
+    out.to_string().into_bytes()
+}
+
+/// GET /api/invites/joined: nodes that joined with an invite `from` this agent, not yet seen by it.
+pub fn joined_for(node: &Node, from: &str) -> Result<Value, ApiError> {
+    let db = node.store.conn();
+    let mut st = db.prepare("SELECT nonce, name, room, spent_by, spent_ms FROM invites
+                             WHERE spent_by IS NOT NULL AND told = 0 AND lower(from_) = lower(?) ORDER BY spent_ms")?;
+    let rows = st.query_map([from], |x| Ok(json!({ "nonce": x.get::<_, String>(0)?, "name": x.get::<_, String>(1)?,
+        "room": x.get::<_, String>(2)?, "node": x.get::<_, String>(3)?, "at": islandmail_core::ts_from_millis(x.get(4)?) })))?;
+    Ok(json!({ "joined": rows.collect::<rusqlite::Result<Vec<_>>>()? }))
+}
+
+/// POST /api/invites/joined {nonce}: this agent has seen (and done the room add for) that join.
+pub fn joined_seen(node: &Node, from: &str, nonce: &str) -> Result<Value, ApiError> {
+    let n = node.store.conn().execute("UPDATE invites SET told = 1 WHERE nonce = ? AND lower(from_) = lower(?) AND spent_by IS NOT NULL",
+                                      [nonce, from])?;
+    Ok(json!({ "updated": n }))
 }
 
 #[cfg(test)]
@@ -481,18 +584,94 @@ mod tests {
         assert!(b58_decode("0OIl").is_none());
     }
 
-    fn node() -> Node {
+    fn node_on(network: [u8; 32], names: &[&str]) -> Node {
         let seed = islandmail_core::keys::Seed::generate();
-        let list = MemberList { v: 1, network: b64u(&[7u8; 32]), seq: 1, members: vec![], homes: vec![],
+        let list = MemberList { v: 1, network: b64u(&network), seq: 1, members: vec![], homes: vec![],
             nodes: vec![NodeEntry { name: "a".into(), key: fmt_key(&seed.public()), addrs: vec!["192.0.2.7:4433".into()],
-                                    names: vec!["alice".into()] }] };
-        let path = std::env::temp_dir().join(format!("islandmail-invite-{}.sqlite", b64u(&islandmail_core::random_bytes::<9>())));
+                                    names: names.iter().map(|n| n.to_string()).collect() }] };
+        let tag = b64u(&islandmail_core::random_bytes::<9>());
+        let path = std::env::temp_dir().join(format!("islandmail-invite-{tag}.sqlite"));
+        let trust = std::env::temp_dir().join(format!("islandmail-invite-{tag}.json"));
+        std::fs::write(&trust, serde_json::to_vec(&list).unwrap()).unwrap();
         let store = crate::store::Store::open(&path).unwrap();
         store.bind_roster(&seed.public(), &list).unwrap();
-        let opts = crate::node::Opts { public_url: "http://x".into(), relay: vec!["n0".into()], ..Default::default() };
+        let opts = crate::node::Opts { public_url: "http://x".into(), relay: vec!["n0".into()], members_file: Some(trust),
+                                       ..Default::default() };
         Node::new(store, list, seed, opts, tokio::sync::mpsc::channel(1).0)
     }
 
+    fn signed(n: &Node, action: &str, arg: &str, mut body: Value) -> Value {
+        let ts = islandmail_core::now_ts();
+        let st = operator_statement(action, &fmt_key(&n.seed.public()), &ts, arg);
+        body["ts"] = ts.into();
+        body["sig"] = b64u(&n.seed.sign(st.as_bytes())).into();
+        body
+    }
+
+    fn make(n: &Node, name: &str, room: &str) -> String {
+        let body = json!({ "name": name, "room": room, "from": "alice", "ttl_s": 604800 });
+        invite(n, &signed(n, "invite", &format!("{name}|{room}|alice|604800"), body)).unwrap()["invite"].as_str().unwrap().into()
+    }
+
+    /// A joining node's reply to `inv`, presenting `name`.
+    fn reply_of(j: &Node, inv: &str, name: &str) -> String {
+        let i = read_invite(inv, now_millis()).unwrap();
+        encode_reply(&Reply { network: i.network, node: NodeEntry { name: name.into(), key: fmt_key(&j.seed.public()),
+                              addrs: vec!["192.0.2.9:4433".into()], names: vec![] }, name: name.into(), nonce: i.nonce }, j)
+    }
+
+    fn answer(a: &Node, j: &Node, reply: &str) -> Value {
+        serde_json::from_slice(&handshake(a, &j.seed.public(), reply.as_bytes())).unwrap()
+    }
+
+    #[test]
+    fn the_join_handshake_spends_the_nonce_once_for_exactly_the_name() {
+        let a = node_on([3u8; 32], &["alice"]);
+        let (b, c) = (node_on([3u8; 32], &[]), node_on([3u8; 32], &[]));
+        let inv = make(&a, "bob", "alice/plan");
+        let r = reply_of(&b, &inv, "bob");
+        assert!(r.starts_with("imr1") && r.len() <= 260, "{} chars", r.len());
+        // Presented by another key than the connection's: refused.
+        let v: Value = serde_json::from_slice(&handshake(&a, &c.seed.public(), r.as_bytes())).unwrap();
+        assert!(v["error"].as_str().unwrap().contains("another node key"), "{v}");
+        let v = answer(&a, &b, &r);
+        assert_eq!((v["ok"].as_bool(), v["name"].as_str(), v["room"].as_str()), (Some(true), Some("bob"), Some("alice/plan")), "{v}");
+        let entry = a.members.read().unwrap().node_by_key(&b.seed.public()).cloned().unwrap();
+        assert_eq!((entry.names, entry.addrs), (vec!["bob".to_string()], vec!["192.0.2.9:4433".to_string()]));
+        assert_eq!(answer(&a, &b, &r)["ok"], true, "the same node again is a no-op");
+        assert!(answer(&a, &c, &reply_of(&c, &inv, "bob"))["error"].as_str().unwrap().contains("already used"));
+        // The inviting agent sees the join once.
+        assert_eq!(joined_for(&a, "alice").unwrap()["joined"].as_array().unwrap().len(), 1);
+        let nonce = joined_for(&a, "alice").unwrap()["joined"][0]["nonce"].as_str().unwrap().to_string();
+        joined_seen(&a, "alice", &nonce).unwrap();
+        assert!(joined_for(&a, "alice").unwrap()["joined"].as_array().unwrap().is_empty());
+        // Another name than the invited one; a name this node holds; an unknown nonce; a changed byte.
+        let inv2 = make(&a, "carol", "");
+        // (a fresh joining node for each try: the handshake allows a few attempts per key and minute)
+        let fresh = || node_on([3u8; 32], &[]);
+        let d = fresh();
+        assert!(answer(&a, &d, &reply_of(&d, &inv2, "dave"))["error"].as_str().unwrap().contains("not \"dave\""));
+        let other = node_on([3u8; 32], &["alice"]);
+        let stranger = make(&other, "carol", "");
+        let d = fresh();
+        assert!(answer(&a, &d, &reply_of(&d, &stranger, "carol"))["error"].as_str().unwrap().contains("unknown nonce"));
+        let d = fresh();
+        let mut raw = b58_decode(&reply_of(&d, &inv2, "carol")[4..]).unwrap();
+        raw[1 + 32 + 32 + 16 + 1] ^= 1;
+        assert!(answer(&a, &d, &format!("imr1{}", b58(&raw)))["error"].as_str().unwrap().contains("signature"));
+        // carol becomes ours before the join: refused.
+        edit_trust(&a, |list, me| { list.nodes.iter_mut().find(|n| n.key == me).unwrap().names.push("carol".into()); Ok(()) }).unwrap();
+        let d = fresh();
+        assert!(answer(&a, &d, &reply_of(&d, &inv2, "carol"))["error"].as_str().unwrap().contains("already held"));
+        // A flood from one key is cut off after a few tries.
+        let d = fresh();
+        let flood: Vec<Value> = (0..8).map(|_| answer(&a, &d, "imr1junk")).collect();
+        assert!(flood.iter().any(|v| v["error"].as_str().unwrap().contains("too many")));
+    }
+
+    fn node() -> Node {
+        node_on([7u8; 32], &["alice"])
+    }
     #[test]
     fn invites_round_trip_and_refuse_tampering_and_expiry() {
         let n = node();
@@ -517,15 +696,8 @@ mod tests {
         assert!(read_invite(&format!("im1{}", b58(&raw)), now).unwrap_err().contains("signature"));
         assert!(read_invite(&s, inv.exp).unwrap_err().contains("expired"));
         assert!(read_invite(&s.replace("im1", "imr1"), now).is_err());
-        // The reply's ticket proves the invite was this node's, for this name and room only.
-        let r = Reply { network: inv.network.clone(), node: NodeEntry { name: "bob".into(), key: fmt_key(&n.seed.public()),
-                        addrs: vec![], names: vec![] }, name: "bob".into(), room: inv.room.clone(), exp: inv.exp, ticket: inv.ticket };
-        let exp_s = (inv.exp / 1000) as u32;
-        assert_eq!(ticket(&n, &[7u8; 32], exp_s, "bob", "alice/plan"), r.ticket);
-        assert_ne!(ticket(&n, &[7u8; 32], exp_s, "carol", "alice/plan"), r.ticket);
-        let rs = encode_reply(&r, &n);
-        assert!(rs.starts_with("imr1") && rs.len() <= 260, "{} chars", rs.len());
-        assert_eq!(read_reply(&rs).unwrap().ticket, inv.ticket);
+        let rs = reply_of(&n, &s, "bob");
+        assert_eq!(read_reply(&rs).unwrap().nonce, inv.nonce);
         let plain = invite(&n, &body("bob", "")).unwrap()["invite"].as_str().unwrap().len();
         println!("invite {} chars with a room, {plain} without; reply {} chars", s.len(), rs.len());
     }

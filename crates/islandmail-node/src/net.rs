@@ -25,6 +25,8 @@ use crate::config::Config;
 use crate::node::Node;
 
 pub const SYNC_ALPN: &[u8] = b"islandmail/sync/1";
+/// The one protocol a key that is not on the trust file may use: present a reply to this node's invite (invite.rs).
+pub const JOIN_ALPN: &[u8] = b"islandmail/join/1";
 const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
 /// Large enough for a `blob` answer: an encrypted attachment (MAX_FILE + 40 bytes) in base64 inside JSON.
@@ -97,8 +99,8 @@ impl MemberGate {
 }
 
 impl EndpointHooks for MemberGate {
-    async fn before_connect<'a>(&'a self, addr: &'a EndpointAddr, _alpn: &'a [u8]) -> BeforeConnectOutcome {
-        if self.node.members.read().unwrap().is_node(addr.id.as_bytes()) {
+    async fn before_connect<'a>(&'a self, addr: &'a EndpointAddr, alpn: &'a [u8]) -> BeforeConnectOutcome {
+        if alpn == JOIN_ALPN || self.node.members.read().unwrap().is_node(addr.id.as_bytes()) {
             BeforeConnectOutcome::Accept
         } else {
             BeforeConnectOutcome::Reject
@@ -107,6 +109,10 @@ impl EndpointHooks for MemberGate {
 
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
         let id = conn.remote_id();
+        if conn.alpn() == JOIN_ALPN {
+            // Not kept in `open`: JoinProto answers one request and closes.
+            return AfterHandshakeOutcome::accept();
+        }
         let members = self.node.members.read().unwrap();
         if members.is_node(id.as_bytes()) {
             let mut open = self.open.lock().unwrap();
@@ -117,6 +123,67 @@ impl EndpointHooks for MemberGate {
             tracing::warn!("refused connection from non-member {}", id.fmt_short());
             AfterHandshakeOutcome::Reject { error_code: 403u32.into(), reason: b"not a member node".to_vec() }
         }
+    }
+}
+
+/// JOIN_ALPN: one request of at most MAX_JOIN_REQUEST bytes within 10 s, one answer, then the connection closes.
+#[derive(Debug, Clone)]
+struct JoinProto {
+    node: Arc<Node>,
+}
+
+impl ProtocolHandler for JoinProto {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        let peer = *conn.remote_id().as_bytes();
+        let node = self.node.clone();
+        let res = tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut send, mut recv) = conn.accept_bi().await?;
+            let req = recv.read_to_end(crate::invite::MAX_JOIN_REQUEST).await?;
+            let resp = tokio::task::spawn_blocking(move || crate::invite::handshake(&node, &peer, &req)).await?;
+            send.write_all(&resp).await?;
+            send.finish()?;
+            conn.closed().await;
+            anyhow::Ok(())
+        }).await;
+        if let Ok(Err(e)) = res { tracing::debug!("join handshake from {}: {e:#}", conn.remote_id().fmt_short()); }
+        conn.close(0u32.into(), b"done");
+        Ok(())
+    }
+}
+
+/// What `join` needs to dial an inviting node directly.
+#[derive(Debug, Clone)]
+pub struct Dialer {
+    endpoint: Endpoint,
+    lookup: MemoryLookup,
+    relays: Vec<RelayUrl>,
+}
+
+/// Presents `reply` to the inviting node `to` on JOIN_ALPN and returns its answer, or why it could not be reached
+/// within `wait`.
+pub async fn dial_join(node: &Node, to: &islandmail_core::NodeEntry, reply: &str, wait: Duration) -> crate::invite::Outcome {
+    use crate::invite::Outcome;
+    let Some(d) = node.dialer.lock().unwrap().clone() else { return Outcome::Unreachable("the network is not up".into()) };
+    let Ok(id) = parse_key(&to.key).map_err(|_| ()).and_then(|k| EndpointId::from_bytes(&k).map_err(|_| ())) else {
+        return Outcome::Unreachable("invalid node key".into());
+    };
+    let mut a = EndpointAddr::new(id);
+    for addr in to.addrs.iter().filter_map(|x| x.parse::<SocketAddr>().ok()) { a = a.with_ip_addr(addr); }
+    for url in &d.relays { a = a.with_relay_url(url.clone()); }
+    d.lookup.set_endpoint_info(a);
+    let attempt = async {
+        let conn = d.endpoint.connect(EndpointAddr::new(id), JOIN_ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        send.write_all(reply.as_bytes()).await?;
+        send.finish()?;
+        let resp = recv.read_to_end(64 * 1024).await?;
+        conn.close(0u32.into(), b"done");
+        anyhow::Ok(serde_json::from_slice::<serde_json::Value>(&resp)?)
+    };
+    match tokio::time::timeout(wait, attempt).await {
+        Ok(Ok(v)) => Outcome::Answered(v),
+        Ok(Err(e)) => Outcome::Unreachable(format!("{e:#}")),
+        Err(_) => Outcome::Unreachable(format!("no answer within {} s", wait.as_secs())),
     }
 }
 
@@ -228,12 +295,15 @@ async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
 pub struct Net {
     pub endpoint: Endpoint,
     pub router: Router,
+    node: Arc<Node>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Net {
     /// Close the endpoint and stop every background task, so nothing here holds the node or its store afterwards.
     pub async fn shutdown(self) -> Result<()> {
+        // The dialer's endpoint holds the gate, which holds the node.
+        self.node.dialer.lock().unwrap().take();
         self.router.shutdown().await?;
         for t in &self.tasks {
             t.abort();
@@ -496,7 +566,9 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
         .accept(SYNC_ALPN, SyncProto { node: node.clone() })
+        .accept(JOIN_ALPN, JoinProto { node: node.clone() })
         .spawn();
+    *node.dialer.lock().unwrap() = Some(Dialer { endpoint: endpoint.clone(), lookup: lookup.clone(), relays: relays.clone() });
 
     let topic = TopicId::from_bytes(node.members.read().unwrap().topic());
     let first = peers(&node, &lookup, &relays);
@@ -636,7 +708,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         }
     }));
 
-    Ok(Net { endpoint, router, tasks })
+    Ok(Net { endpoint, router, tasks, node: node.clone() })
 }
 
 #[cfg(test)]

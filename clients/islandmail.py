@@ -303,6 +303,20 @@ def ident_path(name):
 
 
 def load_identity(name, create=True):
+    ident = _load_identity(name, create)
+    if not _joins_checked:
+        _joins_checked.append(1)
+        try:
+            complete_joins(ident)
+        except (Fail, OSError, ValueError, KeyError):
+            pass  # the next command tries again
+    return ident
+
+
+_joins_checked = []
+
+
+def _load_identity(name, create=True):
     # Your identity: --as NAME / ISLANDMAIL_AS, else the only one here. None yet (first use): make a key and have the
     # local node certify it, under a name in this host's names.
     name = name or os.environ.get("ISLANDMAIL_AS")
@@ -1037,7 +1051,7 @@ def read_node_seed(path):
     return bytes.fromhex(text)
 
 
-def owner_step(action, config, arg, body):
+def owner_step(action, config, arg, body, timeout=60):
     # A host-owner step, signed with the node key (only whoever can read it may change this node's trust).
     _, cfg, seed_file, _ = node_config(config)
     use_node(cfg)
@@ -1048,7 +1062,7 @@ def owner_step(action, config, arg, body):
     ts = canon_ts()
     statement = "islandmail-operator|v1|%s|%s|%s|%s" % (action, key, ts, arg)
     body.update(ts=ts, sig=b64u(ed25519_sign(seed, statement.encode())))
-    return http("POST", MAIL + "/api/%ss" % action, body)
+    return http("POST", MAIL + "/api/%ss" % action, body, timeout=timeout)
 
 
 def node_exe(a):
@@ -1146,7 +1160,8 @@ def cmd_invite(a):
     out = make_invite(ident, a.name, a.room, a.config, a.ttl)
     print(out["invite"])
     sys.stderr.write("islandmail: invite for %s%s, valid until %s. They run: islandmail.py join INVITE; "
-                     "you then run: islandmail.py accept REPLY with what join prints.\n"
+                     "their node then joins this one by itself (only if it cannot reach this node, join prints a reply for: "
+                     "islandmail.py accept REPLY).\n"
                      % (a.name, " (joins room %s)" % a.room if a.room else "", out["exp"]))
 
 
@@ -1158,7 +1173,8 @@ def cmd_join(a):
         use_node(node_config(config)[1])
         if not node_up():
             raise Fail("the node for %s is not running; start it with: islandmail-node run %s" % (config, config))
-    out = owner_step("join", config, a.invite.strip(), {"invite": a.invite.strip()})
+    out = owner_step("join", config, a.invite.strip(), {"invite": a.invite.strip(), "wait_s": a.wait},
+                     timeout=a.wait + 30)
     n = out["inviter"]
     notes = ["this node now trusts node %r (%s, names %s); trust file seq %d"
              % (n["name"], n["key"], ", ".join(n["names"]) or "none", out["seq"])]
@@ -1169,19 +1185,33 @@ def cmd_join(a):
                      % (json.dumps(out["relay"]["invite"]), json.dumps(out["relay"]["node"]),
                         json.dumps(out["relay"]["invite"]), config))
     # The invited name gets its key now, so the inviter's node learns it as soon as they accept.
+    ident = None
     try:
         ident = _read_identity(out["name"]) if os.path.exists(ident_path(out["name"])) else new_identity(out["name"])
         certify(ident)
     except Fail as e:
         notes.append("could not certify %s yet (%s); the first send does it" % (out["name"], e))
-    url = MAIL if MAIL != "http://127.0.0.1:8787" else ""
-    then = "islandmail.py send --to %s \"hello\"" % (out["from"] or "THEIR-AGENT")
+    url = "ISLANDMAIL_URL=%s " % MAIL if MAIL != "http://127.0.0.1:8787" else ""
+    who = out["from"] or "THEIR-AGENT"
     for line in notes:
         sys.stderr.write("islandmail: %s\n" % line)
-    sys.stderr.write("islandmail: send the line below back to the inviter (they run: islandmail.py accept REPLY). "
-                     "Then you are %s: %s%s%s\n" % (out["name"], "ISLANDMAIL_URL=%s " % url if url else "", then,
-                                                    "; you are in room %s" % out["room"] if out["room"] else ""))
-    print(out["reply"])
+    if not out["joined"]:
+        sys.stderr.write("islandmail: the inviting node could not be reached (%s). Send the line below to the inviter; "
+                         "they run: islandmail.py accept REPLY. Then you are %s: %sislandmail.py send --to %s \"hello\"\n"
+                         % (out["unreachable"], out["name"], url, who))
+        print(out["reply"])
+        return
+    print("joined as %s%s" % (out["name"], "; you're in %s once %s's client next runs (it adds you)" % (out["room"], who)
+                                            if out["room"] else ""))
+    if out["from"] and ident:
+        # One line in the inviter's inbox. Their agent's key reaches this node within seconds of the join.
+        for _ in range(30):
+            try:
+                room_post(ident, dm_id(ident["name"], out["from"]), "joined with your invite (node %s)" % node_key(), quiet=True)
+                break
+            except Fail:
+                time.sleep(1)
+    print("next: %sislandmail.py send --to %s \"hello\"" % (url, who))
 
 
 def cmd_accept(a):
@@ -1189,17 +1219,27 @@ def cmd_accept(a):
     name = out["name"]
     print("this node now trusts node %r (%s) for exactly %s; trust file seq %d"
           % (out["node"]["name"], out["node"]["key"], name, out["seq"]))
-    if not out.get("room"):
-        return
-    ident = load_identity(a.as_, create=False)
-    # Their agent's certificate arrives once the two nodes sync; private rooms need its key to share history.
-    known = None
-    for _ in range(60):
-        known = any(x["name"].lower() == name.lower() for x in api(ident, "GET", "/api/agents")["agents"])
-        if known:
-            break
-        time.sleep(1)
-    print("added %s to %s%s" % (name, out["room"], room_add(ident, out["room"], [name], grants=known)))
+    if out.get("room"):
+        complete_joins(_load_identity(a.as_, create=False), wait=60)
+
+
+def complete_joins(ident, wait=0):
+    # Nodes that joined with this agent's invites: one line each, and the invite's room add, which only this agent can
+    # sign. A private room's history needs their agent's key, which arrives once the two nodes sync.
+    for r in api(ident, "GET", "/api/invites/joined")["joined"]:
+        line = "%s joined with your invite (node %s)" % (r["name"], r["node"])
+        if r["room"]:
+            for _ in range(max(1, wait)):
+                if any(_addr(x["name"]) == _addr(r["name"]) for x in api(ident, "GET", "/api/agents")["agents"]):
+                    break
+                if wait:
+                    time.sleep(1)
+            else:
+                sys.stderr.write("islandmail: %s; they are added to %s once their key arrives\n" % (line, r["room"]))
+                continue
+            line += "; added to %s%s" % (r["room"], room_add(ident, r["room"], [r["name"]]))
+        api(ident, "POST", "/api/invites/joined", {"nonce": r["nonce"]})
+        sys.stderr.write("islandmail: %s\n" % line)
 
 
 def cmd_room_leave(a):
@@ -1924,6 +1964,7 @@ def main():
     p.add_argument("--bin", help="first join: the islandmail-node binary (default: on PATH)")
     p.add_argument("--api", default="127.0.0.1:8787", help="first join: the node's loopback API address")
     p.add_argument("--listen", metavar="HOST:PORT", help="first join: a UDP address peers can dial directly")
+    p.add_argument("--wait", type=int, default=60, help="seconds to reach the inviting node before printing a reply instead")
     p.set_defaults(fn=cmd_join)
     p = sub.add_parser("invite", help="an invite for one agent name (and optionally a room), valid 7 days")
     p.add_argument("--name", required=True, help="the one exact name this node will trust theirs for")

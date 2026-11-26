@@ -104,6 +104,8 @@ pub struct Node {
     pub outbound: mpsc::Sender<Envelope>,
     /// Wakes the periodic sync early: a newly trusted peer, or a key grant for envelopes not here yet.
     pub resync: tokio::sync::Notify,
+    /// Set once the network is up: how `join` dials an inviting node that does not trust this one yet.
+    pub dialer: Mutex<Option<crate::net::Dialer>>,
     rates: Mutex<HashMap<(String, &'static str), Vec<i64>>>,
     touched: Mutex<HashMap<String, i64>>,
     auth_seen: Mutex<HashSet<(String, &'static str)>>,
@@ -135,6 +137,7 @@ impl Node {
             events,
             outbound,
             resync: tokio::sync::Notify::new(),
+            dialer: Mutex::new(None),
             rates: Mutex::new(HashMap::new()),
             touched: Mutex::new(HashMap::new()),
             auth_seen: Mutex::new(HashSet::new()),

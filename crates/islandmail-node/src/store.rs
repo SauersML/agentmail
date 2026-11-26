@@ -315,6 +315,7 @@ impl Store {
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |c| Ok(islandmail_core::addr::addressed_to(c.get_raw(0).as_str()?, &[c.get_raw(1).as_str()?])))?;
         crate::homes::init(&db)?;
+        crate::invite::init(&db)?;
         Ok(Store { db: Mutex::new(db), _exclusive: exclusive })
     }
 
