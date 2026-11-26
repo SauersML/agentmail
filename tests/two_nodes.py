@@ -180,6 +180,15 @@ def main():
         check("node B starts", B.start())
         pa, pb = A.port, B.port
 
+        def has_peer_encryption_keys():
+            _, reply = req("GET", pa, "/api/recipients?to=all&mode=members", token("A", "alice"))
+            records = reply.get("node_encryption_keys", [])
+            actual = {r["node"]: r for r in records}
+            return all(actual.get(pub[key]) == req("GET", port, "/api/node")[1]["encryption_key"]
+                       for key, port in [("nodeA", pa), ("nodeB", pb)]) and len(actual) == 2
+        found, _ = wait_for(has_peer_encryption_keys)
+        check("senders obtain both nodes' current signed encryption records", found)
+
         # Auth, exactly like the old server.
         st, me = req("GET", pa, "/api/me", token("A", "alice"))
         check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == roster["network"], json.dumps(me))

@@ -562,6 +562,14 @@ impl Store {
         Ok(())
     }
 
+    pub fn peer_encryption_keys(&self, nodes: &[String], epoch: i64) -> Result<Vec<mailcore::node_key::NodeEncryptionKey>> {
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare("SELECT record FROM node_encryption_keys
+            WHERE node IN (SELECT value FROM json_each(?)) AND epoch=? ORDER BY node")?;
+        let rows = st.query_map(params![serde_json::to_string(nodes)?, epoch], |r| r.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
     /* Certificates, keyed by (issuing node, agent key): one node's certificate never displaces another's. */
 
     /// Ok(true) when new. A second certificate from the same node for the same key is ignored, and so is anything

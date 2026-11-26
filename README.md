@@ -122,7 +122,9 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   holds. Peers control availability and may drop or delay messages.
 
 **Node encryption key rotation.** `GET /api/node` publishes an `encryption_key` signed by the node's pinned
-identity for this network and six-hour UTC interval. The node generates independent private keys in
+identity for this network and six-hour UTC interval. Pinned peers exchange these records during sync.
+`GET /api/recipients` lists available current records for the selected nodes under `node_encryption_keys`.
+The node generates independent private keys in
 `data_dir/encryption-keys/`. It removes expired key files at startup and rotation. Set
 `encryption_key_retention_days` in `config.json` to a positive number of days (default 14).
 Backups and filesystem snapshots can retain deleted keys. Envelope v3 still uses the long-lived recipient keys.

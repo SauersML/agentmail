@@ -150,6 +150,23 @@ impl Node {
         self.encryption_key.read().unwrap().as_ref().filter(|k| k.epoch == epoch).cloned()
     }
 
+    /// Signed current-interval records for the node identities in the requested audience.
+    pub fn recipient_node_keys(&self, members: &MemberList, audience: &[PublicKey]) -> Result<Vec<mailcore::node_key::NodeEncryptionKey>> {
+        let now = now_millis();
+        let nodes: HashSet<_> = members.nodes.iter().map(|n| n.key.as_str()).collect();
+        let pins: Vec<_> = audience.iter().map(fmt_key).filter(|key| nodes.contains(key.as_str())).collect();
+        let epoch = now.div_euclid(mailcore::node_key::ROTATION_MS);
+        let mut records = self.store.peer_encryption_keys(&pins, epoch)?;
+        if let Some(own) = self.current_encryption_key().filter(|k| pins.contains(&k.node)) {
+            records.push(own);
+        }
+        for record in &records {
+            anyhow::ensure!(pins.contains(&record.node), "encryption key outside requested audience");
+            record.verify(&parse_key(&record.node)?, &members.network, now)?;
+        }
+        Ok(records)
+    }
+
     pub fn agents(&self) -> Vec<Agent> {
         self.roster.read().unwrap().clone()
     }

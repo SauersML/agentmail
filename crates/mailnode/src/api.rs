@@ -152,7 +152,8 @@ async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQu
     };
     let members = s.node.members.read().unwrap().clone();
     let keys = Node::recipients(&members, &s.node.agents(), to, &who.name, mode)?;
-    Ok(json_resp(json!({ "keys": keys.iter().map(|k| mailcore::b64u(k)).collect::<Vec<_>>() }), 200))
+    let node_keys = s.node.recipient_node_keys(&members, &keys)?;
+    Ok(json_resp(json!({ "keys": keys.iter().map(|k| mailcore::b64u(k)).collect::<Vec<_>>(), "node_encryption_keys": node_keys }), 200))
 }
 
 /// The unauthenticated POSTs take JSON only (no simple cross-site form posts) and a loopback Host (no DNS rebinding).
