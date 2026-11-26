@@ -1116,15 +1116,17 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             anyhow::Ok(())
-        }).await??;
+        }).await.context("the mail did not cross the relay")??;
         let (reader, net) = &hosts[1];
         let tok = islandmail_core::agent_token::mint(&agents[1], "a1", "agent:a1", &reader.seed.public(), islandmail_core::now_millis(), 60);
         let who = reader.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(reader.store.get(1, &who)?.unwrap().text.as_deref(), Some("relay delivery"));
+        // Peers reach each other at the trust file's relay URL, so nothing here waits for iroh to pick a home relay:
+        // that needs a net report whose one HTTP latency probe (3 s budget) answered, and a miss is retried only 20-26 s
+        // later (iroh 1.4 socket.rs new_re_stun_timer), which is what made this test time out now and then on CI.
         let remote = &net.endpoint;
-        tokio::time::timeout(Duration::from_secs(10), remote.online()).await?;
-        assert!(remote.addr().relay_urls().next().is_some());
         assert!(remote.addr().ip_addrs().next().is_none());
+        let at_relay = EndpointAddr::new(remote.id()).with_relay_url(url.parse()?);
         let peer = hosts[0].1.endpoint.connect(remote.id(), SYNC_ALPN).await?;
         let reply = call(&peer, &network, &Req::Certs).await?;
         let record = reply.encryption_key.context("peer did not publish an encryption key")?;
@@ -1142,15 +1144,17 @@ mod tests {
         hello(&hosts[0].1.endpoint, remote.id()).await?;
         // A member on the old wire format is told why, in the close reason, not silently dropped.
         let old = hosts[0].1.endpoint.connect(remote.id(), OLD_SYNC_ALPN).await?;
-        let closed = tokio::time::timeout(Duration::from_secs(10), old.closed()).await?;
+        let closed = tokio::time::timeout(Duration::from_secs(10), old.closed()).await
+            .context("no close reason for the old wire format")?;
         assert!(closed.to_string().contains("incompatible wire format"), "{closed}");
         let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
             .relay_mode(relay_mode(std::slice::from_ref(&url))?).bind().await?;
         let attempt = tokio::time::timeout(Duration::from_secs(10), async {
-            let conn = outsider.connect(remote.addr(), SYNC_ALPN).await?;
+            let conn = outsider.connect(at_relay, SYNC_ALPN).await?;
             call(&conn, &network, &Req::Days).await
-        }).await?;
-        assert!(attempt.is_err(), "an unpinned node got a sync response through the relay");
+        }).await.context("the outsider's dial was neither answered nor refused")?;
+        let refused = format!("{:#}", attempt.err().context("an unpinned node got a sync response through the relay")?);
+        assert!(refused.contains("not a member node"), "{refused}");
         outsider.close().await;
         drop(peer);
         drop(old);
