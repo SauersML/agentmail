@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -18,7 +19,17 @@ jobs:
             target: aarch64-apple-darwin
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      EXE: ${{ matrix.exe }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,21 +44,24 @@ jobs:
         run: cargo build --locked --release -p mailnode --target ${{ matrix.target }}
       - name: Exercise direct-peer mail and agent clients
         run: |
-          python3 -m venv "$RUNNER_TEMP/mail-test"
-          . "$RUNNER_TEMP/mail-test/bin/activate"
-          python -m pip install -r clients/requirements.txt 'websockets>=12,<17'
-          python tests/client_paseto.py
-          python tests/client_show.py
-          python tests/client_local.py
-          node_bin="target/${{ matrix.target }}/release/mailnode"
-          python tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
-          python tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
-          python tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
+          host_python=$(command -v python3 || command -v python)
+          "$host_python" -m venv "$RUNNER_TEMP/mail-test"
+          if [ -d "$RUNNER_TEMP/mail-test/Scripts" ]; then py="$RUNNER_TEMP/mail-test/Scripts/python"; else py="$RUNNER_TEMP/mail-test/bin/python"; fi
+          "$py" -m pip install -r clients/requirements.txt 'websockets>=12,<17'
+          "$py" tests/client_paseto.py
+          "$py" tests/client_show.py
+          "$py" tests/client_local.py
+          node_bin="target/${{ matrix.target }}/release/mailnode$EXE"
+          "$py" tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
+          "$py" tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
+          "$py" tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
       - name: Package
         run: |
           mkdir -p out
-          cp target/${{ matrix.target }}/release/mailnode out/
-          cd out && shasum -a 256 mailnode > mailnode.sha256
+          cp "target/${{ matrix.target }}/release/mailnode$EXE" out/
+          cd out
+          host_python=$(command -v python3 || command -v python)
+          "$host_python" -c 'import hashlib, sys; n = sys.argv[1]; print(hashlib.sha256(open(n, "rb").read()).hexdigest() + "  " + n)' "mailnode$EXE" > "mailnode$EXE.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mailnode-${{ matrix.target }}
