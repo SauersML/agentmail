@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to main supersedes the run before it; tag (release) and pull request runs are never cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
 jobs:
   build:
     strategy:
