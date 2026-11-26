@@ -555,7 +555,16 @@ def cmd_who(a):
     ident = load_identity(a.as_)
     q = "?prefix=" + urllib.parse.quote(a.prefix) if a.prefix else ""
     for n in api(ident, "GET", "/api/names" + q)["names"]:
-        print("%-28s %-36s last active %sZ" % (n["name"], n["sub"], n["last_active"][:16]))
+        print(who_line(n))
+
+
+EPOCH = "1970-01-01T00:00:00.000Z"
+
+
+def who_line(n):
+    # The node reports the Unix epoch for an agent that has not sent mail yet.
+    la = n["last_active"]
+    return "%-28s %-36s last active %s" % (n["name"], n["sub"], "never" if la == EPOCH else la[:16] + "Z")
 
 
 def cmd_get(a):

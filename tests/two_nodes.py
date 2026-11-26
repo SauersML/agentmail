@@ -305,7 +305,7 @@ def main():
         rc, out = im(pa, "alice", "threads")
         check("islandmail.py threads (A)", rc == 0 and "t1" in out and "t2" in out)
         rc, out = im(pa, "alice", "who")
-        check("islandmail.py who (A)", rc == 0 and "t.bob" in out)
+        check("islandmail.py who (A)", rc == 0 and "t.bob" in out and "1970-01-01" not in out, out)
         rc, out = im(pb, "bob", "read", "--to-me", "--thread", "t1")
         check("islandmail.py read --to-me (B)", rc == 0 and "hello from A" in out)
 

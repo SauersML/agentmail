@@ -381,7 +381,8 @@ impl Conn {
                     .iter()
                     .map(|r| {
                         let la = r["last_active"].as_str().unwrap_or("");
-                        format!("{} [{}] last active {}Z", r["name"].as_str().unwrap_or(""), r["sub"].as_str().unwrap_or(""), &la[..la.len().min(16)])
+                        let la = if la == "1970-01-01T00:00:00.000Z" { "never".to_string() } else { format!("{}Z", &la[..la.len().min(16)]) };
+                        format!("{} [{}] last active {la}", r["name"].as_str().unwrap_or(""), r["sub"].as_str().unwrap_or(""))
                     })
                     .collect::<Vec<_>>()
                     .join("\n"))

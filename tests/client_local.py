@@ -46,3 +46,8 @@ sys.argv = ["islandmail.py", "ask", "--private", "--to", "t.bob", "a question"]
 im.main()
 assert seen and seen[0].private and seen[0].to == "t.bob", seen
 print("ok: ask --private")
+
+# who: an agent that has not sent mail yet shows "never", not the Unix epoch.
+assert im.who_line({"name": "t.new", "sub": "agent:t.new", "last_active": "1970-01-01T00:00:00.000Z"}).endswith("last active never")
+assert im.who_line({"name": "t.old", "sub": "agent:t.old", "last_active": "2026-11-25T10:20:30.000Z"}).endswith("last active 2026-11-25T10:20Z")
+print("ok: who shows never for agents with no mail yet")
