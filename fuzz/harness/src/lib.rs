@@ -2,30 +2,8 @@
 //! file and nodes on temporary stores. Shared by the fuzz targets and the protocol property tests.
 #![allow(dead_code, unused_imports, unused_variables, unused_mut, clippy::all)]
 
-#[path = "../../../crates/islandmail-node/src/api.rs"]
-pub mod api;
-#[path = "../../../crates/islandmail-node/src/config.rs"]
-pub mod config;
-#[path = "../../../crates/islandmail-node/src/encryption_keys.rs"]
-pub mod encryption_keys;
-#[path = "../../../crates/islandmail-node/src/homes.rs"]
-pub mod homes;
-#[path = "../../../crates/islandmail-node/src/invite.rs"]
-pub mod invite;
-#[path = "../../../crates/islandmail-node/src/mcpl.rs"]
-pub mod mcpl;
-#[path = "../../../crates/islandmail-node/src/migrate.rs"]
-pub mod migrate;
-#[path = "../../../crates/islandmail-node/src/net.rs"]
-pub mod net;
-#[path = "../../../crates/islandmail-node/src/node.rs"]
-pub mod node;
-#[path = "../../../crates/islandmail-node/src/private_fs.rs"]
-pub mod private_fs;
-#[path = "../../../crates/islandmail-node/src/store.rs"]
-pub mod store;
-#[path = "../../../crates/islandmail-node/src/ui.rs"]
-pub mod ui;
+// Every module the node declares in its main.rs (see build.rs), each at its source file.
+include!(concat!(env!("OUT_DIR"), "/node_modules.rs"));
 
 pub mod world;
 
