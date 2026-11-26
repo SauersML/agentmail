@@ -97,7 +97,7 @@ def main():
         check("MCPL 0.5 featureSets/update grant arrives", got, line)
         check("grant gives full mode (push enabled)", bool(got) and "full" in line.rsplit("->", 1)[-1], line)
         st, r = req("POST", api, "/api/messages", tok_alice, {"to": "t.hostagent", "thread": "hosttest", "text": "ping from alice: kumquat-7"})
-        mid = r.get("message", {}).get("id")
+        mid = r.get("message", {}).get("seq")
         check("alice posts to the agent", st == 201, "#%s" % mid)
         got, dt = wait_for(lambda: grep(nlog, "push of #%s accepted" % mid), timeout=60, every=1)
         check("node pushes push/event and the host accepts it", got, "%.1fs" % dt)

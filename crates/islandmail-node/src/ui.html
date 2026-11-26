@@ -126,6 +126,8 @@ li.gone .mini { background: var(--border-strong); }
 .at.me { background: var(--accent); color: var(--on-accent); }
 .event { text-align: center; color: var(--muted); font-size: 13px; padding: 6px 20px; overflow-wrap: anywhere; }
 .event .name { font-weight: 600; }
+.msg.reply .body { padding-left: 14px; border-left: 2px solid var(--border); }
+.re { font-size: 12px; color: var(--muted); margin: 1px 0 2px; }
 .quote { border-left: 2px solid var(--border-strong); padding: 1px 10px; margin: 3px 0 5px; color: var(--muted); font-size: 13.5px; cursor: pointer; border-radius: 0 6px 6px 0; }
 .quote:hover { background: var(--hover); }
 .quote .qf { font-weight: 600; font-size: 12.5px; }
@@ -387,9 +389,10 @@ function buildNodes(arr, prev) {
       const meta = el('div', 'meta'), t = el('span', 'time num', rel(m.ts));
       t.dataset.ts = m.ts; t.title = abs(m.ts); meta.append(nameEl(m.from), t); body.append(meta);
     }
+    if (m.reply_to) { row.classList.add('reply'); body.append(el('div', 're num', '↳ re ' + m.reply_to)); }
     if (m.quote) {
       const q = el('div', 'quote'); q.title = 'Jump to quoted message';
-      q.append(el('div', 'qf', '↩ ' + (m.quote.from || '')), el('div', 'qt', m.quote.text || ''));
+      q.append(el('div', 'qf', (m.quote.from || '')), el('div', 'qt', m.quote.text || ''));
       q.onclick = () => jumpTo(m.quote.id); body.append(q);
     }
     if (m.text) { const tx = el('div', 'text'); renderText(tx, m.text); body.append(tx); }
@@ -424,7 +427,7 @@ function buildFiles(files) {
   return box;
 }
 function jumpTo(id) {
-  const t = listEl && listEl.querySelector('[data-id="' + Number(id) + '"]');
+  const t = listEl && listEl.querySelector('[data-id="' + String(id).replace(/[^a-z0-9]/g, '') + '"]');
   if (!t) return;
   t.scrollIntoView({ block: 'center', behavior: 'smooth' });
   t.classList.remove('flash'); void t.offsetWidth; t.classList.add('flash');
@@ -435,22 +438,41 @@ function rerender() {
 }
 function ingest(arr) {
   const fresh = [];
-  for (const m of arr || []) if (!S.byId.has(m.id)) { S.byId.set(m.id, m); fresh.push(m); }
+  for (const m of arr || []) {
+    S.maxSeq = Math.max(S.maxSeq || 0, m.seq || 0);
+    if (!S.byId.has(m.env)) { S.byId.set(m.env, m); fresh.push(m); }
+  }
   return fresh;
+}
+// The node's display order (islandmail-core order.rs): signed time (clamped to 5 min after receipt: order_ts), ties by
+// hash, each reply right under its parent and that parent's earlier replies.
+function displayOrder(arr) {
+  const at = m => (m.order_ts || m.ts) + ' ' + m.env, cmp = (a, b) => (at(a) < at(b) ? -1 : at(a) > at(b) ? 1 : 0);
+  const byShort = new Map(arr.map(m => [m.id, m])), kids = new Map(), roots = [];
+  for (const m of arr) {
+    const p = m.reply_to && byShort.get(m.reply_to);
+    if (p && p !== m) { if (!kids.has(p.env)) kids.set(p.env, []); kids.get(p.env).push(m); } else roots.push(m);
+  }
+  roots.sort(cmp); for (const k of kids.values()) k.sort(cmp);
+  const out = [], seen = new Set();
+  const walk = r => { const st = [r]; while (st.length) { const m = st.pop(); if (seen.has(m.env)) continue; seen.add(m.env); out.push(m);
+    const k = kids.get(m.env); if (k) for (let i = k.length - 1; i >= 0; i--) st.push(k[i]); } };
+  roots.forEach(walk); arr.filter(m => !seen.has(m.env)).sort(cmp).forEach(walk);
+  return out;
 }
 const qs = o => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
 
 async function selectRoom(id) {
   if (!id) return;
   const token = ++S.token;
-  S.cur = id; S.info = null; S.msgs = []; S.byId = new Map(); S.more = false; S.loaded = false; S.pinned = true;
+  S.cur = id; S.info = null; S.msgs = []; S.byId = new Map(); S.maxSeq = 0; S.more = false; S.loaded = false; S.pinned = true;
   history.replaceState(null, '', location.pathname + location.search + '#room=' + encodeURIComponent(id));
   appEl.classList.add('show-room'); renderRooms(); buildPane();
   listEl.append(el('div', 'placeholder', 'Loading…'));
   try {
     const j = await api('/ui/api/messages?' + qs({ room: id, limit: PAGE }));
     if (token !== S.token) return;
-    S.info = j.room || null; S.msgs = ingest(j.messages); S.more = !!j.more; S.loaded = true;
+    S.info = j.room || null; S.msgs = displayOrder(ingest(j.messages)); S.more = !!j.more; S.loaded = true;
     buildPane(); rerender(); toBottom(); S.pinned = true;
   } catch (e) {
     if (token === S.token && listEl) listEl.replaceChildren(el('div', 'placeholder', 'Could not load this room.'));
@@ -465,10 +487,10 @@ async function loadEarlier() {
   if (!S.loaded || !S.msgs.length) return;
   const token = S.token; moreBtn.disabled = true; moreBtn.textContent = 'Loading…';
   try {
-    const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: PAGE, before: S.msgs[0].id }));
+    const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: PAGE, before: S.msgs[0].seq }));
     if (token !== S.token) return;
     const fresh = ingest(j.messages), oldH = scrollEl.scrollHeight, oldTop = scrollEl.scrollTop;
-    S.msgs = fresh.concat(S.msgs).sort((a, b) => a.id - b.id); S.more = !!j.more;
+    S.msgs = displayOrder(fresh.concat(S.msgs)); S.more = !!j.more;
     rerender(); scrollEl.scrollTop = scrollEl.scrollHeight - oldH + oldTop;
   } catch (e) {} finally { if (moreBtn) { moreBtn.disabled = false; moreBtn.textContent = 'Load earlier messages'; } }
 }
@@ -477,8 +499,7 @@ async function pollRoom() {
   const token = S.token;
   try {
     for (let round = 0; round < 5; round++) {
-      const last = S.msgs.length ? S.msgs[S.msgs.length - 1].id : 0;
-      const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: 100, after: last }));
+      const j = await api('/ui/api/messages?' + qs({ room: S.cur, limit: 100, since: S.maxSeq || 0 }));
       if (token !== S.token) return;
       if (j.room) {
         const before = JSON.stringify(S.info); S.info = j.room;
@@ -486,10 +507,10 @@ async function pollRoom() {
       }
       const fresh = ingest(j.messages);
       if (fresh.length) {
-        const pin = nearBottom(), prev = S.msgs[S.msgs.length - 1] || null;
-        S.msgs = S.msgs.concat(fresh);
-        listEl.append(buildNodes(fresh, prev));
-        if (pin) toBottom();
+        const pin = nearBottom(), top = scrollEl.scrollTop;
+        S.msgs = displayOrder(S.msgs.concat(fresh));
+        rerender();
+        if (pin) toBottom(); else scrollEl.scrollTop = top;
       }
       if (!j.more) break;
     }

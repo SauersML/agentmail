@@ -105,6 +105,8 @@ pub struct Row {
     /// ",name,name," of the agents mentioned.
     pub mentions: Option<String>,
     pub reply_to: Option<String>,
+    /// When this node received the envelope (ms).
+    pub received: i64,
 }
 
 /// Room fields of a row, from its decrypted body.
@@ -160,7 +162,7 @@ impl Row {
         let text = self.text.clone().unwrap_or_default();
         let shown = text.chars().count() as i64;
         let mut m = json!({
-            "id": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
+            "id": islandmail_core::short_id(&self.env_id), "seq": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
             "text": text, "files": public_files(&self.files),
             "len": self.len, "sub": self.sender_sub, "verified": true,
             "env": self.env_id, "mode": self.mode, "kind": self.kind,
@@ -176,7 +178,12 @@ impl Row {
             m["mentions"] = json!(meta.mentions);
         }
         if let Some(r) = &meta.reply_to {
-            m["reply_to"] = json!(r);
+            m["reply_to"] = json!(islandmail_core::short_id(r));
+        }
+        let at = islandmail_core::parse_ts(&self.ts).map(|t| islandmail_core::order::display_ms(t, self.received));
+        if let Some(at) = at.filter(|&at| islandmail_core::ts_from_millis(at) != self.ts) {
+            // Dated more than 5 minutes after it arrived here: sorted at that bound instead.
+            m["order_ts"] = json!(islandmail_core::ts_from_millis(at));
         }
         if let Some(e) = &meta.event {
             m["event"] = serde_json::to_value(e).unwrap_or_default();
@@ -212,7 +219,7 @@ const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode,
                     length(text) AS len, files, readers, \
                     (SELECT group_concat(k) FROM (SELECT rtrim(value->>'to', '=') AS k FROM json_each(env, '$.keys') \
                      UNION SELECT key FROM grants WHERE grants.env_id = messages.env_id)), \
-                    kind, meta, mentions, reply_to";
+                    kind, meta, mentions, reply_to, received";
 
 /// A viewer sees a row its node can read, whose content key was wrapped to the viewer's key (in the envelope or
 /// in a key grant), private rows only when addressed to it; never a key grant itself.
@@ -242,6 +249,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         meta: r.get(14)?,
         mentions: r.get(15)?,
         reply_to: r.get(16)?,
+        received: r.get(17)?,
     })
 }
 
@@ -422,6 +430,13 @@ impl Store {
         Ok(db.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| r.get(0))?)
     }
 
+    #[cfg(test)]
+    pub fn set_received(&self, env_id: &str, ms: i64) -> Result<()> {
+        self.db.lock().unwrap().execute("UPDATE messages SET received = ? WHERE env_id = ?", params![ms, env_id])?;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn get(&self, id: i64, viewer: &Caller) -> Result<Option<Row>> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
@@ -494,7 +509,7 @@ impl Store {
     pub fn thread_rows(&self, viewer: &Caller, limit: i64) -> Result<Vec<serde_json::Value>> {
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(&format!(
-            "SELECT m.thread, t.n, m.id, m.ts, m.sender, m.recipient, substr(m.text, 1, 300) AS snippet
+            "SELECT m.thread, t.n, m.id, m.ts, m.sender, m.recipient, substr(m.text, 1, 300) AS snippet, m.env_id
              FROM (SELECT thread, COUNT(*) AS n, MAX(id) AS last FROM messages WHERE {} GROUP BY thread) t
              JOIN messages m ON m.id = t.last ORDER BY m.id DESC LIMIT ?",
             visible_sql()
@@ -502,7 +517,8 @@ impl Store {
         let rows = st
             .query_map(params![format!(",{},", norm(&viewer.name)), viewer.key, viewer.key, limit], |r| {
                 Ok(json!({
-                    "thread": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "id": r.get::<_, i64>(2)?,
+                    "thread": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "seq": r.get::<_, i64>(2)?,
+                    "id": islandmail_core::short_id(&r.get::<_, String>(7)?),
                     "ts": r.get::<_, String>(3)?, "sender": r.get::<_, String>(4)?,
                     "recipient": r.get::<_, String>(5)?, "snippet": r.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 }))
@@ -511,18 +527,22 @@ impl Store {
         Ok(rows)
     }
 
-    /// Sort lightweight graph metadata first, then load a page of visible bodies in causal order.
+    /// Sort lightweight metadata first, then load a page of visible bodies in display order (`islandmail_core::order`);
+    /// `after` and `before` are local seq numbers of messages in that order.
     pub fn thread_causal(&self, thread: &str, viewer: &Caller, q: &Query, text_cap: i64) -> Result<(Vec<Row>, bool)> {
         let db = self.db.lock().unwrap();
-        let mut graph = db.prepare("SELECT id, env_id, ts, parents FROM messages WHERE thread=?")?;
+        let mut graph = db.prepare("SELECT id, env_id, ts, received, reply_to FROM messages WHERE thread=?")?;
         let mut nodes = Vec::new();
         let mut records = graph.query([thread])?;
         while let Some(r) = records.next()? {
-            let parents: Vec<String> = serde_json::from_str(r.get_ref(3)?.as_str()?)?;
-            nodes.push((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, parents));
+            let ts: String = r.get(2)?;
+            let at = islandmail_core::order::display_ms(islandmail_core::parse_ts(&ts).unwrap_or(0), r.get(3)?);
+            nodes.push((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, at, r.get::<_, Option<String>>(4)?));
         }
-        let items: Vec<_> = nodes.iter().map(|(_, id, ts, parents)| islandmail_core::order::Item { id, ts, parents }).collect();
-        let mut order = islandmail_core::order::thread_order(&items);
+        let items: Vec<_> = nodes.iter()
+            .map(|(_, id, at, reply_to)| islandmail_core::order::Item { id, at: *at, reply_to: reply_to.as_deref() })
+            .collect();
+        let mut order = islandmail_core::order::room_order(&items);
         let position = |id| order.iter().position(|&i| nodes[i].0 == id);
         let start = q.after.filter(|&id| id != 0).map_or(0, |id| position(id).map_or(order.len(), |i| i + 1));
         let end = q.before.map_or(order.len(), |id| position(id).unwrap_or(0));
@@ -878,7 +898,7 @@ impl Store {
                     (SELECT COUNT(*) FROM messages u WHERE u.thread = m.thread AND instr(u.mentions, ?) > 0 AND u.id > COALESCE(
                         (SELECT last_id FROM room_reads WHERE viewer = ? AND thread = m.thread), 0)
                         AND u.sender_sub != ? AND u.id IN (SELECT id FROM messages WHERE thread = m.thread AND {vis})),
-                    m.kind
+                    m.kind, m.env_id
              FROM (SELECT thread, COUNT(*) AS n, MAX(id) AS last, json_group_array(DISTINCT sender) AS senders
                    FROM messages WHERE {vis} GROUP BY thread) t
              JOIN messages m ON m.id = t.last ORDER BY m.id DESC LIMIT ?", vis = visible_sql()))?;
@@ -886,7 +906,8 @@ impl Store {
         let rows = st
             .query_map(params![k, viewer.sub, name, k, k, name, k, viewer.sub, name, k, k, name, k, k, limit], |r| {
                 Ok(json!({
-                    "room": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "id": r.get::<_, i64>(2)?,
+                    "room": r.get::<_, String>(0)?, "n": r.get::<_, i64>(1)?, "seq": r.get::<_, i64>(2)?,
+                    "id": islandmail_core::short_id(&r.get::<_, String>(10)?),
                     "ts": r.get::<_, String>(3)?, "sender": r.get::<_, String>(4)?,
                     "snippet": r.get::<_, Option<String>>(5)?.unwrap_or_default(),
                     "senders": serde_json::from_str::<serde_json::Value>(&r.get::<_, String>(6)?).unwrap_or(json!([])),
@@ -912,6 +933,26 @@ impl Store {
         db.execute("INSERT INTO room_reads (viewer, thread, last_id) VALUES (?, ?, ?) ON CONFLICT(viewer, thread) \
                     DO UPDATE SET last_id = MAX(last_id, excluded.last_id)", params![viewer.key, thread, id])?;
         Ok(())
+    }
+
+    /// Visible rows whose shared id starts with `prefix` (or whose envelope hash is `prefix`), at most `limit`.
+    pub fn by_prefix(&self, prefix: &str, viewer: &Caller, limit: usize) -> Result<Vec<Row>> {
+        let prefix = prefix.trim().to_ascii_lowercase();
+        let (lo, hi) = if islandmail_core::envelope::is_id(&prefix) {
+            (prefix.clone(), prefix)
+        } else {
+            match islandmail_core::id_prefix_range(&prefix) {
+                Some(r) => r,
+                None => return Ok(Vec::new()),
+            }
+        };
+        let db = self.db.lock().unwrap();
+        let mut st = db.prepare(&format!(
+            "SELECT {COLS} FROM messages WHERE env_id >= ? AND env_id <= ? AND {} ORDER BY env_id LIMIT ?", visible_sql()))?;
+        let rows = st.query_map(params![MAX_TEXT, lo, hi, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key, limit as i64],
+                                read_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// The visible row of an envelope (for quotes and replies).

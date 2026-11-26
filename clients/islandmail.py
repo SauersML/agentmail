@@ -23,7 +23,7 @@ it; nothing else to set up.
   python3 islandmail.py room send hypha/plan "@ops.orchestrator ready?"     (@name wakes that agent)
   python3 islandmail.py room read hypha/plan     |  room add / leave / remove / topic / watch --mentions
   python3 islandmail.py dm hypha "hi"            # the private room of the two of you
-  python3 islandmail.py reply 4711 "agreed"      # in that message's room, same privacy, quoting it
+  python3 islandmail.py reply k3vq7d2a "agreed"  # in that message's room, same privacy, quoting it (--dm: its author alone)
   python3 islandmail.py ui                       # a link to the read-only room view in a browser
 
   python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
@@ -576,8 +576,9 @@ def _addr(s):
 
 
 def for_me(m, name):
-    # Mail addressed to the name (or all), a DM to it, or a room post that @mentions it.
-    return addressed_to(m["to"], name) or _addr(name) in [_addr(x) for x in m.get("mentions") or []]
+    # Mail addressed to the name (or all), a DM to it, a room post that @mentions it, or a reply to its message.
+    return addressed_to(m["to"], name) or _addr(name) in [_addr(x) for x in m.get("mentions") or []] \
+        or _addr((m.get("quote") or {}).get("from") or "") == _addr(name)
 
 
 def addressed_to(to, name):
@@ -610,16 +611,21 @@ def show(m, out=sys.stdout):
     where = "thread \"%s\"" % _one_line(m["thread"])
     if m.get("room"):
         where = "room \"%s\"" % _one_line(m["room"])
-    q = m.get("quote")
-    if q:
-        where += ", replying to #%d from %s" % (q["id"], _one_line(q["from"]))
-        text = "\n".join("| " + line for line in _BREAKS.split(q["text"])[:3]) + "\n" + text
-    elif m.get("reply_to"):
-        where += ", replying to a message you cannot see"
     body = "\n".join("> " + _one_line(line) for line in _BREAKS.split(text))
-    out.write("#%d %sZ from %s to %s, %s:\n%s\n\n" % (
-        m["id"], _one_line(m["ts"][:16]), sender, _one_line(m["to"]), where, body))
+    out.write("%s %sZ from %s to %s, %s:\n%s%s\n\n" % (
+        _one_line(m["id"]), _one_line(m["ts"][:16]), sender, _one_line(m["to"]), where, reply_lines(m), body))
     out.flush()
+
+
+def reply_lines(m, quoted=3):
+    # The mailbox's own lines for a reply: "↳ re ID" and a short quote of the original (when you can read it).
+    if not m.get("reply_to"):
+        return ""
+    q = m.get("quote")
+    if not q:
+        return "\u21b3 re %s (a message you cannot read)\n" % _one_line(m["reply_to"])
+    out = "\u21b3 re %s from %s\n" % (_one_line(m["reply_to"]), _one_line(q["from"]))
+    return out + "".join("  | %s\n" % _one_line(l) for l in _BREAKS.split(q["text"])[:quoted])
 
 
 # ---- commands ----
@@ -691,7 +697,7 @@ def cmd_selftoken(a):
 def cmd_whoami(a):
     ident = load_identity(a.as_)
     me = api(ident, "GET", "/api/me")
-    print("%s (%s) on %s; mailbox at %s, last message #%d" % (me["name"], me["sub"], me["island"], MAIL, me["last_id"]))
+    print("%s (%s) on %s; mailbox at %s" % (me["name"], me["sub"], me["island"], MAIL))
 
 
 def cmd_send(a):
@@ -762,7 +768,7 @@ def send(ident, a):
     r = api(ident, "POST", "/api/messages", body)
     m = r["message"]
     reaches = r.get("reaches")
-    print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(reaches, m["to"])), flush=True)
+    print("sent %s to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(reaches, m["to"])), flush=True)
     m["reaches"] = reaches
     return m
 
@@ -852,7 +858,7 @@ def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=Fa
     if not quiet:
         who = r.get("reaches") or []
         note = (" for " + ", ".join(who[:12]) + (" and %d more" % (len(who) - 12) if len(who) > 12 else "")) if who else ""
-        print("posted #%d in %s%s" % (m["id"], room_label(ident, room), note), flush=True)
+        print("posted %s in %s%s" % (m["id"], room_label(ident, room), note), flush=True)
     return m
 
 
@@ -899,7 +905,7 @@ def cmd_room_create(a):
     if with_:
         text += " with " + ", ".join("@" + w for w in with_)
     m = room_post(ident, room, text, event=event, quiet=True)
-    print("created %s room %s (#%d)%s" % ("private" if a.private else "open", room, m["id"],
+    print("created %s room %s (%s)%s" % ("private" if a.private else "open", room, m["id"],
                                          "; members: " + ", ".join([ident["name"]] + with_) if a.private else ""))
 
 
@@ -964,7 +970,11 @@ def cmd_room_send(a):
 
 
 def message(ident, mid):
-    return api(ident, "GET", "/api/messages/%d" % mid)["message"]
+    # Any unique prefix of a message's id (or its full envelope hash).
+    mid = mid.strip().lower()
+    if not re.fullmatch(r"[a-z2-7]{1,52}|[0-9a-f]{64}", mid):
+        raise Fail("a message id is letters a-z and digits 2-7 (any unique prefix of it), e.g. %s" % "k3vq7d2a")
+    return api(ident, "GET", "/api/messages/" + mid)["message"]
 
 
 def show_room_header(ident, info):
@@ -979,21 +989,17 @@ def show_room_header(ident, info):
 
 
 def show_compact(m, me, out=sys.stdout):
-    # One room message: a header line the mailbox writes (number, sender, age, reply), then the sender's lines quoted.
+    # One room message: a header line the mailbox writes (id, sender, age, reply), then the sender's lines quoted.
     if m.get("kind") == "event":
-        out.write("#%d — %s %s · %s\n" % (m["id"], _one_line(m["from"]), _one_line(m["text"]), ago(m["ts"])))
+        out.write("%s — %s %s · %s\n" % (_one_line(m["id"]), _one_line(m["from"]), _one_line(m["text"]), ago(m["ts"])))
         return
-    head = "#%d %s · %s" % (m["id"], _one_line(m["from"]), ago(m["ts"]))
+    head = "%s %s · %s" % (_one_line(m["id"]), _one_line(m["from"]), ago(m["ts"]))
     if _addr(me) in [_addr(x) for x in m.get("mentions") or []]:
         head += " · mentions you"
     lines = _BREAKS.split(m["text"])
-    q = m.get("quote")
-    if q:
-        head += " · replying to #%d %s" % (q["id"], _one_line(q["from"]))
-        lines = ["| " + l for l in _BREAKS.split(q["text"])[:2]] + lines
     for f in m.get("files") or []:
         lines.append("[attachment: %s (%d bytes, id %s)]" % (f["name"], f["size"], f["id"]))
-    out.write(head + "\n" + "\n".join("> " + _one_line(l) for l in lines) + "\n")
+    out.write(head + "\n" + reply_lines(m, 2) + "\n".join("> " + _one_line(l) for l in lines) + "\n")
     out.flush()
 
 
@@ -1012,7 +1018,7 @@ def cmd_room_read(a):
         if not msgs:
             print("(no messages you can read yet)")
     if msgs:
-        api(ident, "POST", "/api/room-read", {"room": room, "id": max(m["id"] for m in msgs)})
+        api(ident, "POST", "/api/room-read", {"room": room, "seq": max(m["seq"] for m in msgs)})
 
 
 def cmd_room_info(a):
@@ -1050,10 +1056,16 @@ def cmd_dm(a):
 
 
 def cmd_reply(a):
-    # Answer a message where it was said: its room, the same privacy, quoting it.
+    # Answer a message where it was said: its room, the same privacy (never wider), quoting it. --dm answers its author
+    # alone, in your DM room.
     ident = load_identity(a.as_)
     m = message(ident, a.id)
     text = norm_text(sys.stdin.read() if a.text == "-" else a.text)
+    if a.dm:
+        if _addr(m["from"]) == _addr(ident["name"]):
+            raise Fail("that is your own message; --dm answers its author")
+        room_post(ident, dm_id(ident["name"], m["from"]), text, a.file, reply_to=m["env"])
+        return
     if m.get("room") or m["thread"].startswith("dm:"):
         room_post(ident, m["thread"], text, a.file, reply_to=m["env"])
         return
@@ -1073,7 +1085,7 @@ def cmd_reply(a):
     if m["mode"] == "private":
         body["mode"] = "private"
     r = api(ident, "POST", "/api/messages", body)["message"]
-    print("replied #%d to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
+    print("replied %s to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
 
 
 def cmd_ui(a):
@@ -1087,7 +1099,7 @@ def cmd_room_watch(a):
     # Print the room's new messages as they arrive (with --mentions, only those that @mention you).
     ident = load_identity(a.as_)
     room = room_id(ident, a.name)
-    after = api(ident, "GET", "/api/me")["last_id"]
+    after = api(ident, "GET", "/api/me")["last_seq"]
     delay = 1
     while True:
         try:
@@ -1097,7 +1109,7 @@ def cmd_room_watch(a):
             with _opener.open(req, timeout=90) as r:
                 delay = 1
                 for m in stream_messages(r):
-                    after = max(after, m["id"])
+                    after = max(after, m["seq"])
                     if m["thread"] != room or m["from"] == ident["name"]:
                         continue
                     if a.mentions and _addr(ident["name"]) not in [_addr(x) for x in m.get("mentions") or []]:
@@ -1126,7 +1138,7 @@ def cmd_ask(a):
     # Use the canonical recipient returned by the node.
     if len(sent.get("reaches") or []) == 1:
         to = _addr(sent["reaches"][0])
-    deadline, delay, after = time.monotonic() + a.wait, 3, sent["id"]
+    deadline, delay, after = time.monotonic() + a.wait, 3, sent["seq"]
     while time.monotonic() < deadline:
         path = "/api/messages?" + urllib.parse.urlencode({"from": to, "after": after, "limit": 20})
         page = api(ident, "GET", path, timeout=max(0.1, deadline - time.monotonic()))
@@ -1137,13 +1149,13 @@ def cmd_ask(a):
                 show(m)
             return
         if msgs:
-            after = msgs[-1]["id"]
+            after = msgs[-1]["seq"]
             if page.get("more"):
                 continue
         time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
         delay = min(delay * 1.5, 20)
-    sys.stderr.write("islandmail: no answer from %s within %d s; it may still reply: read --from %s --after %d\n" % (
-        to, a.wait, to, sent["id"]))
+    sys.stderr.write("islandmail: no answer from %s within %d s; it may still reply: read --from %s --latest 5\n" % (
+        to, a.wait, to))
     sys.exit(3)
 
 
@@ -1153,6 +1165,8 @@ def query(a):
         v = getattr(a, k.replace("from", "from_"), None)
         if v is not None:
             q[k] = v
+    if a.thread is not None and not (a.to_me or a.from_ or a.to or a.q):
+        q["order"] = "causal"  # one room: the display order (by time, replies under their parent)
     return "/api/messages?" + urllib.parse.urlencode(q)
 
 
@@ -1192,7 +1206,7 @@ def advance_watch_cursor(ident, a, msgs):
         cursor = read_cursor(path)
     except FileNotFoundError:
         return
-    ids = [m["id"] for m in msgs]
+    ids = [m["seq"] for m in msgs]
     start, newest = (a.after if a.after is not None else min(ids)), max(ids)
     if start <= cursor < newest:
         write_private(path, str(newest))
@@ -1201,7 +1215,7 @@ def advance_watch_cursor(ident, a, msgs):
 def cmd_threads(a):
     ident = load_identity(a.as_)
     for t in api(ident, "GET", "/api/threads")["threads"][: a.limit]:
-        print("%-28s %4d msgs  last #%d %sZ from %s" % (_one_line(t["thread"][:28]), t["n"], t["id"], t["ts"][:16], t["sender"]))
+        print("%-28s %4d msgs  last %s %sZ from %s" % (_one_line(t["thread"][:28]), t["n"], t["id"], t["ts"][:16], t["sender"]))
 
 
 def cmd_who(a):
@@ -1222,18 +1236,30 @@ def who_line(n):
 
 def cmd_get(a):
     ident = load_identity(a.as_)
-    msgs = api(ident, "GET", "/api/messages?after=%d&limit=1" % (a.id - 1))["messages"]
-    if not msgs or msgs[0]["id"] != a.id:
-        raise Fail("no message #%d" % a.id)
-    show(msgs[0])
+    m = message(ident, a.id)
+    if a.json:
+        print(json.dumps(m, indent=1))
+    else:
+        show(m)
 
 
 def cmd_download(a):
     ident = load_identity(a.as_)
-    if not re.fullmatch(r"[a-f0-9]{64}", a.file_id):
-        raise Fail("file_id must be a lowercase 64-digit content hash")
-    data = api(ident, "GET", "/api/files/%s?download=1" % a.file_id, raw=True, timeout=300)
-    out = a.o or a.file_id
+    # A file's content hash, or a message id (any unique prefix) with ":N" or ":NAME" when it has several attachments.
+    ref, name = a.file_id, None
+    if not re.fullmatch(r"[a-f0-9]{64}", ref):
+        mid, _, pick = ref.partition(":")
+        files = message(ident, mid).get("files") or []
+        if pick:
+            chosen = [f for i, f in enumerate(files, 1) if pick == str(i) or pick == f["name"]]
+        else:
+            chosen = files if len(files) == 1 else []
+        if len(chosen) != 1:
+            raise Fail("message %s has %d attachments; name one: %s" % (mid, len(files), ", ".join(
+                "%s:%d (%s)" % (mid, i, _one_line(f["name"])) for i, f in enumerate(files, 1)) or "none"))
+        ref, name = chosen[0]["id"], os.path.basename(_one_line(chosen[0]["name"])) or None
+    data = api(ident, "GET", "/api/files/%s?download=1" % ref, raw=True, timeout=300)
+    out = a.o or name or ref
     write_private(out, data, create=True, create_dirs=False)
     print("saved %d bytes to %s" % (len(data), out))
 
@@ -1246,7 +1272,7 @@ def stream_messages(response):
             raise HTTPException("incomplete watch event")
         if line.startswith(b"data: "):
             message = json.loads(line[6:])
-            if not isinstance(message, dict) or type(message.get("id")) is not int or not 0 < message["id"] < 2**63:
+            if not isinstance(message, dict) or type(message.get("seq")) is not int or not 0 < message["seq"] < 2**63:
                 raise Fail("invalid watch event id")
             yield message
 
@@ -1256,12 +1282,12 @@ def cmd_watch(a):
     hooks = arrival_hooks(a)
     resume = watch_cursor(ident, a.name)
     if a.from_now:
-        write_private(resume, str(api(ident, "GET", "/api/me")["last_id"]))
+        write_private(resume, str(api(ident, "GET", "/api/me")["last_seq"]))
     while True:
         try:
             after = read_cursor(resume)
         except FileNotFoundError:
-            after = api(ident, "GET", "/api/me")["last_id"]
+            after = api(ident, "GET", "/api/me")["last_seq"]
             try:
                 write_private(resume, str(after), create=True)
             except FileExistsError:
@@ -1278,7 +1304,7 @@ def cmd_watch(a):
                 delay = 1
                 certified = False
                 for m in stream_messages(r):
-                    if m["id"] <= after:
+                    if m["seq"] <= after:
                         continue
                     own = m["from"] == ident["name"]
                     print_it = not (own and (a.skip_own or a.mine)) and (
@@ -1288,7 +1314,7 @@ def cmd_watch(a):
                         show(m)
                         for hook in hooks:
                             hook(ident, m)
-                    after = m["id"]
+                    after = m["seq"]
                     write_private(resume, str(after))
                     if print_it and a.until:
                         return
@@ -1338,11 +1364,11 @@ def arrival_hooks(a):
             try:
                 r = subprocess.run(argv, input=json.dumps(p).encode(), env=env, timeout=HOOK_TIMEOUT)
                 if r.returncode:
-                    sys.stderr.write("watch: --exec exited %d for #%d\n" % (r.returncode, m["id"]))
+                    sys.stderr.write("watch: --exec exited %d for %s\n" % (r.returncode, m["id"]))
             except subprocess.TimeoutExpired:
-                sys.stderr.write("watch: --exec still running after %d s for #%d; stopped it\n" % (HOOK_TIMEOUT, m["id"]))
+                sys.stderr.write("watch: --exec still running after %d s for %s; stopped it\n" % (HOOK_TIMEOUT, m["id"]))
             except OSError as e:
-                sys.stderr.write("watch: --exec failed for #%d: %s\n" % (m["id"], e))
+                sys.stderr.write("watch: --exec failed for %s: %s\n" % (m["id"], e))
         hooks.append(run_exec)
     if a.post:
         url = urllib.parse.urlsplit(a.post)
@@ -1365,7 +1391,7 @@ def arrival_hooks(a):
             try:
                 http("POST", a.post, json.dumps(hook_payload(ident, m)).encode(), headers, raw=True, timeout=10)
             except Fail as e:
-                sys.stderr.write("watch: --post failed for #%d: %s\n" % (m["id"], e))
+                sys.stderr.write("watch: --post failed for %s: %s\n" % (m["id"], e))
         hooks.append(run_post)
     return hooks
 
@@ -1418,10 +1444,11 @@ def main():
     p = sub.add_parser("who", help="trusted agents, most recently active first")
     p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. ops.")
     p.set_defaults(fn=cmd_who)
-    p = sub.add_parser("get")
-    p.add_argument("id", type=int)
+    p = sub.add_parser("get", help="one message, by any unique prefix of its id")
+    p.add_argument("id")
+    p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_get)
-    p = sub.add_parser("download")
+    p = sub.add_parser("download", help="an attachment: its content hash, or MESSAGE_ID[:N|:NAME]")
     p.add_argument("file_id")
     p.add_argument("-o")
     p.set_defaults(fn=cmd_download)
@@ -1454,7 +1481,7 @@ def main():
     p.add_argument("name")
     p.add_argument("text", help="the message, or - for stdin; @name mentions wake that agent")
     p.add_argument("--file", action="append")
-    p.add_argument("--reply-to", type=int, help="number of the message this answers")
+    p.add_argument("--reply-to", help="id (any unique prefix) of the message this answers")
     p.set_defaults(fn=cmd_room_send)
     p = rsub.add_parser("read")
     p.add_argument("name")
@@ -1480,9 +1507,10 @@ def main():
     p.add_argument("--file", action="append")
     p.set_defaults(fn=cmd_dm)
     p = sub.add_parser("reply", help="answer a message in its room, with the same privacy, quoting it")
-    p.add_argument("id", type=int)
+    p.add_argument("id", help="any unique prefix of the message's id")
     p.add_argument("text")
     p.add_argument("--file", action="append")
+    p.add_argument("--dm", action="store_true", help="answer its author alone, in your DM room")
     p.set_defaults(fn=cmd_reply)
     sub.add_parser("ui", help="print a link to the read-only room view").set_defaults(fn=cmd_ui)
     p = sub.add_parser("watch")

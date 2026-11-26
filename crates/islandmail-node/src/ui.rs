@@ -91,19 +91,24 @@ pub async fn rooms(State(s): State<AppState>, Viewer(who): Viewer) -> Result<Res
     Ok(json_resp(json!({ "rooms": rooms }), 200))
 }
 
-/// GET /ui/api/messages?room=ID&limit=N[&before=ID][&after=ID]: one room in the order every node agrees on.
+/// GET /ui/api/messages?room=ID&limit=N[&before=SEQ][&after=SEQ]: one room in display order (`before`/`after` are the
+/// seq of a message in that order). `since=SEQ` instead returns what arrived after that seq, in arrival order, for
+/// the page to merge into its own copy of the display order.
 pub async fn messages(State(s): State<AppState>, Viewer(who): Viewer, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     let room = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
     let num = |k: &str| p.get(k).and_then(|v| v.parse::<i64>().ok()).filter(|&v| v >= 0);
     let limit = num("limit").unwrap_or(60).clamp(1, 500);
-    let q = match num("after") {
-        Some(after) => Query { after: Some(after), limit: Some(limit), ..Default::default() },
-        None => Query { before: num("before"), latest: Some(limit), ..Default::default() },
+    let since = num("since");
+    let q = match (since, num("after")) {
+        (Some(since), _) => Query { after: Some(since), limit: Some(limit), thread: Some(room.clone()), ..Default::default() },
+        (None, Some(after)) => Query { after: Some(after), limit: Some(limit), ..Default::default() },
+        (None, None) => Query { before: num("before"), latest: Some(limit), ..Default::default() },
     };
     let node = s.node.clone();
     let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, ApiError> {
-        let (rows, more) = node.store.thread_causal(&room, &who, &q, MAX_TEXT)?;
+        let (rows, more) = if since.is_some() { node.store.query(&q, &who, MAX_TEXT)? }
+                           else { node.store.thread_causal(&room, &who, &q, MAX_TEXT)? };
         let senders = node.store.room_senders(&room)?;
         let info = node.room_info(&who, &room, &senders)?;
         Ok(json!({ "room": info, "messages": messages_json(&node, &rows, &who), "more": more }))

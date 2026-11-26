@@ -10,6 +10,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -216,7 +217,7 @@ def main():
         # SSE on B sees a message posted on A.
         stop = threading.Event()
         events = []
-        last_b = req("GET", pb, "/api/me", token("B", "bob"))[1]["last_id"]
+        last_b = req("GET", pb, "/api/me", token("B", "bob"))[1]["last_seq"]
         th = threading.Thread(target=sse_reader, args=(pb, token("B", "bob"), last_b, events, stop), daemon=True)
         th.start()
         time.sleep(0.5)
@@ -256,7 +257,7 @@ def main():
         check("same causal thread order on A and B", oa == ob and len(oa) == 5, "%d messages" % len(oa))
         route = "/api/messages?thread=t1&order=causal"
         first = req("GET", pa, route + "&limit=2", token("A", "alice"))[1]
-        rest = req("GET", pa, route + "&after=%d" % first["messages"][-1]["id"], token("A", "alice"))[1]
+        rest = req("GET", pa, route + "&after=%d" % first["messages"][-1]["seq"], token("A", "alice"))[1]
         check("causal pages resume after the last delivered message", first["more"] and not rest["more"]
               and len(first["messages"]) == 2 and [m["env"] for m in first["messages"] + rest["messages"]] == oa)
 
@@ -296,7 +297,7 @@ def main():
             watcher.terminate()
             watcher.communicate(timeout=5)
         rc, out = im(pa, "alice", "send", "--to", "t.bob", "--thread", "t2", "sent with islandmail.py")
-        check("islandmail.py send (A)", rc == 0 and out.startswith("sent #") and "stored here for t.bob, copied to their nodes as they sync" in out, out)
+        check("islandmail.py send (A)", rc == 0 and re.match(r"sent [a-z2-7]{8} to ", out) and "stored here for t.bob, copied to their nodes as they sync" in out, out)
         delivered, _ = wait_for(lambda: req("GET", pb, "/api/messages?thread=t2", token("B", "bob"))[1]["messages"])
         check("message reached B while watcher was stopped", bool(delivered))
         watcher = watch()
@@ -309,8 +310,8 @@ def main():
             check("islandmail.py watch --mine --until (B) gets it", False, "timeout")
         rc, out = im(pa, "alice", "read", "--thread", "t2", "--latest", "5")
         check("islandmail.py read (A)", rc == 0 and "> sent with islandmail.py" in out, out.splitlines()[0] if out else "")
-        num = int(out.split()[0][1:]) if out.startswith("#") else 0
-        rc, out = im(pa, "alice", "get", str(num))
+        num = out.split()[0][:5] if out else "x"
+        rc, out = im(pa, "alice", "get", num)
         check("islandmail.py get (A)", rc == 0 and "sent with islandmail.py" in out)
         rc, out = im(pa, "alice", "threads")
         check("islandmail.py threads (A)", rc == 0 and "t1" in out and "t2" in out)

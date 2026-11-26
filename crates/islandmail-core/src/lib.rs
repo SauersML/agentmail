@@ -66,6 +66,53 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
     Some(t.unix_timestamp_nanos().div_euclid(1_000_000) as i64)
 }
 
+const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+
+/// Characters in a message's short id.
+pub const SHORT_ID: usize = 8;
+
+/// A message's shared id: its envelope hash (64 lowercase hex) in lowercase base32 (RFC 4648 alphabet, no padding),
+/// the same on every node. People see the first `SHORT_ID` characters; any unique prefix names the message.
+pub fn b32_id(env_hex: &str) -> String {
+    let bytes: Vec<u8> = (0..env_hex.len() / 2).filter_map(|i| u8::from_str_radix(env_hex.get(2 * i..2 * i + 2)?, 16).ok()).collect();
+    let (mut out, mut acc, mut bits) = (String::new(), 0u32, 0);
+    for b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(B32[((acc >> bits) & 31) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(B32[((acc << (5 - bits)) & 31) as usize] as char);
+    }
+    out
+}
+
+pub fn short_id(env_hex: &str) -> String {
+    b32_id(env_hex).chars().take(SHORT_ID).collect()
+}
+
+/// The inclusive range of envelope hashes (hex) whose base32 id starts with `prefix`; None if no id can.
+pub fn id_prefix_range(prefix: &str) -> Option<(String, String)> {
+    if prefix.is_empty() || prefix.len() > 52 {
+        return None;
+    }
+    let mut bits = Vec::with_capacity(260);
+    for c in prefix.bytes() {
+        let v = B32.iter().position(|&x| x == c.to_ascii_lowercase())?;
+        bits.extend((0..5).rev().map(|i| (v >> i) & 1 == 1));
+    }
+    bits.truncate(256);
+    let hex = |fill: bool| {
+        let mut all = bits.clone();
+        all.resize(256, fill);
+        all.chunks(4).map(|n| char::from_digit(n.iter().fold(0, |a, &b| a * 2 + u32::from(b)), 16).unwrap()).collect::<String>()
+    };
+    Some((hex(false), hex(true)))
+}
+
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut b = [0u8; N];
     getrandom::getrandom(&mut b).expect("OS randomness");

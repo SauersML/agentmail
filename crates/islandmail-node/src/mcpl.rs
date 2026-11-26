@@ -76,14 +76,14 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "prefix": { "type": "string", "description": "Only names starting with this, e.g. ops. or sauersml." } } } },
         { "name": "search", "description": "Messages whose text contains the words, newest last.",
           "inputSchema": { "type": "object", "properties": { "q": { "type": "string" }, "limit": { "type": "integer", "description": "default 20, at most 100" } }, "required": ["q"] } },
-        { "name": "get", "description": "One message in full, by its number.",
-          "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] } },
+        { "name": "get", "description": "One message in full, by its id (any unique prefix of it).",
+          "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
         { "name": "rooms", "description": "Your rooms (open rooms, private rooms you are in, DMs), latest activity first, with unread counts.",
           "inputSchema": { "type": "object", "properties": {} } },
         { "name": "room_send", "description": "Post in a room (an open room or thread name, creator/name, or a DM id from rooms). @name mentions wake that agent.",
           "inputSchema": { "type": "object", "properties": {
             "room": { "type": "string" }, "text": { "type": "string" },
-            "reply_to": { "type": "integer", "description": "Number of the message this answers (optional)" } },
+            "reply_to": { "type": "string", "description": "Id of the message this answers (optional)" } },
             "required": ["room", "text"] } },
     ])
 }
@@ -398,8 +398,8 @@ impl Conn {
                 let room = params["channelId"].as_str().and_then(|c| c.strip_prefix("room:")).unwrap_or("").to_string();
                 let text: Vec<&str> = params["content"].as_array().map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
                     .unwrap_or_default();
-                match self.room_send(&room, &text.join("\n"), None) {
-                    Ok(row) => reply(self, json!({ "delivered": true, "messageId": row.id.to_string() })),
+                match self.room_send(&room, &text.join("\n"), params["replyTo"].as_str()) {
+                    Ok(row) => reply(self, json!({ "delivered": true, "messageId": islandmail_core::short_id(&row.env_id) })),
                     Err(e) => fail(self, -32603, e.message),
                 }
             }
@@ -436,8 +436,8 @@ impl Conn {
                 let m = &p.row;
                 if p.repeated {
                     return Ok(format!(
-                        "Already sent as #{} to {} in thread \"{}\" at {}; this identical message wasn't sent again.",
-                        m.id, m.recipient, m.thread, m.ts
+                        "Already sent as {} to {} in thread \"{}\" at {}; this identical message wasn't sent again.",
+                        islandmail_core::short_id(&m.env_id), m.recipient, m.thread, m.ts
                     ));
                 }
                 let reach = if p.reaches.is_empty() {
@@ -447,7 +447,7 @@ impl Conn {
                 } else {
                     format!("stored here for {}, copied to their nodes as they sync", p.reaches.join(", "))
                 };
-                Ok(format!("Sent #{} to {} in thread \"{}\"; {reach}.", m.id, m.recipient, m.thread))
+                Ok(format!("Sent {} to {} in thread \"{}\"; {reach}.", islandmail_core::short_id(&m.env_id), m.recipient, m.thread))
             }
             "inbox" => {
                 let limit = cap(&args["limit"], 20);
@@ -495,7 +495,7 @@ impl Conn {
                     .iter()
                     .map(|t| {
                         let ts = t["ts"].as_str().unwrap_or("");
-                        format!("{} ({} messages; last #{} {}Z from {})", t["thread"].as_str().unwrap_or(""), t["n"], t["id"],
+                        format!("{} ({} messages; last {} {}Z from {})", t["thread"].as_str().unwrap_or(""), t["n"], t["id"],
                             &ts[..ts.len().min(16)], t["sender"].as_str().unwrap_or(""))
                     })
                     .collect::<Vec<_>>()
@@ -529,16 +529,13 @@ impl Conn {
             }
             "room_send" => {
                 let room = args["room"].as_str().unwrap_or("").to_string();
-                let reply_to = args["reply_to"].as_i64();
+                let reply_to = args["reply_to"].as_str();
                 let row = self.room_send(&room, args["text"].as_str().unwrap_or(""), reply_to)?;
-                Ok(format!("Posted #{} in room {}.", row.id, room))
+                Ok(format!("Posted {} in room {}.", islandmail_core::short_id(&row.env_id), room))
             }
             "get" => {
-                let id = args["id"].as_i64().unwrap_or(-1);
-                match n.store.get(id, me)? {
-                    Some(r) => Ok(self.node.fmt(&r, 100_000)),
-                    None => Err(ApiError::new(404, format!("no message #{}", args["id"].to_string().chars().take(20).collect::<String>()))),
-                }
+                let id = args["id"].as_str().map(String::from).unwrap_or_else(|| args["id"].to_string());
+                Ok(self.node.fmt(&crate::api::resolve(n, &id, me)?, 100_000))
             }
             other => Err(ApiError::new(400, format!("no tool named {}", other.chars().take(80).collect::<String>()))),
         }
@@ -564,13 +561,12 @@ impl Conn {
     }
 
     /// Post as the connected agent in a room (the node signs: the agent's identity file is in identities_dir).
-    fn room_send(&self, room: &str, text: &str, reply_to: Option<i64>) -> Result<Row, ApiError> {
+    fn room_send(&self, room: &str, text: &str, reply_to: Option<&str>) -> Result<Row, ApiError> {
         let members = self.node.members.read().unwrap().clone();
         let plan = self.node.room_plan(room, &self.who.name, None, &members, &self.node.agents())?;
         let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true });
         if let Some(id) = reply_to {
-            let q = self.node.store.get(id, &self.who)?.ok_or_else(|| ApiError::new(404, format!("no message #{id}")))?;
-            body["reply_to"] = json!(q.env_id);
+            body["reply_to"] = json!(crate::api::resolve(&self.node, id, &self.who)?.env_id);
         }
         Ok(self.node.post(&self.who, &body)?.row)
     }
@@ -656,7 +652,7 @@ impl Conn {
 
     fn incoming_message(&self, r: &Row) -> Value {
         let (tags, meta) = self.tags(r);
-        json!({ "channelId": format!("room:{}", r.thread), "messageId": r.id.to_string(),
+        json!({ "channelId": format!("room:{}", r.thread), "messageId": islandmail_core::short_id(&r.env_id),
                 "author": { "id": r.sender_sub, "name": r.sender }, "timestamp": r.ts,
                 "content": [{ "type": "text", "text": self.node.fmt(r, PUSH_TEXT) }], "metadata": meta, "tags": tags })
     }
@@ -699,7 +695,7 @@ impl Conn {
         let rpc = format!("incoming-{}-{}", r.id, islandmail_core::b64u(&islandmail_core::random_bytes::<6>()));
         self.send(json!({ "jsonrpc": "2.0", "id": rpc, "method": "channels/incoming",
                           "params": { "messages": [self.incoming_message(r)] } }));
-        tracing::info!("mcpl {}: channels/incoming #{} in {}", self.who.name, r.id, r.thread);
+        tracing::info!("mcpl {}: channels/incoming {} in {}", self.who.name, islandmail_core::short_id(&r.env_id), r.thread);
         self.pending = Some((rpc, r.id, std::time::Instant::now()));
     }
 
@@ -708,7 +704,7 @@ impl Conn {
         let rpc = format!("push-{event_id}-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<6>()));
         let text = self.node.fmt(r, PUSH_TEXT);
         let (tags, meta) = self.tags(r);
-        let mut o = json!({ "server": "islandmail", "messageId": r.id, "thread": r.thread, "from": r.sender,
+        let mut o = json!({ "server": "islandmail", "messageId": islandmail_core::short_id(&r.env_id), "seq": r.id, "thread": r.thread, "from": r.sender,
                             "to": r.recipient, "verified": true,
                             "channelId": format!("room:{}", r.thread), "mcplChannelId": format!("room:{}", r.thread),
                             "authorId": r.sender_sub, "authorName": r.sender });

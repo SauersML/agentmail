@@ -235,7 +235,7 @@ async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
     let island = s.node.members.read().unwrap().network.clone();
     Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "island": island, "last_id": s.node.store.last_id()?,
+        json!({ "name": who.name, "sub": who.sub, "island": island, "last_seq": s.node.store.last_id()?,
                 "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq() }),
         200,
     ))
@@ -252,11 +252,11 @@ async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
         }
         let (rows, more) = s.node.store.thread_causal(&thread, &who, &q, MAX_TEXT)?;
         let msgs = messages_json(&s.node, &rows, &who);
-        return Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200));
+        return Ok(json_resp(json!({ "messages": msgs, "more": more, "last_seq": s.node.store.last_id()? }), 200));
     }
     let (rows, more) = s.node.store.query(&q, &who, MAX_TEXT)?;
     let msgs = messages_json(&s.node, &rows, &who);
-    Ok(json_resp(json!({ "messages": msgs, "more": more, "last_id": s.node.store.last_id()? }), 200))
+    Ok(json_resp(json!({ "messages": msgs, "more": more, "last_seq": s.node.store.last_id()? }), 200))
 }
 
 async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
@@ -290,16 +290,27 @@ pub fn messages_json(node: &Node, rows: &[crate::store::Row], who: &Caller) -> V
         let mut m = r.to_message();
         if let Some(q) = r.reply_to.as_deref().and_then(|e| node.store.by_env(e, who).ok().flatten()) {
             let text: String = q.text.unwrap_or_default().chars().take(280).collect();
-            m["quote"] = json!({ "id": q.id, "from": q.sender, "ts": q.ts, "text": text });
+            m["quote"] = json!({ "id": islandmail_core::short_id(&q.env_id), "seq": q.id, "from": q.sender, "ts": q.ts, "text": text });
         }
         m
     }).collect()
 }
 
+/// GET /api/messages/ID: ID is any unique prefix of a message's shared id (or its envelope hash).
 async fn one(State(s): State<AppState>, who: Caller, axum::extract::Path(id): axum::extract::Path<String>) -> Result<Response, ApiError> {
-    let id: i64 = id.parse().map_err(|_| ApiError::new(400, "message id must be a number"))?;
-    let row = s.node.store.get(id, &who)?.ok_or_else(|| ApiError::new(404, format!("no message #{id}")))?;
+    let row = resolve(&s.node, &id, &who)?;
     Ok(json_resp(json!({ "message": messages_json(&s.node, &[row], &who).pop() }), 200))
+}
+
+/// The one message the viewer can see whose id starts with `id`: 404 for none, 409 when the prefix is ambiguous.
+pub fn resolve(node: &Node, id: &str, who: &Caller) -> Result<crate::store::Row, ApiError> {
+    let shown: String = id.chars().take(64).filter(|c| c.is_ascii_alphanumeric()).collect();
+    let mut rows = node.store.by_prefix(id, who, 2)?;
+    match rows.len() {
+        0 => Err(ApiError::new(404, format!("no message {shown}"))),
+        1 => Ok(rows.pop().unwrap()),
+        _ => Err(ApiError::new(409, format!("{shown} names more than one message; use more of its id"))),
+    }
 }
 
 async fn rooms(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
@@ -331,11 +342,11 @@ async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQue
     Ok(json_resp(json!({ "keys": keys }), 200))
 }
 
-/// POST /api/room-read {room, id}: the caller has read the room up to message `id`.
+/// POST /api/room-read {room, seq}: the caller has read the room up to local seq `seq`.
 async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
     let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
     let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?;
-    let id = v["id"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "id is required"))?;
+    let id = v["seq"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "seq is required"))?;
     s.node.store.mark_read(&who, room, id)?;
     Ok(json_resp(json!({ "ok": true }), 200))
 }
@@ -414,7 +425,7 @@ async fn download(
 }
 
 fn sse_event(m: &Value) -> String {
-    format!("id: {}\ndata: {}\n\n", m["id"], m)
+    format!("id: {}\ndata: {}\n\n", m["seq"], m)
 }
 
 struct StreamSlot {
@@ -477,8 +488,8 @@ async fn stream(
         loop {
             if !node.active(&who) { break; }
             let Ok((rows, more)) = node.store.query(&Query { after: Some(after), ..Default::default() }, &who, MAX_TEXT) else { break };
-            for r in rows {
-                chunk.push_str(&sse_event(&r.to_message()));
+            for (r, m) in rows.iter().zip(messages_json(&node, &rows, &who)) {
+                chunk.push_str(&sse_event(&m));
                 after = r.id;
             }
             if !chunk.is_empty() {

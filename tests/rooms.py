@@ -13,11 +13,14 @@ quote in the same room and privacy; /ui serves its page and its JSON endpoints l
 Needs `websockets` (pip) for the MCPL checks.
 """
 import argparse
+import base64
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -201,21 +204,22 @@ def main():
         # reply: same room and privacy, reply_to and a quote.
         msgs = js("ops.orchestrator", "room", "read", "hypha/plan")["messages"]
         orig = [m for m in msgs if m["text"] == "secret one"][0]
-        rc, out = cl("ops.orchestrator", "reply", str(orig["id"]), "re: secret one, agreed")
+        rc, out = cl("ops.orchestrator", "reply", orig["id"], "re: secret one, agreed")
         check("reply posts", rc == 0 and "hypha/plan" in out, out[-160:])
         got, t = wait_for(lambda: [m for m in (js("hypha", "room", "read", "hypha/plan") or {}).get("messages", [])
                                    if m["text"] == "re: secret one, agreed"], timeout=20)
         m = got[0] if got else {}
-        check("reply_to round trip with a quote, in the same private room", m.get("reply_to") == orig["env"]
+        check("reply_to round trip with a quote, in the same private room", m.get("reply_to") == orig["id"]
               and m.get("quote", {}).get("from") == "hypha" and m.get("mode") == "private" and m.get("thread") == "hypha/plan",
               json.dumps(m)[:300])
         legacy = [m for m in js("lab.carol", "room", "read", "release")["messages"] if m["text"] == "plan v1 is out"][0]
-        rc, out = cl("lab.carol", "reply", str(legacy["id"]), "nice")
+        rc, out = cl("lab.carol", "reply", legacy["id"], "nice")
         got, _ = wait_for(lambda: [m for m in js("hypha", "room", "read", "release")["messages"]
                                    if m["text"] == "nice" and m.get("quote", {}).get("text") == "plan v1 is out"
                                    and m["to"] == "hypha"], timeout=20)
         check("reply to plain thread mail goes back to its sender in its thread", rc == 0 and got, out[-160:])
 
+        issue12_checks(cl, js, req, api, token, bg, orig)
         mcpl_checks(api, cl, token)
 
         # /ui: the page, a view key, JSON rooms and members.
@@ -235,6 +239,14 @@ def main():
         st, body = req("GET", api["mac"], "/ui/api/messages?room=hypha/plan&limit=50", "ui." + key)
         check("/ui/api/messages returns the room and its messages", st == 200 and body["room"]["kind"] == "private"
               and any(m["text"] == "secret one" for m in body["messages"]), str(st))
+        cli_order = [m["env"] for m in (js("hypha", "room", "read", "hypha/plan", "--latest", "50") or {}).get("messages", [])]
+        check("/ui gets the same display order as room read", [m["env"] for m in body["messages"]] == cli_order,
+              "%d vs %d" % (len(body["messages"]), len(cli_order)))
+        since = max(m["seq"] for m in body["messages"])
+        cl("hypha", "room", "send", "hypha/plan", "for the ui poll")
+        st, body = req("GET", api["mac"], "/ui/api/messages?room=hypha/plan&since=%d" % since, "ui." + key)
+        check("/ui since=SEQ returns what arrived after it", st == 200 and [m["text"] for m in body["messages"]] == ["for the ui poll"],
+              json.dumps(body)[:200])
         st, _ = req("GET", api["mac"], "/ui/api/rooms", "ui.wrong")
         st2, _ = req("GET", api["mac"], "/ui/api/rooms", token("hypha"))
         check("/ui JSON needs a view key (an agent token is not one)", st == 401 and st2 == 401, "%d %d" % (st, st2))
@@ -246,6 +258,95 @@ def main():
     failed = [r for r in RESULTS if not r[1]]
     print("\n%d checks, %d failed; logs in %s" % (len(RESULTS), len(failed), work))
     sys.exit(1 if failed else 0)
+
+
+def b32(env):
+    return base64.b32encode(bytes.fromhex(env)).decode().lower().rstrip("=")
+
+
+def issue12_checks(cl, js, req, api, token, bg, orig):
+    """#12: shared short ids, reply (same room, never less private; --dm), display order with replies under parents."""
+    # Shared ids: 8 base32 characters of the envelope hash, the same on every node; seq only in --json.
+    on_mac = {m["env"]: m for m in js("hypha", "room", "read", "hypha/plan", "--latest", "100")["messages"]}
+    on_pod = {m["env"]: m for m in js("ops.orchestrator", "room", "read", "hypha/plan", "--latest", "100")["messages"]}
+    both = set(on_mac) & set(on_pod)
+    check("a message has the same id on every node: 8 base32 chars of its hash", both and all(
+        on_mac[e]["id"] == on_pod[e]["id"] == b32(e)[:8] for e in both), "%d shared" % len(both))
+    check("--json keeps the local seq for cursors", all(isinstance(m.get("seq"), int) for m in on_mac.values()))
+    rc, out = cl("hypha", "room", "read", "hypha/plan")
+    check("human output shows ids, never local numbers", rc == 0 and orig["id"] in out and not re.search(r"#\d", out), out[:200])
+    rc, out = cl("ops.orchestrator", "get", orig["id"][:5])
+    check("get takes any unique prefix (on another node too)", rc == 0 and out.startswith(orig["id"] + " ") and "secret one" in out,
+          out[:160])
+    rc, out = cl("hypha", "get", orig["env"])
+    check("and the full envelope hash", rc == 0 and "secret one" in out)
+    ids = sorted(m["id"] for m in js("hypha", "read", "--latest", "200"))
+    pre = next((a[:n] for n in (1, 2) for a, b in zip(ids, ids[1:]) if a[:n] == b[:n]), None)
+    rc, out = cl("hypha", "get", pre or "a")
+    check("an ambiguous prefix asks for more of the id", rc != 0 and "more than one" in out, "%s: %s" % (pre, out[-120:]))
+    rc, out = cl("hypha", "get", "zzzzzzzz")
+    check("an unknown id is not found", rc != 0 and "no message" in out, out[-120:])
+
+    # Reply privacy: a reply to a private message cannot be posted where more agents read it.
+    rc, out = cl("ops.orchestrator", "room", "send", "release", "leak it", "--reply-to", orig["id"])
+    check("a reply never downgrades privacy (private -> open room refused)", rc != 0 and "must be private" in out, out[-160:])
+    # reply --dm: to the author alone, in the DM room, quoting the original.
+    w = bg("hypha", "watch", "--mine", "--until", "--name", "dmreply", "--from-now")
+    time.sleep(2)
+    rc, out = cl("ops.orchestrator", "reply", orig["id"], "--dm", "just between us")
+    dm = "dm:hypha+ops.orchestrator"
+    check("reply --dm posts in the author's DM room", rc == 0 and "DM" in out, out[-160:])
+    got, _ = wait_for(lambda: [m for m in (js("hypha", "room", "read", dm, "--latest", "20") or {}).get("messages", [])
+                               if m["text"] == "just between us"], timeout=20)
+    m = got[0] if got else {}
+    check("as a private reply with the quote", m.get("mode") == "private" and m.get("reply_to") == orig["id"]
+          and (m.get("quote") or {}).get("text") == "secret one", json.dumps(m)[:200])
+    try:
+        out, _ = w.communicate(timeout=30)
+        check("and wakes the author", w.returncode == 0 and "just between us" in out, out[-160:])
+    except subprocess.TimeoutExpired:
+        w.kill()
+        check("and wakes the author", False, "timed out")
+    rc, out = cl("hypha", "reply", orig["id"], "--dm", "x")
+    check("--dm to your own message is refused", rc != 0, out[-120:])
+
+    # Order: by signed time, replies right under their parent; watch still fires on arrival.
+    cl("hypha", "room", "create", "order")
+    cl("hypha", "room", "send", "hypha/order", "A first")
+    cl("hypha", "room", "send", "hypha/order", "B second")
+    a = [m for m in js("hypha", "room", "read", "hypha/order")["messages"] if m["text"] == "A first"][0]
+    got, _ = wait_for(lambda: any(m["text"] == "A first" for m in (js("ops.orchestrator", "room", "read", "hypha/order") or {})
+                                  .get("messages", [])), timeout=20)
+    w = bg("hypha", "watch", "--mine", "--until", "--name", "order", "--from-now")
+    time.sleep(2)
+    rc, out = cl("ops.orchestrator", "reply", a["id"], "C answers A")
+    try:
+        wout, _ = w.communicate(timeout=30)
+        check("a reply to an old message wakes its author on arrival", w.returncode == 0 and "C answers A" in wout, wout[-160:])
+    except subprocess.TimeoutExpired:
+        w.kill()
+        check("a reply to an old message wakes its author on arrival", False, "timed out")
+    want = ["A first", "C answers A", "B second"]
+    got, _ = wait_for(lambda: [m["text"] for m in js("hypha", "room", "read", "hypha/order")["messages"]
+                               if m.get("kind") != "event"] == want, timeout=20)
+    check("display order: by time, a reply right under its parent", got)
+    envs = lambda agent: [m["env"] for m in js(agent, "room", "read", "hypha/order")["messages"]]
+    check("the same order on another node", envs("hypha") == envs("ops.orchestrator"))
+    rc, out = cl("hypha", "room", "read", "hypha/order")
+    lines = out.splitlines()
+    i = next((k for k, l in enumerate(lines) if "C answers A" in l), 0)
+    check("a reply shows '\u21b3 re ID' and a quote", i >= 2 and lines[i - 2] == "\u21b3 re %s from hypha" % a["id"]
+          and lines[i - 1] == "  | A first", "\n".join(lines[max(0, i - 3):i + 1]))
+
+    # Attachments by message id.
+    cl("hypha", "room", "send", "hypha/order", "notes attached", "--file", __file__)
+    f = [m for m in js("hypha", "room", "read", "hypha/order")["messages"] if m["text"] == "notes attached"][0]
+    dest = os.path.join(tempfile.mkdtemp(prefix="islandmail-dl-"), "copy.py")
+    rc, out = cl("hypha", "download", f["id"][:6], "-o", dest)
+    ok = rc == 0 and os.path.exists(dest) and open(dest, "rb").read() == open(__file__, "rb").read()
+    check("download takes a message id prefix", ok, out[-160:])
+    if os.path.exists(dest):
+        os.remove(dest)
 
 
 def mcpl_checks(api, cl, token):

@@ -572,6 +572,23 @@ mod tests {
     }
 
     #[test]
+    fn short_ids_and_prefix_ranges() {
+        let env = "00443214c74254b635cf84653a56d7c675be77df".to_string() + "0123456789abcdefabcdef01";
+        let id = crate::b32_id(&env);
+        assert_eq!(id.len(), 52);
+        assert_eq!(&id[..8], "abcdefgh");
+        assert_eq!(crate::short_id(&env), &id[..8]);
+        for n in [1, 3, 8, 13, 51, 52] {
+            let (lo, hi) = crate::id_prefix_range(&id[..n]).unwrap();
+            assert!(lo.as_str() <= env.as_str() && env.as_str() <= hi.as_str(), "prefix {n}");
+            assert_eq!(lo.len(), 64);
+        }
+        let (lo, hi) = crate::id_prefix_range("abcdefgi").unwrap();
+        assert!(env < lo || env > hi);
+        assert!(crate::id_prefix_range("ab1").is_none() && crate::id_prefix_range("").is_none());
+    }
+
+    #[test]
     fn room_fields_are_covered_by_the_digest() {
         let salt = [7u8; 16];
         let plain = post_digest(&salt, "hi", &[]).unwrap();

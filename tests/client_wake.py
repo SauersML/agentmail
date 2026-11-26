@@ -58,8 +58,13 @@ def main():
 
     def send(text, thread="general"):
         rc, out, err = cl("s.peer", "send", "--to", "hypha", "--thread", thread, text)
-        m = re.search(r"sent #(\d+)", out)
-        return int(m.group(1)) if rc == 0 and m else None
+        m = re.search(r"sent ([a-z2-7]{8}) ", out)
+        return m.group(1) if rc == 0 and m else None
+
+    def seq(mid):
+        # Cursors are local seq numbers (only in --json); people see the shared id.
+        rc, out, _ = cl("hypha", "get", mid or "x", "--json")
+        return json.loads(out)["seq"] if rc == 0 else None
 
     def watch(*args, timeout=20):
         return cl("hypha", "watch", "--mine", "--until", *args, timeout=timeout)
@@ -90,11 +95,11 @@ def main():
         rc, out, _ = watch()
         check("first watch arms the cursor at the first mail", rc == 0 and "> one" in out, out[-200:])
         with open(cursor("side"), "w") as f:
-            f.write(str(m1))
+            f.write(str(seq(m1)))
         m2, m3 = send("two"), send("three")
         rc, out, _ = cl("hypha", "read", "--to-me", "--latest", "20")
         check("read shows the new mail", rc == 0 and "> two" in out and "> three" in out, out[-200:])
-        check("read moved the default cursor to the newest mail it showed", open(cursor("main")).read().strip() == str(m3))
+        check("read moved the default cursor to the newest mail it showed", open(cursor("main")).read().strip() == str(seq(m3)))
         send("four")
         rc, out, _ = watch()
         check("re-armed watch wakes for new mail only, not what was read", rc == 0 and "> four" in out and "> two" not in out, out[-200:])

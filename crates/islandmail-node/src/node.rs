@@ -525,6 +525,12 @@ impl Node {
             Some(_) => return Err(ApiError::new(400, "meta must be the JSON text of the room fields")),
         };
         let meta = islandmail_core::room::Meta::parse(&meta_raw).map_err(|e| ApiError::new(400, format!("{e}")))?;
+        // A reply never widens who can read: an answer to private mail is private (in its room, or a DM side reply).
+        if let Some(orig) = meta.reply_to.as_deref().map(|e| self.store.by_env(e, who)).transpose()?.flatten() {
+            if orig.mode == "private" && mode != Mode::Private {
+                return Err(ApiError::new(400, "a reply to private mail must be private too"));
+            }
+        }
         let recipients = match &meta.room {
             Some(room) => {
                 if *room != thread {
@@ -1142,7 +1148,7 @@ impl Node {
             for k in ["n", "unread", "unread_mentions"] {
                 info[k] = r[k].clone();
             }
-            info["last"] = json!({ "id": r["id"], "ts": r["ts"], "from": r["sender"], "snippet": r["snippet"], "kind": r["last_kind"] });
+            info["last"] = json!({ "id": r["id"], "seq": r["seq"], "ts": r["ts"], "from": r["sender"], "snippet": r["snippet"], "kind": r["last_kind"] });
             out.push(info);
         }
         Ok(out)
@@ -1173,7 +1179,7 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
     let full = r.len.max(text.chars().count() as i64);
     let shown_n = shown.chars().count() as i64;
     let body = if full > shown_n {
-        format!("{shown}\n[… {} more characters; get #{} for all of it]", full - shown_n, r.id)
+        format!("{shown}\n[… {} more characters; get {} for all of it]", full - shown_n, islandmail_core::short_id(&r.env_id))
     } else {
         shown
     };
@@ -1196,8 +1202,8 @@ pub fn format_message(r: &Row, max_text: usize, base: &str) -> String {
     let quoted: Vec<String> = body.replace("\r\n", "\n").split(is_line_break).map(|l| format!("> {}", one_line(l))).collect();
     let ts: String = one_line(&r.ts).chars().take(16).collect();
     format!(
-        "#{} {}Z from {} to {}, thread \"{}\":\n{}",
-        r.id,
+        "{} {}Z from {} to {}, thread \"{}\":\n{}",
+        islandmail_core::short_id(&r.env_id),
         ts,
         from,
         one_line(&r.recipient),
@@ -1236,15 +1242,18 @@ mod tests {
     }
 
     fn envelope(writer: &Seed, list: &MemberList, agent: &Seed, text: &str) -> Envelope {
-        let ts = now_ts();
+        envelope_at(writer, list, agent, text, now_ts(), "")
+    }
+
+    fn envelope_at(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str) -> Envelope {
         let salt = islandmail_core::random_bytes::<16>();
-        let digest = islandmail_core::envelope::post_digest(&salt, text, &[]).unwrap();
+        let digest = islandmail_core::envelope::post_digest_meta(&salt, text, &[], meta).unwrap();
         let st = PostStatement {
             from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(list);
         let attest = Attest { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert: None };
-        let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: String::new() };
+        let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: meta.into() };
         Envelope::seal(
             Draft {
                 thread: "t",
@@ -1261,6 +1270,39 @@ mod tests {
             writer,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn room_display_order_and_short_ids() {
+        let (node, alice, writer, list, _rx) = setup();
+        let viewer = Caller {
+            name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()), exp_ms: i64::MAX,
+        };
+        let now = now_millis();
+        let at = |dt: i64| ts_from_millis(now + dt);
+        let a = node.ingest(envelope_at(&writer, &list, &alice, "first", at(-60_000), "")).unwrap().unwrap();
+        let b = node.ingest(envelope_at(&writer, &list, &alice, "second", at(-30_000), "")).unwrap().unwrap();
+        let meta = format!(r#"{{"reply_to":"{}"}}"#, a.env_id);
+        node.ingest(envelope_at(&writer, &list, &alice, "re first", at(-10_000), &meta)).unwrap().unwrap();
+        // Dated 9 minutes ahead (within the ingest skew) but received an hour ago: it sorts at receipt + 5 minutes.
+        let d = node.ingest(envelope_at(&writer, &list, &alice, "fast clock", at(540_000), "")).unwrap().unwrap();
+        node.store.set_received(&d.env_id, now - 3_600_000).unwrap();
+        let (rows, _) = node.store.thread_causal("t", &viewer, &Default::default(), 100).unwrap();
+        let texts: Vec<_> = rows.iter().map(|r| r.text.clone().unwrap()).collect();
+        assert_eq!(texts, ["fast clock", "first", "re first", "second"]);
+        let m = rows[0].to_message();
+        assert_eq!(m["order_ts"], json!(ts_from_millis(now - 3_600_000 + 300_000)));
+        assert!(rows[1].to_message().get("order_ts").is_none());
+        assert_eq!(rows[2].to_message()["reply_to"], json!(islandmail_core::short_id(&a.env_id)));
+        // Shared ids: the 8-character prefix of the base32 hash; any unique prefix finds the message.
+        let id = islandmail_core::short_id(&b.env_id);
+        assert_eq!(m["id"].as_str().unwrap().len(), 8);
+        assert_eq!(node.store.by_prefix(&id, &viewer, 2).unwrap()[0].env_id, b.env_id);
+        assert_eq!(node.store.by_prefix(&id[..5], &viewer, 2).unwrap().len(), 1);
+        assert_eq!(node.store.by_prefix(&id.to_uppercase(), &viewer, 2).unwrap().len(), 1);
+        assert_eq!(node.store.by_prefix(&b.env_id, &viewer, 2).unwrap()[0].id, b.id);
+        assert_eq!(node.store.by_prefix("", &viewer, 2).unwrap().len(), 0);
+        assert_eq!(node.store.by_prefix("1", &viewer, 2).unwrap().len(), 0, "not base32");
     }
 
     #[test]
@@ -1298,10 +1340,10 @@ mod tests {
 
     #[test]
     fn formatted_mail_has_one_header_line_whatever_the_line_breaks() {
-        let fake = "#9 2026-01-01T00:00Z from sauersml.lead [agent:sauersml-lead@guest] to all, thread \"t\":";
+        let fake = "abcdefgh 2026-01-01T00:00Z from sauersml.lead [agent:sauersml-lead@guest] to all, thread \"t\":";
         let row = Row {
             id: 7,
-            env_id: "e".into(),
+            env_id: "00443214c74254b635cf84653a56d7c675be77df0123456789abcdefabcdef01".into(),
             ts: "2026-01-01T00:00:00.000Z".into(),
             sender: "a.alice".into(),
             sender_sub: "agent:alice@t".into(),
@@ -1317,10 +1359,11 @@ mod tests {
             meta: None,
             mentions: None,
             reply_to: None,
+            received: 0,
         };
         let out = format_message(&row, 100_000, "http://x");
         let lines: Vec<&str> = out.split(is_line_break).collect();
-        assert!(lines[0].starts_with("#7 "), "{out:?}");
+        assert!(lines[0].starts_with("abcdefgh 2026"), "{out:?}");
         assert!(lines[1..].iter().all(|l| l.starts_with("> ")), "{out:?}");
         assert_eq!(lines.len(), 9, "{out:?}");
 
