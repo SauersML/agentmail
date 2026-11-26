@@ -202,11 +202,24 @@ fn get_within(node: &Node, ids: &[String], budget: usize) -> Result<(Vec<String>
     Ok((out, ids.len()))
 }
 
+/// Connecting to a peer gives up after this long.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// A request gives up when the peer sends nothing for this long; a slow but moving transfer (a large attachment over
+/// a thin link) continues.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Backstop for a whole sync session with one peer. Sessions run independently per peer, so a long one delays no other.
+const SESSION_TIMEOUT: Duration = Duration::from_secs(3600);
+
 async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&serde_json::to_vec(&(network, req))?).await?;
+    let (mut send, mut recv) = tokio::time::timeout(IDLE_TIMEOUT, conn.open_bi()).await??;
+    let request = serde_json::to_vec(&(network, req))?;
+    tokio::time::timeout(IDLE_TIMEOUT, send.write_all(&request)).await??;
     send.finish()?;
-    let bytes = recv.read_to_end(MAX_RESP).await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(IDLE_TIMEOUT, recv.read_chunk(1 << 20)).await?? {
+        anyhow::ensure!(bytes.len() + chunk.len() <= MAX_RESP, "sync response over {MAX_RESP} bytes");
+        bytes.extend_from_slice(&chunk);
+    }
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -294,7 +307,8 @@ impl Ctx {
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
     async fn sync_with(&self, peer: EndpointId, blob_after: &mut String) -> Result<usize> {
         let node = &self.node;
-        let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN))
+            .await.context("connect timed out")??;
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
         if let Some(record) = &trust.encryption_key {
@@ -587,24 +601,33 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let c = ctx.clone();
     let every = Duration::from_secs(cfg.sync_secs.max(1));
     tasks.push(tokio::spawn(async move {
+        // One session per peer at a time, each on its own: an unreachable or slow peer (a large attachment over a thin
+        // link) never delays the others. The JoinSet ends every session when this task stops.
         let mut blob_cursors = BTreeMap::<EndpointId, String>::new();
+        let mut running = tokio::task::JoinSet::new();
+        let mut busy = std::collections::BTreeSet::<EndpointId>::new();
         loop {
+            while let Some(done) = running.try_join_next() {
+                if let Ok((peer, after)) = done {
+                    busy.remove(&peer);
+                    blob_cursors.insert(peer, after);
+                }
+            }
             let peers = c.peers();
-            let pulls = peers.iter().copied().map(|peer| {
-                let c = &c;
+            for &peer in &peers {
+                if !busy.insert(peer) { continue; }
+                let c = c.clone();
                 let mut after = blob_cursors.remove(&peer).unwrap_or_default();
-                async move {
-                    // Room for a full-size attachment over a slow link (100 MiB in 10 minutes is about 1.4 Mbit/s).
-                    match tokio::time::timeout(Duration::from_secs(600), c.sync_with(peer, &mut after)).await {
+                running.spawn(async move {
+                    match tokio::time::timeout(SESSION_TIMEOUT, c.sync_with(peer, &mut after)).await {
                         Ok(Ok(k)) if k > 0 => tracing::info!("periodic sync with {}: {k} new", peer.fmt_short()),
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => tracing::debug!("periodic sync with {} failed: {e:#}", peer.fmt_short()),
                         Err(_) => tracing::debug!("periodic sync with {} timed out", peer.fmt_short()),
                     }
                     (peer, after)
-                }
-            });
-            blob_cursors = futures::stream::iter(pulls).buffer_unordered(4).collect().await;
+                });
+            }
             let _ = c.sender.join_peers(peers).await;
             tokio::select! {
                 _ = tokio::time::sleep(every) => {}
