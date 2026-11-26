@@ -165,6 +165,7 @@ async fn node_info(State(s): State<AppState>, RawQuery(raw): RawQuery) -> Respon
     let members = s.node.members.read().unwrap();
     let mut info = json!({ "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "network": members.network, "network_id": islandmail_core::b64u(&members.topic()),
                 "envelope_version": islandmail_core::envelope::VERSION,
+                "versions": islandmail_core::versions::report(), "build": env!("CARGO_PKG_VERSION"),
                 "encryption_key": s.node.current_encryption_key(),
                 "members_seq": members.seq, "auth": ["agent-token"],
                 "names": members.node_by_key(&s.node.seed.public()).map(|n| n.names.clone()).unwrap_or_default(),

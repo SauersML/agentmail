@@ -107,7 +107,9 @@ pub fn valid_relay_url(u: &str) -> bool {
 
 impl MemberList {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.v == 1 && self.seq > 0, "expected local trust file version 1 and positive revision");
+        ensure!(self.v <= crate::versions::TRUST_FILE, "{}", crate::versions::too_new("trust file", self.v, crate::versions::TRUST_FILE));
+        ensure!(self.v == crate::versions::TRUST_FILE && self.seq > 0,
+                "expected local trust file version {} (older ones are migrated at start) and positive revision", crate::versions::TRUST_FILE);
         let id = b64u_decode(&self.network).ok_or_else(|| anyhow!("invalid network ID"))?;
         ensure!(id.len() == 32 && b64u(&id) == self.network, "use the network ID printed by islandmail-node network-id");
         ensure!(!self.nodes.is_empty() && self.members.len() + self.nodes.len() <= crate::envelope::MAX_KEYS,
@@ -238,8 +240,7 @@ impl MemberList {
     }
 
     pub fn topic(&self) -> [u8; 32] {
-        // v2: sealed envelopes. Nodes on the old wire format gossip on another topic (sync says why they fail).
-        blake3::derive_key("islandmail/local-trust/v2", self.network.as_bytes())
+        blake3::derive_key(crate::versions::GOSSIP_TOPIC, self.network.as_bytes())
     }
 }
 

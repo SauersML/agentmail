@@ -9,7 +9,7 @@ use crate::cert::Cert;
 use crate::members::{self, Agent, MemberList};
 use crate::{b64u, b64u_decode, parse_ts};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = crate::versions::ENVELOPE;
 pub const MAX_FIELD: usize = 120;
 pub const MAX_PARENTS: usize = 16;
 /// nonce + tag + the largest padded body (512 KiB).
@@ -326,7 +326,10 @@ impl Envelope {
 
     /// `check` without the membership of the writing node: framing, sizes, time and the node's signature.
     pub fn check_frame(&self, now_ms: i64) -> Result<()> {
-        if self.v != VERSION {
+        if !crate::versions::ENVELOPE_READS.contains(&self.v) {
+            if self.v > VERSION {
+                bail!("{}", crate::versions::too_new("envelope", self.v, VERSION));
+            }
             bail!("unsupported envelope version {}", self.v);
         }
         let n = self.keys.len();

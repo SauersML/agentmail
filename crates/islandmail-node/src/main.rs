@@ -14,6 +14,7 @@ mod encryption_keys;
 mod homes;
 mod invite;
 mod mcpl;
+mod migrate;
 mod net;
 mod node;
 mod private_fs;

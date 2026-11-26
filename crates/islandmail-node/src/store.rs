@@ -83,8 +83,8 @@ CREATE TRIGGER IF NOT EXISTS finish_blob AFTER INSERT ON blobs BEGIN
 END;
 ";
 
-/// The store format (SQLite `user_version`). A data directory in any other format is refused, not converted.
-const STORE_VERSION: i64 = 1;
+/// The store format (SQLite `user_version`). Older stores are migrated at open (see migrate.rs).
+const STORE_VERSION: i64 = islandmail_core::versions::STORE;
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
 #[derive(Clone, Debug)]
@@ -317,8 +317,9 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF")?;
         let empty = !db.prepare("SELECT 1 FROM sqlite_schema")?.exists([])?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        anyhow::ensure!(empty || version == STORE_VERSION,
-                        "{} is not an Islandmail store of format {STORE_VERSION}; use a new data directory", path.display());
+        if !empty {
+            crate::migrate::store(&mut db, path, version)?;
+        }
         let tx = db.transaction()?;
         tx.execute_batch(SCHEMA)?;
         tx.execute_batch(&format!("PRAGMA user_version = {STORE_VERSION}"))?;

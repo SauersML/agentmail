@@ -14,6 +14,7 @@ pub mod node_key;
 pub mod order;
 pub mod paseto;
 pub mod room;
+pub mod versions;
 
 pub use envelope::{Attest, Body, Envelope, Mode, Verified};
 pub use cert::{Cert, Revocation};

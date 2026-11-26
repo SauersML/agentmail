@@ -10,6 +10,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Config format version (islandmail_core::versions::CONFIG); older configs are migrated at start.
+    #[serde(default = "one")]
+    pub v: u32,
     pub data_dir: PathBuf,
     /// Loopback HTTP API, e.g. "127.0.0.1:8787"
     #[serde(default = "default_api")]
@@ -52,14 +55,19 @@ fn default_api() -> String {
     "127.0.0.1:8787".into()
 }
 fn default_key_retention() -> u32 { 14 }
+fn one() -> u32 {
+    1
+}
+
 fn default_sync() -> u64 {
     30
 }
 
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
-        let raw = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut c: Config = serde_json::from_str(&raw).context("config is not valid JSON")?;
+        let value = crate::migrate::file(path, crate::migrate::config)?;
+        let mut c: Config = serde_json::from_value(value).context("config is not valid")?;
+        anyhow::ensure!(c.v == islandmail_core::versions::CONFIG, "config version {} after migration", c.v);
         let base = path.parent().unwrap_or(Path::new("."));
         let fix = |p: &mut PathBuf| {
             if p.is_relative() {
@@ -76,13 +84,17 @@ impl Config {
     }
 
     pub fn members(&self) -> Result<MemberList> {
-        let raw = std::fs::read(&self.members_file)
-            .with_context(|| format!("reading {}", self.members_file.display()))?;
-        Self::parse_members(&raw)
+        let value = crate::migrate::file(&self.members_file, crate::migrate::trust)?;
+        let list: MemberList = serde_json::from_value(value).context("member list is not valid")?;
+        list.validate()?;
+        Ok(list)
     }
 
+    /// A trust file's bytes as this build's member list (an older version is brought forward in memory).
     pub fn parse_members(raw: &[u8]) -> Result<MemberList> {
-        let list: MemberList = serde_json::from_slice(raw).context("member list is not valid JSON")?;
+        let mut value: serde_json::Value = serde_json::from_slice(raw).context("member list is not valid JSON")?;
+        crate::migrate::trust(&mut value)?;
+        let list: MemberList = serde_json::from_value(value).context("member list is not valid")?;
         list.validate()?;
         Ok(list)
     }
