@@ -329,7 +329,8 @@ impl Node {
             return Err(ApiError::new(403, format!("no home in this host's trust file vouches for {name}")));
         }
         let mut why = String::new();
-        let Some(token) = homes.iter().find_map(|h| h.check(name, key, &proof, now).map_err(|e| why = format!("{e:#}")).ok()) else {
+        let aud = islandmail_core::home::audience(&list.network);
+        let Some(token) = homes.iter().find_map(|h| h.check(name, key, &proof, &aud, now).map_err(|e| why = format!("{e:#}")).ok()) else {
             tracing::warn!("enrollment of {name} refused: {why}");
             return Err(ApiError::new(403, format!("enrollment refused: {why}")));
         };

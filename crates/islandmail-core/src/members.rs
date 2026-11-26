@@ -128,9 +128,9 @@ impl MemberList {
         ensure!(self.homes.len() <= MAX_NAMES, "at most {MAX_NAMES} homes");
         for (i, h) in self.homes.iter().enumerate() {
             h.validate()?;
-            // One suffix, one home; the same home may list a second key generation while it rotates.
+            // One suffix, one home; the same home may list a second key while it rotates.
             for o in &self.homes[..i] {
-                ensure!(o.suffix != h.suffix || (o.iss == h.iss && o.kg != h.kg && o.aud == h.aud),
+                ensure!(o.suffix != h.suffix || (o.iss == h.iss && o.key != h.key),
                         "homes {:?} and {:?} share suffix {}", o.name, h.name, h.suffix);
             }
         }
@@ -160,7 +160,7 @@ impl MemberList {
         let home = crate::home::is_home_name(&c.name);
         self.nodes.iter().any(|n| n.key == c.node && (home || n.covers(&c.name)))
             && c.agent_key().is_ok_and(|k| self.permits_agent_key(&c.name, &k)) && c.check().is_ok()
-            && crate::home::check_cert(&self.homes, c).is_ok()
+            && crate::home::check_cert(&self.homes, &self.network, c).is_ok()
     }
 
     /// Every agent this host accepts at `at_ms`. `revoked_at(cert)` is when the cert's own node revoked its key, if

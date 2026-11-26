@@ -1,16 +1,15 @@
 //! Offline verification of archipelago-home `aid1` identity tokens, ported from the home's reference verifier
-//! (archipelago-home `src/token.ts`, `docs/AUDIENCE-CONTRACT.md` §2-§3) with the key generation and key binding of its
-//! `docs/FEDERATION.md` §9.7:
+//! (archipelago-home `src/token.ts`, `docs/AUDIENCE-CONTRACT.md` §2-§3):
 //!
 //!   aid1.<base64url(payload JSON)>.<base64url(ed25519 signature)>
 //!
 //! The signature covers the literal bytes of `aid1.<payload segment>`. Nothing is re-canonicalized: the bytes received
 //! are verified first, then parsed. Checks, in order: shape, signature under the pinned issuer key, `v`, `iss`, `aud`,
-//! `kg` (the issuer key generation), `sub`, `name`, `scopes`, `exp` (in the future when present), `iat` (not more than
-//! five minutes ahead). A token without `exp` must name its holder's key in `cnf`; this verifier always returns `cnf`
-//! and Islandmail requires it on every token it enrolls with.
+//! `kg` (only when the verifier pins a key generation), `sub`, `name`, `scopes`, `cnf` (a well-formed key when
+//! present), `exp` (required, in the future), `iat` (not more than five minutes ahead). Today's tokens carry no `kg`
+//! or `cnf`; FEDERATION.md §9.7 adds both, and this verifier accepts them.
 //!
-//! A key-bound token is presented with a proof of possession: the holder's signature over
+//! The holder presents a token with a proof of possession: its key's signature over
 //! `archipelago-present|v1|<iss>|<aud>|<timestamp>|<jti>|<token hash>` (`present_statement`).
 
 use anyhow::{anyhow, bail, ensure, Result};
@@ -25,13 +24,13 @@ pub const MAX_TOKEN: usize = 64 * 1024;
 /// How far ahead of the verifier's clock `iat` may be.
 pub const IAT_SKEW_S: f64 = 300.0;
 
-/// What a verifier pins for one issuer.
+/// What a verifier pins for one issuer. `kg: None` accepts any key generation, or none.
 #[derive(Clone, Debug)]
 pub struct Expect<'a> {
     pub key: &'a PublicKey,
     pub iss: &'a str,
     pub aud: &'a str,
-    pub kg: u64,
+    pub kg: Option<u64>,
 }
 
 /// The checked payload fields Islandmail uses. `raw` keeps the whole parsed payload.
@@ -42,11 +41,11 @@ pub struct Payload {
     pub kind: String,
     pub name: String,
     pub aud: String,
-    pub kg: u64,
+    pub kg: Option<u64>,
     pub scopes: Vec<String>,
     pub iat: f64,
-    pub exp: Option<f64>,
-    /// The holder's key, `ed25519:<base64url>`, when the token is key-bound.
+    pub exp: f64,
+    /// The holder's key, `ed25519:<base64url>`, when the token names it.
     pub cnf: Option<PublicKey>,
     pub raw: Value,
 }
@@ -81,9 +80,15 @@ pub fn verify(token: &str, ex: &Expect, now_ms: i64) -> Result<Payload> {
     ensure!(p.get("v").and_then(finite) == Some(1.0), "unsupported version");
     ensure!(text("iss") == Some(ex.iss), "issuer mismatch");
     ensure!(text("aud") == Some(ex.aud), "audience mismatch");
-    let kg = p.get("kg").and_then(finite).filter(|k| *k >= 0.0 && k.fract() == 0.0 && *k <= 9.0e15)
-        .ok_or_else(|| anyhow!("missing key generation"))? as u64;
-    ensure!(kg == ex.kg, "key generation mismatch");
+    let kg = match p.get("kg") {
+        None => None,
+        Some(v) => Some(finite(v).filter(|k| *k >= 0.0 && k.fract() == 0.0 && *k <= 9.0e15)
+            .ok_or_else(|| anyhow!("malformed key generation"))? as u64),
+    };
+    if let Some(want) = ex.kg {
+        ensure!(kg.is_some(), "missing key generation");
+        ensure!(kg == Some(want), "key generation mismatch");
+    }
     let sub = text("sub").filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("missing sub"))?;
     let name = text("name").filter(|s| !s.is_empty()).ok_or_else(|| anyhow!("missing name"))?;
     let scopes = p.get("scopes").and_then(Value::as_array)
@@ -98,13 +103,7 @@ pub fn verify(token: &str, ex: &Expect, now_ms: i64) -> Result<Payload> {
         }
     };
     let now = now_ms as f64 / 1000.0;
-    let exp = match p.get("exp") {
-        None => {
-            ensure!(cnf.is_some(), "expired");
-            None
-        }
-        Some(v) => Some(finite(v).filter(|e| *e > now).ok_or_else(|| anyhow!("expired"))?),
-    };
+    let exp = p.get("exp").and_then(finite).filter(|e| *e > now).ok_or_else(|| anyhow!("expired"))?;
     let iat = p.get("iat").and_then(finite).filter(|i| *i <= now + IAT_SKEW_S)
         .ok_or_else(|| anyhow!("iat in the future"))?;
     let kind = text("kind").unwrap_or("").to_string();
@@ -145,25 +144,26 @@ pub(crate) mod tests {
 
     /// Issuer seed for the vectors below (raw 32 bytes, hex).
     pub const ISSUER_SEED: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    /// Holder (agent) seed named by the vectors' `cnf`.
+    /// Holder (agent) seed named by the `good_cnf_kg` vector's `cnf`.
     pub const HOLDER_SEED: &str = "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb";
     /// Unix ms between every vector's iat and exp.
     pub const NOW_MS: i64 = 1_785_100_600_000;
 
-    // Minted by archipelago-home's own `mintToken` (src/token.ts) with the issuer seed above, and accepted by its
-    // `verifyToken` (which ignores `kg` and `cnf`): see testdata/aid1/mint.mjs. Payload order is mintToken's.
+    pub const AUD: &str = "islandmail:TESTNET";
+    // Minted by archipelago-home's own `mintToken` (src/token.ts) with the issuer seed above, in the payload shape its
+    // `mintFor` builds today, and checked by its `verifyToken`: see testdata/aid1/mint.mjs.
     pub const GOOD: &str = include_str!("../testdata/aid1/good.txt");
+    pub const GOOD_CNF_KG: &str = include_str!("../testdata/aid1/good_cnf_kg.txt");
     pub const EXPIRED: &str = include_str!("../testdata/aid1/expired.txt");
-    pub const NO_EXP_BOUND: &str = include_str!("../testdata/aid1/no_exp_bound.txt");
-    pub const NO_EXP_BEARER: &str = include_str!("../testdata/aid1/no_exp_bearer.txt");
-    pub const NO_KG: &str = include_str!("../testdata/aid1/no_kg.txt");
+    pub const NO_EXP: &str = include_str!("../testdata/aid1/no_exp.txt");
+    pub const LONG_LIVED: &str = include_str!("../testdata/aid1/long_lived.txt");
 
     fn issuer() -> PublicKey {
         Seed::from_hex(ISSUER_SEED).unwrap().public()
     }
 
     fn expect(key: &PublicKey) -> Expect<'_> {
-        Expect { key, iss: "id.test", aud: "islandmail", kg: 1 }
+        Expect { key, iss: "id.test", aud: AUD, kg: None }
     }
 
     fn reason(token: &str, ex: &Expect) -> String {
@@ -174,14 +174,17 @@ pub(crate) mod tests {
     fn vectors_from_the_reference_minter() {
         let k = issuer();
         let p = verify(GOOD.trim(), &expect(&k), NOW_MS).unwrap();
-        assert_eq!((p.sub.as_str(), p.name.as_str(), p.kind.as_str(), p.kg), ("agent:fable@guest", "Fable", "agent", 1));
-        assert_eq!(p.cnf, Some(Seed::from_hex(HOLDER_SEED).unwrap().public()));
+        assert_eq!((p.sub.as_str(), p.name.as_str(), p.kind.as_str(), p.kg), ("agent:fable@guest", "Fable", "agent", None));
+        assert_eq!((p.cnf, p.exp - p.iat), (None, 600.0));
         assert_eq!(p.scopes, vec!["mail:send".to_string()]);
+        let bound = verify(GOOD_CNF_KG.trim(), &expect(&k), NOW_MS).unwrap();
+        assert_eq!((bound.cnf, bound.kg), (Some(Seed::from_hex(HOLDER_SEED).unwrap().public()), Some(1)));
+        verify(GOOD_CNF_KG.trim(), &Expect { kg: Some(1), ..expect(&k) }, NOW_MS).unwrap();
+        assert_eq!(reason(GOOD, &Expect { kg: Some(1), ..expect(&k) }), "missing key generation");
         assert_eq!(reason(EXPIRED, &expect(&k)), "expired");
-        let bound = verify(NO_EXP_BOUND.trim(), &expect(&k), NOW_MS).unwrap();
-        assert!(bound.exp.is_none() && bound.cnf.is_some());
-        assert_eq!(reason(NO_EXP_BEARER, &expect(&k)), "expired", "a bearer token without exp is refused");
-        assert_eq!(reason(NO_KG, &expect(&k)), "missing key generation");
+        assert_eq!(reason(NO_EXP, &expect(&k)), "expired", "exp is required");
+        assert_eq!(verify(LONG_LIVED.trim(), &expect(&k), NOW_MS).unwrap().exp - 3300.0, NOW_MS as f64 / 1000.0,
+                   "the verifier accepts it; the home check bounds the lifetime");
     }
 
     #[test]
@@ -190,7 +193,7 @@ pub(crate) mod tests {
         let good = GOOD.trim();
         assert_eq!(reason(good, &Expect { aud: "docs", ..expect(&k) }), "audience mismatch");
         assert_eq!(reason(good, &Expect { iss: "id.evil", ..expect(&k) }), "issuer mismatch");
-        assert_eq!(reason(good, &Expect { kg: 2, ..expect(&k) }), "key generation mismatch");
+        assert_eq!(reason(GOOD_CNF_KG.trim(), &Expect { kg: Some(2), ..expect(&k) }), "key generation mismatch");
         let other = Seed::generate().public();
         assert_eq!(reason(good, &expect(&other)), "signature verify failed");
         // Flip one bit of every payload byte in turn: the literal bytes are signed, so each one fails.
@@ -228,11 +231,11 @@ pub(crate) mod tests {
             ("42", "malformed payload"),
             ("{not json", "payload not JSON"),
             (r#"{"v":2}"#, "unsupported version"),
-            (r#"{"v":1,"iss":"id.test","aud":"islandmail","kg":1.5}"#, "missing key generation"),
-            (r#"{"v":1,"iss":"id.test","aud":"islandmail","kg":1,"sub":"s","name":"n","scopes":[1]}"#, "malformed scopes"),
-            (r#"{"v":1,"iss":"id.test","aud":"islandmail","kg":1,"sub":"s","name":"n","scopes":[],"cnf":"ed25519:x"}"#,
+            (r#"{"v":1,"iss":"id.test","aud":"islandmail:TESTNET","kg":1.5}"#, "malformed key generation"),
+            (r#"{"v":1,"iss":"id.test","aud":"islandmail:TESTNET","sub":"s","name":"n","scopes":[1]}"#, "malformed scopes"),
+            (r#"{"v":1,"iss":"id.test","aud":"islandmail:TESTNET","sub":"s","name":"n","scopes":[],"cnf":"ed25519:x"}"#,
              "malformed cnf"),
-            (r#"{"v":1,"iss":"id.test","aud":"islandmail","kg":1,"sub":"s","name":"n","scopes":[],"exp":1e999}"#,
+            (r#"{"v":1,"iss":"id.test","aud":"islandmail:TESTNET","sub":"s","name":"n","scopes":[],"exp":1e999}"#,
              "payload not JSON"),
         ] {
             assert_eq!(reason(&mint(json), &expect(&k)), why, "{json}");

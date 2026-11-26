@@ -21,17 +21,19 @@ const priv = (hex) => createPrivateKey({ key: Buffer.concat([PKCS8, Buffer.from(
 const issuer = priv('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60');
 const holder = fingerprintOfPrivate(priv('4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb'));
 const NOW = 1785100600;
-const base = { v: 1, iss: 'id.test', sub: 'agent:fable@guest', kind: 'agent', name: 'Fable', aud: 'islandmail',
-               scopes: ['mail:send'], iat: NOW - 600 };
+// The payload today's mintFor (src/exchange.ts) builds for an agent, in its key order: no kg, no cnf, exp required.
+const base = { v: 1, iss: 'id.test', sub: 'agent:fable@guest', kind: 'agent', name: 'Fable', aud: 'islandmail:TESTNET',
+               scopes: ['mail:send'], iat: NOW - 300 };
 const drop = (o, k) => { const c = { ...o }; delete c[k]; return c; };
 const vectors = {
-  good: { ...base, exp: NOW + 3600, kg: 1, cnf: holder },
-  expired: { ...base, exp: NOW - 10, kg: 1, cnf: holder },
-  no_exp_bound: { ...base, kg: 1, cnf: holder },
-  no_exp_bearer: { ...base, kg: 1 },
-  no_kg: drop({ ...base, exp: NOW + 3600, cnf: holder }, 'kg'),
+  good: { ...base, exp: NOW + 300 },
+  // With FEDERATION.md §9.7's kg and cnf (cnf where mintFor would put it, after exp).
+  good_cnf_kg: { ...base, exp: NOW + 300, kg: 1, cnf: holder },
+  expired: { ...base, exp: NOW - 10 },
+  no_exp: drop({ ...base, exp: NOW + 300 }, 'exp'),
+  long_lived: { ...base, exp: NOW + 3300 },
 };
-const opts = { issuerId: fingerprintOfPrivate(issuer), iss: 'id.test', aud: 'islandmail', nowMs: NOW * 1000 };
+const opts = { issuerId: fingerprintOfPrivate(issuer), iss: 'id.test', aud: 'islandmail:TESTNET', nowMs: NOW * 1000 };
 for (const [name, payload] of Object.entries(vectors)) {
   const tok = mintToken(issuer, payload);
   writeFileSync(join(out, `${name}.txt`), tok + '\n');

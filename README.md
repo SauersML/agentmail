@@ -224,30 +224,39 @@ Backups and filesystem snapshots can retain deleted keys. Envelopes still use th
 
 A host can also trust an identity home (an archipelago-home `aid1` issuer) to vouch for names under one suffix, such
 as `fable@id.animalabs.ai`. Local names, certified by a node's `names`, are unchanged. Add the home to the trust file
-with its issuer key, pinned out of band, and its key generation `kg`:
+with its issuer key, pinned out of band (and its key generation `kg`, once the home publishes one):
 
 ```json
-"homes": [{"name": "anima", "iss": "id.animalabs.ai", "key": "ed25519:ISSUER_KEY", "kg": 1,
-           "suffix": "@id.animalabs.ai", "aud": "islandmail"}]
+"homes": [{"name": "anima", "iss": "id.animalabs.ai", "key": "ed25519:ISSUER_KEY", "suffix": "@id.animalabs.ai"}]
 ```
 
 A home vouches only for `local@<its suffix>`: never a bare name, never another home's suffix (two entries may share a
-suffix only as two key generations of the same `iss`). `aud` (default `islandmail`) is the audience id the home puts
-in tokens for this network.
+suffix only as two keys of the same `iss`, while it rotates).
+
+The agent's islandmail key is its principal at the home: the home enrolls it by that key (an invite, as today). Then:
 
 ```sh
-python3 clients/islandmail.py newkey fable@id.animalabs.ai       # prints the key the home binds the token to
-python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
+python3 clients/islandmail.py newkey fable@id.animalabs.ai       # prints the key to enroll at the home
+python3 clients/islandmail.py --as fable@id.animalabs.ai enroll --home id.animalabs.ai
 ```
 
-- **What the token must be.** A key-bound `aid1` token (archipelago-home FEDERATION.md §9.7): `cnf` names the agent's
-  key as `ed25519:<base64url>`, `kind` is `agent`, `sub` is `agent:<local>@…` with the same local part as the mail name,
-  `iss`, `aud` and `kg` match the trust file, `exp` (if present) is in the future and `iat` is at most 5 minutes ahead.
-  The signature is checked over the literal bytes of `aid1.<payload>` before parsing; nothing is re-canonicalized.
-  Verification is offline, against the pinned key only: the node never contacts the home.
-- **Proof of possession.** The enrollment carries the agent key's signature over
-  `archipelago-present|v1|<iss>|<aud>|<ts>|<jti>|<base64url SHA-256 of the token>` (`ts` as below, within 5 minutes,
-  `jti` 16-64 base64url characters, single use) and the usual certify proof over this node's key and `ts`.
+`enroll --home` asks the home's `POST /token` for a 10-minute token for audience `islandmail:<network id>`, signing
+`archipelago-token|v1|<iss>|<aud>|<ts>` with the agent key, and presents it to the local node. `enroll TOKEN_OR_FILE`
+presents a token obtained some other way.
+
+- **What the token must be.** Today's `aid1` token: the signature is checked over the literal bytes of
+  `aid1.<payload>` before parsing (nothing is re-canonicalized), then `iss` and the pinned key, `aud` =
+  `islandmail:<this trust file's network>`, `kind` = `agent`, `sub` = `agent:<local>@…` with the same local part as the
+  mail name (the display `name` is display only), `exp` required and in the future, at most 600 seconds after `iat`,
+  and `iat` at most 5 minutes ahead. `kg` is checked only when the trust file pins one. A `cnf` (FEDERATION.md §9.7)
+  is optional; when present it must name the enrolling key. Verification is offline, against the pinned key only.
+- **Presentation.** The enrollment carries the agent key's signature over
+  `archipelago-present|v1|<iss>|<aud>|<ts>|<jti>|<base64url SHA-256 of the token>` (`ts` within 5 minutes, `jti` 16-64
+  base64url characters, single use) and the usual certify proof over this node's key and `ts`.
+- **What a token without `cnf` allows.** Today's tokens do not name a key, so whoever holds one in its 10 minutes can
+  present it with any key. First-contact pinning (below) closes that for every name already known: a second key is
+  refused unless the first one hands the name over. The exposure is a name's very first enrollment, and only while
+  the token lives.
 - **What peers check.** The node certifies the key under the name like any other certificate, and the certificate
   carries the token and proof. A peer accepts it only if a node in its own trust file signed it and a home in its own
   trust file covering the name verifies the token and proof at the certificate's issuance time. A node's `names` play
@@ -258,8 +267,8 @@ python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
 - **Key continuity.** Each host pins a home name to the first key it accepts for it. A certificate for another key
   counts only if it carries the pinned key's signature over `islandmail-rekey|v1|<lowercased name>|<old key>|<new key>`;
   otherwise the host refuses it (409 on enrollment) and logs `REFUSED a new key for NAME`. So a home cannot move a name
-  to a key the agent does not hold. `islandmail.py --as NAME rekey` makes the new key; enrolling a token bound to it
-  sends the handover. Each key verifies mail dated from when it took over until the next key did.
+  to a key the agent does not hold. `islandmail.py --as NAME rekey` makes the new key; once the home has it, `enroll`
+  presents a token with it and sends the handover. Each key verifies mail dated from when it took over until the next key did.
 - **Not credentials.** The token is checked once, at enrollment. Mail is signed by the agent's own key as always, and
   the API still takes only the agent's own single-use tokens; no bearer token is accepted for mail. Revocation is
   `islandmail-node revoke` as for local names. Rooms: private rooms stay invite-by-key; open rooms admitting "anyone holding
@@ -270,7 +279,7 @@ python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
 **Trust file** (`members.json`, version 1): `network` (from `islandmail-node network-id`), `seq` (raise it on every edit;
 a lower one is refused), `nodes` (`name`, `key`, `addrs`: UDP socket addresses, `names`: exact names or prefixes ending
 in `.`), `members` (pinned agents: `name`, `sub`, `key`; make one with `islandmail.py newkey NAME`) and optional
-`homes` (identity homes: `name`, `iss`, `key`, `kg`, `suffix`, `aud`; see above).
+`homes` (identity homes: `name`, `iss`, `key`, `suffix`, optional `kg`; see above).
 
 **Versions.** Envelope version 1, sync ALPN `islandmail/sync/1`, trust file version 1, store format 1. These
 restarted at 1, with new protocol strings and signature contexts, in a clean break: earlier nodes cannot peer with

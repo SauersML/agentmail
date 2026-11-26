@@ -631,25 +631,42 @@ def cmd_newkey(a):
     print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
 
 
+def home_token(ident, home):
+    # Today's archipelago-home: POST /token with a key proof over archipelago-token|v1|<iss>|<aud>|<ts> mints a token
+    # for any audience. The home's principal is this key; ask for 10 minutes, the longest a node accepts.
+    home = checked_node_url(home.rstrip("/")) if "://" in home else checked_node_url("https://" + home)
+    iss = http("GET", home + "/.well-known/mcpl-identity").get("domain")
+    if not isinstance(iss, str) or not iss:
+        raise Fail("%s does not publish its domain at /.well-known/mcpl-identity" % home)
+    aud = "islandmail:" + node_info()["network"]
+    ts = canon_ts()
+    seed = bytes.fromhex(ident["seed"])
+    proof = ed25519_sign(seed, ("archipelago-token|v1|%s|%s|%s" % (iss, aud, ts)).encode())
+    body = {"id": ident["id"], "audience": aud, "timestamp": ts, "proof": b64u(proof), "ttl": "10m"}
+    return http("POST", home + "/token", body)["token"]
+
+
 def cmd_enroll(a):
     name = a.as_ or os.environ.get("ISLANDMAIL_AS")
     if not name or "@" not in name:
         raise Fail("enroll needs --as NAME@HOME-SUFFIX (make its key first with: newkey NAME@HOME-SUFFIX)")
     ident = load_identity(name, create=False)
-    token = read_token(a.token)
+    nxt = _read_identity(name, pending_path(name)) if os.path.exists(pending_path(name)) else None
+    if (a.token is None) == (a.home is None):
+        raise Fail("give a token (or a file holding one, or -), or --home URL to ask the home for one")
+    # A pending key (rekey) enrolls in place of the current one, which signs the handover.
+    key = nxt or ident
+    token = home_token(key, a.home) if a.home else read_token(a.token)
     cnf = aid1_payload(token).get("cnf")
-    if cnf == ident["id"]:
+    if cnf not in (None, key["id"]):
+        raise Fail("the token is bound to %s, not to the key being enrolled (%s)" % (cnf, key["id"]))
+    if nxt:
+        enroll(nxt, token, old=ident)
+        os.replace(pending_path(name), ident_path(name))
+        print("enrolled %s with its new key %s (handed over by %s)" % (name, nxt["id"], ident["id"]))
+    else:
         enroll(ident, token)
         print("enrolled %s with key %s" % (name, ident["id"]))
-        return
-    if os.path.exists(pending_path(name)):
-        nxt = _read_identity(name, pending_path(name))
-        if cnf == nxt["id"]:
-            enroll(nxt, token, old=ident)
-            os.replace(pending_path(name), ident_path(name))
-            print("enrolled %s with its new key %s (handed over by %s)" % (name, nxt["id"], ident["id"]))
-            return
-    raise Fail("the token is bound to %s, which is neither this identity's key nor its pending new key (rekey)" % cnf)
 
 
 def cmd_rekey(a):
@@ -658,7 +675,7 @@ def cmd_rekey(a):
     if "@" not in ident["name"]:
         raise Fail("rekey is for home names (name@home-suffix)")
     nxt = new_identity(ident["name"], ident["sub"], path=pending_path(ident["name"]))
-    sys.stderr.write("new key saved in %s; have your home issue a token for it, then run enroll with that token\n"
+    sys.stderr.write("new key saved in %s; once your home has it, run enroll (its old key signs the handover)\n"
                      % pending_path(ident["name"]))
     print(nxt["id"])
 
@@ -1367,10 +1384,11 @@ def main():
     p.add_argument("--node-key", help="the node's key (default: ISLANDMAIL_NODE_KEY, or ask the node)")
     p.set_defaults(fn=cmd_selftoken)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
-    p = sub.add_parser("enroll", help="have the node certify NAME@HOME with a key-bound aid1 token from that home")
-    p.add_argument("token", help="the aid1 token, a file holding it, or - for stdin")
+    p = sub.add_parser("enroll", help="have the node certify NAME@HOME with an aid1 token from that home")
+    p.add_argument("token", nargs="?", help="the aid1 token, a file holding it, or - for stdin")
+    p.add_argument("--home", help="ask this home (its URL or domain) for the token, signing with your key")
     p.set_defaults(fn=cmd_enroll)
-    sub.add_parser("rekey", help="make a new key for a home name; enroll it with a token bound to it").set_defaults(fn=cmd_rekey)
+    sub.add_parser("rekey", help="make a new key for a home name; enroll then hands the name to it").set_defaults(fn=cmd_rekey)
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)
     p.add_argument("--thread", help="default general; --private to one agent with no thread: your DM room")

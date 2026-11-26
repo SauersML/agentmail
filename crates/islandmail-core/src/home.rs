@@ -1,7 +1,11 @@
 //! Homes: archipelago-home identity issuers a host trusts to vouch for agent names under one suffix
-//! (`fable@id.animalabs.ai`). An agent enrolls at a trusted node with a key-bound `aid1` token from its home; the node
-//! then certifies the agent's key exactly as it certifies its own names, and the certificate carries the token and the
-//! agent's proof of possession, so every peer re-checks it offline against the home it pins in its own trust file.
+//! (`fable@id.animalabs.ai`). An agent enrolls at a trusted node with a short-lived `aid1` token its home minted for
+//! this network (`aud` = `islandmail:<network id>`, at most 10 minutes from `iat` to `exp`) and its own key's
+//! presentation signature over it. The node then certifies the agent's key exactly as it certifies its own names; the
+//! certificate carries the token and the presentation, so every peer re-checks them offline against the home it pins
+//! in its own trust file. Today's tokens do not name the agent's key (`cnf`), so a token is good for any key until it
+//! expires: the first key a host sees for a name is pinned there, and only that key can hand the name on. A token that
+//! does carry `cnf` must name the enrolling key.
 //! A home vouches only for `local@<its suffix>`: never a bare name, never another home's suffix. Mail is still signed
 //! by the agent's own key; the token is never a mail credential.
 
@@ -13,8 +17,12 @@ use crate::cert::{self, Cert, CERTIFY_SKEW_MS};
 use crate::keys::{self, fmt_key, parse_key, PublicKey};
 use crate::{b64u, b64u_decode, parse_ts};
 
-/// Default audience id: what the home names Islandmail as, in its `audiences.json`.
-pub const DEFAULT_AUD: &str = "islandmail";
+/// The audience id tokens for a network carry: `islandmail:<network id>` (the trust file's `network`).
+pub fn audience(network: &str) -> String {
+    format!("islandmail:{network}")
+}
+/// Longest lifetime (`exp - iat`) of a token an agent enrolls with, in seconds.
+pub const MAX_TOKEN_LIFE_S: f64 = 600.0;
 /// Longest domain in a home suffix, so `local@domain` fits the envelope's 120-character fields.
 pub const MAX_DOMAIN: usize = 64;
 
@@ -26,20 +34,15 @@ pub struct HomeEntry {
     pub name: String,
     /// The token's `iss`: the home's issuing domain.
     pub iss: String,
-    /// The pinned issuer key, `ed25519:<base64url>`, of key generation `kg`.
+    /// The pinned issuer key, `ed25519:<base64url>`.
     pub key: String,
-    pub kg: u64,
+    /// The key's generation, when the home publishes one; tokens must then carry the same `kg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kg: Option<u64>,
     /// The names it may vouch for: `@domain`. It covers exactly `local@domain`.
     pub suffix: String,
-    /// The audience id this network's tokens carry (default "islandmail").
-    #[serde(default = "default_aud")]
-    pub aud: String,
     // Design hook, not built: an open room may later admit "anyone holding scope X from home Y" by naming this
     // entry's `name` and a scope; the scopes are in the certificate's token, so peers could check them offline.
-}
-
-fn default_aud() -> String {
-    DEFAULT_AUD.into()
 }
 
 /// `domain` as a home suffix: lowercase DNS labels (letters, digits, hyphens), at least two, at most MAX_DOMAIN.
@@ -91,7 +94,7 @@ impl Rekey {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct HomeProof {
-    /// The home's key-bound token naming the agent key in `cnf`.
+    /// The home's token for this network.
     pub aid1: String,
     /// The proof of possession: its timestamp (the enrollment's), jti and the agent key's signature.
     pub ts: String,
@@ -116,7 +119,6 @@ impl HomeEntry {
         ensure!(fmt_key(&k) == self.key, "home {:?}: key must use canonical base64url", self.name);
         let domain = self.suffix.strip_prefix('@').ok_or_else(|| anyhow!("home {:?}: suffix must start with '@'", self.name))?;
         ensure!(valid_domain(domain), "home {:?}: suffix {:?} must be '@' and a lowercase domain", self.name, self.suffix);
-        ensure!(!self.aud.is_empty() && self.aud.len() <= 128, "home {:?}: invalid aud", self.name);
         Ok(())
     }
 
@@ -125,24 +127,26 @@ impl HomeEntry {
         split_name(name).is_some_and(|(_, d)| Some(d) == self.suffix.strip_prefix('@'))
     }
 
-    /// Checks a home enrollment for `name` and agent `key`, as the certifying node does at `at_ms` and every peer does
-    /// at the certificate's issuance time: the token verifies under this home's pinned key, generation, iss and aud,
-    /// is an agent's, names `key` in `cnf` and the same local name in `sub`, and the proof of possession is by `key`
-    /// within five minutes of `at_ms`.
-    pub fn check(&self, name: &str, key: &str, p: &HomeProof, at_ms: i64) -> Result<aid1::Payload> {
+    /// Checks a home enrollment for `name` and agent `key` on network `aud` (`audience(network)`), as the certifying
+    /// node does at `at_ms` and every peer does at the certificate's issuance time: the token verifies under this
+    /// home's pinned key (and generation, if pinned), iss and aud, lives at most 10 minutes, is an agent's, names the
+    /// same local name in `sub` and, if it has a `cnf`, this key; the presentation is by `key` within five minutes.
+    pub fn check(&self, name: &str, key: &str, p: &HomeProof, aud: &str, at_ms: i64) -> Result<aid1::Payload> {
         ensure!(self.covers(name), "{name} is not under {}", self.suffix);
         let issuer = parse_key(&self.key)?;
-        let t = aid1::verify(&p.aid1, &aid1::Expect { key: &issuer, iss: &self.iss, aud: &self.aud, kg: self.kg }, at_ms)
+        let t = aid1::verify(&p.aid1, &aid1::Expect { key: &issuer, iss: &self.iss, aud, kg: self.kg }, at_ms)
             .map_err(|e| anyhow!("{} token refused: {e}", self.name))?;
+        ensure!(t.exp - t.iat <= MAX_TOKEN_LIFE_S, "{} token lives {}s; enroll with one of at most {MAX_TOKEN_LIFE_S}s",
+                self.name, t.exp - t.iat);
         ensure!(t.kind == "agent", "{} token is for a {:?}, not an agent", self.name, t.kind);
         let agent = parse_key(key)?;
-        ensure!(t.cnf == Some(agent), "{} token is not bound to this key (cnf)", self.name);
+        ensure!(t.cnf.is_none_or(|k| k == agent), "{} token is bound to another key (cnf)", self.name);
         let (local, _) = split_name(name).expect("covered");
         ensure!(sub_local(&t.sub).is_some_and(|l| l.eq_ignore_ascii_case(local)),
                 "{} token is for {:?}, not {local}", self.name, t.sub);
         let ts = parse_ts(&p.ts).ok_or_else(|| anyhow!("proof ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
         ensure!((ts - at_ms).abs() <= CERTIFY_SKEW_MS, "the proof of possession is more than 5 minutes old");
-        aid1::check_presentation(&agent, &self.iss, &self.aud, &p.ts, &p.jti, &p.aid1, &p.pop)?;
+        aid1::check_presentation(&agent, &self.iss, aud, &p.ts, &p.jti, &p.aid1, &p.pop)?;
         if let Some(r) = &p.rekey {
             r.check(name, key)?;
         }
@@ -155,12 +159,12 @@ impl HomeEntry {
 ///
 /// The certifying node claims the issuance time, so it is bounded on both sides: not before the token's `iat`, and not
 /// more than five minutes after this host's clock when it receives the certificate (a future-dated claim).
-pub fn check_cert(homes: &[HomeEntry], c: &Cert) -> Result<()> {
-    check_cert_at(homes, c, crate::now_millis())
+pub fn check_cert(homes: &[HomeEntry], network: &str, c: &Cert) -> Result<()> {
+    check_cert_at(homes, network, c, crate::now_millis())
 }
 
 /// `check_cert` with this host's clock at `now_ms`.
-pub fn check_cert_at(homes: &[HomeEntry], c: &Cert, now_ms: i64) -> Result<()> {
+pub fn check_cert_at(homes: &[HomeEntry], network: &str, c: &Cert, now_ms: i64) -> Result<()> {
     match (&c.home, is_home_name(&c.name)) {
         (None, false) => Ok(()),
         (Some(_), false) => bail!("a home proof on a name outside every home suffix"),
@@ -170,7 +174,7 @@ pub fn check_cert_at(homes: &[HomeEntry], c: &Cert, now_ms: i64) -> Result<()> {
             ensure!(at <= now_ms.saturating_add(CERTIFY_SKEW_MS), "certificate for {} is dated in the future", c.name);
             let mut last = anyhow!("no home in this host's trust file vouches for {}", c.name);
             for h in homes.iter().filter(|h| h.covers(&c.name)) {
-                match h.check(&c.name, &c.key, p, at) {
+                match h.check(&c.name, &c.key, p, &audience(network), at) {
                     Ok(t) if t.iat * 1000.0 <= at as f64 => return Ok(()),
                     Ok(_) => last = anyhow!("certificate for {} is dated before its token's iat", c.name),
                     Err(e) => last = e,
@@ -184,18 +188,20 @@ pub fn check_cert_at(homes: &[HomeEntry], c: &Cert, now_ms: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aid1::tests::{GOOD, HOLDER_SEED, ISSUER_SEED, NOW_MS};
+    use crate::aid1::tests::{AUD, GOOD, GOOD_CNF_KG, HOLDER_SEED, ISSUER_SEED, LONG_LIVED, NOW_MS};
     use crate::keys::Seed;
+
+    const NET: &str = "TESTNET";
 
     pub fn entry() -> HomeEntry {
         HomeEntry { name: "test".into(), iss: "id.test".into(), key: fmt_key(&Seed::from_hex(ISSUER_SEED).unwrap().public()),
-                    kg: 1, suffix: "@id.test".into(), aud: DEFAULT_AUD.into() }
+                    kg: None, suffix: "@id.test".into() }
     }
 
     fn proof(holder: &Seed, token: &str, ts_ms: i64) -> HomeProof {
         let ts = crate::ts_from_millis(ts_ms);
         let jti = b64u(&[7u8; 16]);
-        let pop = b64u(&holder.sign(aid1::present_statement("id.test", DEFAULT_AUD, &ts, &jti, token).as_bytes()));
+        let pop = b64u(&holder.sign(aid1::present_statement("id.test", AUD, &ts, &jti, token).as_bytes()));
         HomeProof { aid1: token.into(), ts, jti, pop, rekey: None }
     }
 
@@ -203,6 +209,7 @@ mod tests {
     fn names_and_suffixes() {
         let h = entry();
         h.validate().unwrap();
+        assert_eq!(audience(NET), AUD);
         assert!(h.covers("fable@id.test") && h.covers("Fable@id.test"));
         for bad in ["fable", "fable@other.test", "fable@sub.id.test", "fable@ID.test", "@id.test", "a@b@id.test", "all@id.test"] {
             assert!(!h.covers(bad), "{bad}");
@@ -219,17 +226,27 @@ mod tests {
         let key = fmt_key(&holder.public());
         let tok = GOOD.trim();
         let p = proof(&holder, tok, NOW_MS);
-        h.check("fable@id.test", &key, &p, NOW_MS).unwrap();
-        assert!(h.check("other@id.test", &key, &p, NOW_MS).is_err(), "sub names another agent");
-        assert!(h.check("fable", &key, &p, NOW_MS).is_err(), "bare name");
-        assert!(h.check("fable@else.test", &key, &p, NOW_MS).is_err(), "another suffix");
-        assert!(h.check("fable@id.test", &fmt_key(&Seed::generate().public()), &p, NOW_MS).is_err(), "cnf names another key");
-        assert!(h.check("fable@id.test", &key, &p, NOW_MS + 400_000).is_err(), "stale proof");
-        assert!(HomeEntry { kg: 2, ..entry() }.check("fable@id.test", &key, &p, NOW_MS).is_err());
-        assert!(HomeEntry { aud: "docs".into(), ..entry() }.check("fable@id.test", &key, &p, NOW_MS).is_err());
-        let mut forged = p.clone();
-        forged.pop = b64u(&Seed::generate().sign(b"x"));
-        assert!(h.check("fable@id.test", &key, &forged, NOW_MS).is_err(), "proof by another key");
+        h.check("fable@id.test", &key, &p, AUD, NOW_MS).unwrap();
+        // Today's tokens name no key: any key presenting one is accepted (first-contact pinning does the rest).
+        let other = Seed::generate();
+        h.check("fable@id.test", &fmt_key(&other.public()), &proof(&other, tok, NOW_MS), AUD, NOW_MS).unwrap();
+        assert!(h.check("other@id.test", &key, &p, AUD, NOW_MS).is_err(), "sub names another agent");
+        assert!(h.check("fable", &key, &p, AUD, NOW_MS).is_err(), "bare name");
+        assert!(h.check("fable@else.test", &key, &p, AUD, NOW_MS).is_err(), "another suffix");
+        assert!(h.check("fable@id.test", &key, &p, "islandmail:OTHER", NOW_MS).is_err(), "another network");
+        assert!(h.check("fable@id.test", &fmt_key(&other.public()), &p, AUD, NOW_MS).is_err(), "proof by another key");
+        assert!(h.check("fable@id.test", &key, &p, AUD, NOW_MS + 400_000).is_err(), "stale proof");
+        assert!(HomeEntry { kg: Some(1), ..entry() }.check("fable@id.test", &key, &p, AUD, NOW_MS).is_err(), "no kg");
+        let long = h.check("fable@id.test", &key, &proof(&holder, LONG_LIVED.trim(), NOW_MS), AUD, NOW_MS).unwrap_err();
+        assert!(long.to_string().contains("lives 3600s"), "{long}");
+        // A token with cnf and kg: the key must be the cnf key.
+        let bound = proof(&holder, GOOD_CNF_KG.trim(), NOW_MS);
+        HomeEntry { kg: Some(1), ..entry() }.check("fable@id.test", &key, &bound, AUD, NOW_MS).unwrap();
+        let mut stolen = proof(&other, GOOD_CNF_KG.trim(), NOW_MS);
+        stolen.rekey = None;
+        let e = h.check("fable@id.test", &fmt_key(&other.public()), &stolen, AUD, NOW_MS).unwrap_err();
+        assert!(e.to_string().contains("bound to another key"), "{e}");
+        assert!(HomeEntry { kg: Some(2), ..entry() }.check("fable@id.test", &key, &bound, AUD, NOW_MS).is_err());
     }
 
     #[test]
@@ -237,18 +254,20 @@ mod tests {
         let h = entry();
         let holder = Seed::from_hex(HOLDER_SEED).unwrap();
         let node = Seed::generate();
-        let iat_ms = 1_785_100_000_000; // the GOOD vector's iat
+        let iat_ms = NOW_MS - 300_000; // the GOOD vector's iat
         let cert = |issued_ms: i64| {
             let p = proof(&holder, GOOD.trim(), issued_ms);
             Cert::issue_home(&node, "fable@id.test", &holder.public(), &crate::ts_from_millis(issued_ms), p)
         };
         let homes = std::slice::from_ref(&h);
-        check_cert_at(homes, &cert(iat_ms), NOW_MS).unwrap();
-        let early = check_cert_at(homes, &cert(iat_ms - 1), NOW_MS).unwrap_err().to_string();
+        check_cert_at(homes, NET, &cert(iat_ms), iat_ms).unwrap();
+        let early = check_cert_at(homes, NET, &cert(iat_ms - 1), iat_ms).unwrap_err().to_string();
         assert!(early.contains("before its token's iat"), "{early}");
-        check_cert_at(homes, &cert(NOW_MS + 300_000), NOW_MS).unwrap();
-        let future = check_cert_at(homes, &cert(NOW_MS + 300_001), NOW_MS).unwrap_err().to_string();
+        // Received at iat: dated up to five minutes later is accepted, one millisecond more is not.
+        check_cert_at(homes, NET, &cert(iat_ms + 300_000), iat_ms).unwrap();
+        let future = check_cert_at(homes, NET, &cert(iat_ms + 300_001), iat_ms).unwrap_err().to_string();
         assert!(future.contains("dated in the future"), "{future}");
+        assert!(check_cert_at(homes, "OTHER", &cert(iat_ms), iat_ms).is_err(), "another network's trust file");
     }
 
     #[test]
