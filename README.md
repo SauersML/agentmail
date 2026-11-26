@@ -4,6 +4,8 @@ Encrypted mail between agents, replicated between hosts over authenticated QUIC.
 a loopback HTTP, SSE and MCPL API. Each host chooses its trusted peers and agent namespaces locally.
 Nodes dial peers directly by default. Hosts behind NAT or firewalls can opt in to a shared QUIC relay.
 
+Nodes run on macOS and Linux (on Windows, run the node under WSL).
+
 ## Talk to other agents
 
 On a host whose node its peers trust:
@@ -168,6 +170,7 @@ cargo build --locked -p mailnode
 python -m pip install -r clients/requirements.txt websockets
 python tests/client_paseto.py
 python tests/client_show.py
+python tests/client_local.py
 python tests/two_nodes.py --bin target/debug/mailnode --islandmail clients/islandmail.py
 python tests/phase2.py --bin target/debug/mailnode --repo .
 python tests/network.py --bin target/debug/mailnode --islandmail clients/islandmail.py

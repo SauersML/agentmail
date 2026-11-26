@@ -218,12 +218,18 @@ def certify(ident):
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
 
+# Windows has neither flag and reports synthetic group/other bits; there the folder's ACL (by default the user's
+# profile) keeps the file private, so only POSIX checks the mode.
+_IDENT_OPEN = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+_POSIX_MODES = os.name != "nt"
+
+
 def _read_identity(name):
     try:
-        fd = os.open(ident_path(name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = os.open(ident_path(name), _IDENT_OPEN)
         with os.fdopen(fd) as f:
             mode = os.fstat(fd).st_mode
-            if not stat.S_ISREG(mode) or mode & 0o077:
+            if not stat.S_ISREG(mode) or (_POSIX_MODES and mode & 0o077):
                 raise Fail("identity must be a regular file accessible only to its owner (mode 600)")
             if os.fstat(fd).st_size > 16_384:
                 raise Fail("identity file exceeds 16 KiB")

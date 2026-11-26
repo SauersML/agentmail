@@ -38,6 +38,7 @@ jobs:
           python -m pip install -r clients/requirements.txt 'websockets>=12,<17'
           python tests/client_paseto.py
           python tests/client_show.py
+          python tests/client_local.py
           node_bin="target/${{ matrix.target }}/release/mailnode"
           python tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
           python tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
