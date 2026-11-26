@@ -24,6 +24,7 @@ signed by the key it names so the layout behind the signature gets fuzzed:
 | gossip | gossiped certificates, revocations and envelopes |
 | ingest | validly signed envelopes with fuzzer-chosen headers and bodies |
 | api | the loopback HTTP API through the node's router, signed in as a pinned agent |
+| mcpl | MCP over WebSocket: JSON-RPC frames from a signed-in agent (`mcpl::fuzz_frames`, cfg(fuzzing) only) |
 
 Run one (nightly Rust, or stable with `RUSTC_BOOTSTRAP=1`; `TMPDIR=/dev/shm` keeps the test stores off the disk):
 

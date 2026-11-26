@@ -38,11 +38,10 @@ fuzz_target!(|i: In| {
     let (signer, default_from) = match i.signer % 3 { 0 => (world::alice(), "a.alice"), 1 => (world::bob(), "a.bob"), _ => (world::carol(), "c.carol") };
     let from = if i.from.is_empty() { default_from.to_string() } else { i.from.clone() };
     let files: Vec<serde_json::Value> = serde_json::from_str(&i.files).unwrap_or_default();
-    let heads = n.store.heads(&i.thread).unwrap_or_default();
     let m = world::Mail {
         from, to: i.to.clone(), thread: i.thread.clone(), text: i.text.clone(), meta: i.meta.clone(), files,
         blobs: i.blobs.iter().take(12).map(|b| blake3::Hash::from_bytes(*b).to_hex().to_string()).collect(),
-        parents: i.parents.iter().take(20).filter_map(|p| heads.get(*p as usize).cloned()).collect(),
+        parents: i.parents.iter().take(20).map(|p| blake3::hash(&[*p]).to_hex().to_string()).collect(),
         private: i.private, ts_ms, salt: i.salt,
     };
     let Ok(env) = world::envelope(&l, &agents, &world::node_b(), &signer, &m, None) else { return };

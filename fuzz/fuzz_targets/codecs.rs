@@ -32,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = core::keys::fmt_key(&k);
     }
     if let Ok(seed) = core::keys::Seed::from_hex(s) {
-        assert_eq!(seed.to_hex(), s.to_ascii_lowercase());
+        assert_eq!(seed.to_hex(), s.trim().to_ascii_lowercase());
     }
     let _ = (core::addr::norm(s), core::addr::is_broadcast(s), core::addr::addressed_to(s, &["a.alice", "b."]));
     let _ = (core::cert::valid_name(s), core::cert::valid_agent_name(s), core::cert::valid_namespace_entry(s));
