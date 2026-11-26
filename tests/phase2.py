@@ -125,14 +125,14 @@ def main():
         rc, _ = im(pb, "bob", "download", fid, "-o", "got.bin")
         with open(existing, "rb") as dst:
             check("downloading again preserves an existing destination", rc != 0 and dst.read() == b"keep existing file")
-        big = urllib.request.Request("http://127.0.0.1:%d/api/files?name=big" % pa, data=b"x" * (25 * 1024 * 1024 + 10), method="POST",
+        big = urllib.request.Request("http://127.0.0.1:%d/api/files?name=big" % pa, data=b"x" * (100 * 1024 * 1024 + 10), method="POST",
                                      headers={"Authorization": "Bearer " + atok(pa, "alice"), "Content-Type": "application/octet-stream"})
         try:
             urllib.request.urlopen(big, timeout=60)
             code = 200
         except urllib.error.HTTPError as e:
             code = e.code
-        check("upload over 25 MiB refused (413)", code == 413, str(code))
+        check("upload over 100 MiB refused (413)", code == 413, str(code))
 
         # 5. Local trust change: seq 2 (adds node C and member u.dave) given only to A.
         m2 = member_list(2, ["A", "B", "C"], extra_members=["dave"])

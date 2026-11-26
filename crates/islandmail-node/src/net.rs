@@ -27,10 +27,11 @@ use crate::node::Node;
 pub const SYNC_ALPN: &[u8] = b"islandmail/sync/1";
 const MAX_GOSSIP: usize = 1 << 20;
 const MAX_REQ: usize = 1 << 20;
-const MAX_RESP: usize = 64 << 20;
+/// Large enough for a `blob` answer: an encrypted attachment (MAX_FILE + 40 bytes) in base64 inside JSON.
+const MAX_RESP: usize = 4 * (crate::node::MAX_FILE + 40).div_ceil(3) + (1 << 20);
 const IDS_PER_GET: usize = 200;
 /// A `get` answer stops adding envelopes past this many bytes (it always carries at least one), so it stays under
-/// MAX_RESP even when every envelope is near the size limit (200 of those are ~110 MiB); the asker requests the rest.
+/// 64 MiB even when every envelope is near the size limit (200 of those are ~110 MiB); the asker requests the rest.
 const GET_BUDGET: usize = 32 << 20;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -593,7 +594,8 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 let c = &c;
                 let mut after = blob_cursors.remove(&peer).unwrap_or_default();
                 async move {
-                    match tokio::time::timeout(Duration::from_secs(120), c.sync_with(peer, &mut after)).await {
+                    // Room for a full-size attachment over a slow link (100 MiB in 10 minutes is about 1.4 Mbit/s).
+                    match tokio::time::timeout(Duration::from_secs(600), c.sync_with(peer, &mut after)).await {
                         Ok(Ok(k)) if k > 0 => tracing::info!("periodic sync with {}: {k} new", peer.fmt_short()),
                         Ok(Ok(_)) => {}
                         Ok(Err(e)) => tracing::debug!("periodic sync with {} failed: {e:#}", peer.fmt_short()),

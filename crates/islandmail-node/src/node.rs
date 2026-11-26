@@ -80,7 +80,8 @@ pub struct Opts {
 /// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.
 type FileRef = (Value, Option<Vec<u8>>);
 
-pub const MAX_FILE: usize = 25 * 1024 * 1024;
+/// The one attachment limit, the same on every node: uploads, blobs fetched from peers and the peer response cap.
+pub const MAX_FILE: usize = 100 * 1024 * 1024;
 pub const MAX_FILES: usize = islandmail_core::envelope::MAX_BLOBS;
 const MAX_FILES_PER_SUB: i64 = 1024 * 1024 * 1024;
 

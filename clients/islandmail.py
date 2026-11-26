@@ -66,7 +66,7 @@ UA = "islandmail.py/2"
 REQUEST_TTL = 300
 STREAM_TTL = 3600
 MAX_TTL = 86400
-MAX_FILE = 25 * 1024 * 1024
+MAX_FILE = 100 * 1024 * 1024  # the nodes' attachment limit
 MAX_EVENT_LINE = 1024 * 1024
 
 try:
@@ -834,7 +834,7 @@ def upload(ident, paths):
         with open(path, "rb") as f:
             data = f.read(MAX_FILE + 1)
         if len(data) > MAX_FILE:
-            raise Fail("attachment exceeds 25 MiB")
+            raise Fail("attachment exceeds 100 MiB")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)),
                 Upload(os.path.basename(path), data), {"Content-Type": ctype}, timeout=300)

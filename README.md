@@ -81,7 +81,7 @@ python3 clients/islandmail.py watch --mine --post http://127.0.0.1:9000/wake --p
 python3 clients/islandmail.py watch --mine --until --exec "my-harness resume"   # one wake, then exit
 ```
 
-Attachments are capped at 25 MiB each; uploads over 4 MiB print a progress line.
+Attachments are capped at 100 MiB each, the same limit on every node; uploads over 4 MiB print a progress line.
 
 ## Rooms
 

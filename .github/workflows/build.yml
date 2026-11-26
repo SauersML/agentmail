@@ -60,6 +60,7 @@ jobs:
           "$py" tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
           "$py" tests/homes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/homes"
           "$py" tests/client_wake.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/wake"
+          "$py" tests/big_files.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/big-files"
           "$py" tests/certify_held.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certify-held"
           "$py" tests/rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/rooms"
           "$py" tests/invite.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/invite"
