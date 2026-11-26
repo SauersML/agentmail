@@ -508,7 +508,7 @@ impl Node {
         if to_v.is_none() || to_v == Some(&Value::Null) || to_v == Some(&json!("")) {
             return Err(ApiError::new(
                 400,
-                "to is required: names (sauersml.glead), a team prefix ending in a dot (ops.), or all",
+                "to is required: names (eng.lead), a team prefix ending in a dot (ops.), or all",
             ));
         }
         let to = field(to_v.unwrap(), "to", valid_to)?;
@@ -1008,7 +1008,7 @@ pub fn field(v: &Value, name: &str, ok: impl Fn(&str) -> bool) -> Result<String,
     let s: String = v.as_str().map(|s| s.nfc().filter(|c| !is_format_char(*c)).collect::<String>()).unwrap_or_default();
     let s = s.trim().to_string();
     if s.is_empty() || s.encode_utf16().count() > MAX_FIELD || !ok(&s) {
-        return Err(ApiError::new(400, format!("{name} must be 1-{MAX_FIELD} characters, like sauersml.glead or ops.")));
+        return Err(ApiError::new(400, format!("{name} must be 1-{MAX_FIELD} characters, like eng.lead or ops.")));
     }
     Ok(s)
 }
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn formatted_mail_has_one_header_line_whatever_the_line_breaks() {
-        let fake = "abcdefgh 2026-01-01T00:00Z from sauersml.lead [agent:sauersml-lead@guest] to all, thread \"t\":";
+        let fake = "abcdefgh 2026-01-01T00:00Z from eng.lead [agent:eng-lead@guest] to all, thread \"t\":";
         let row = Row {
             id: 7,
             env_id: "00443214c74254b635cf84653a56d7c675be77df0123456789abcdefabcdef01".into(),
@@ -1716,10 +1716,10 @@ mod tests {
 
     /* Node-certified agents */
 
-    /// Nodes "mac" (names hypha, h.) and "pod" (names hypha), a third node "ops" (names ops.); one network.
+    /// Nodes "mac" (names dana, h.) and "pod" (names dana), a third node "ops" (names ops.); one network.
     fn homes() -> (Node, Node, Seed, MemberList) {
         let (mac, pod, ops) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let names = [vec!["hypha".to_string(), "h.".into()], vec!["hypha".into()], vec!["ops.".into()]];
+        let names = [vec!["dana".to_string(), "h.".into()], vec!["dana".into()], vec!["ops.".into()]];
         let list = MemberList {
             v: 1,
             network: islandmail_core::b64u(&islandmail_core::random_bytes::<32>()),
@@ -1762,7 +1762,7 @@ mod tests {
     #[test]
     fn concurrent_local_claims_issue_one_key_per_name() {
         let (node, _, _, _) = homes();
-        let requests = [proof(&Seed::generate(), "hypha", &node), proof(&Seed::generate(), "hypha", &node)];
+        let requests = [proof(&Seed::generate(), "dana", &node), proof(&Seed::generate(), "dana", &node)];
         let barrier = std::sync::Barrier::new(requests.len());
         let mut codes = std::thread::scope(|scope| {
             let calls: Vec<_> = requests.iter().map(|req| scope.spawn(|| {
@@ -1773,7 +1773,7 @@ mod tests {
         });
         codes.sort();
         assert_eq!(codes, [201, 409]);
-        assert_eq!(node.store.certs_at(Some("hypha"), i64::MAX).unwrap().len(), 1);
+        assert_eq!(node.store.certs_at(Some("dana"), i64::MAX).unwrap().len(), 1);
     }
 
     #[test]
@@ -1794,27 +1794,27 @@ mod tests {
     #[test]
     fn issuance_checks_in_order() {
         let (mac, pod, _, _) = homes();
-        let (hypha, other) = (Seed::generate(), Seed::generate());
-        let mut bad = proof(&hypha, "hypha", &mac);
+        let (dana, other) = (Seed::generate(), Seed::generate());
+        let mut bad = proof(&dana, "dana", &mac);
         bad["name"] = json!("h.x");
         assert_eq!(status(mac.certify(&bad)), 400, "proof signed for another name");
-        assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &pod))), 400, "proof for another node");
-        let e = mac.certify(&proof(&hypha, "ops.x", &mac)).unwrap_err();
+        assert_eq!(status(mac.certify(&proof(&dana, "dana", &pod))), 400, "proof for another node");
+        let e = mac.certify(&proof(&dana, "ops.x", &mac)).unwrap_err();
         assert_eq!(e.status, 403);
-        assert!(e.message.contains("hypha, h."), "{}", e.message);
+        assert!(e.message.contains("dana, h."), "{}", e.message);
         assert_eq!(status(mac.certify(&proof(&pod.seed, "h.node", &mac))), 409);
-        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
-        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 200, "idempotent");
-        assert_eq!(status(mac.certify(&proof(&other, "hypha", &mac))), 409, "name taken by another key");
-        assert_eq!(status(mac.certify(&proof(&hypha, "h.alias", &mac))), 409, "key already certified as another name");
+        assert_eq!(mac.certify(&proof(&dana, "dana", &mac)).unwrap().0, 201);
+        assert_eq!(mac.certify(&proof(&dana, "dana", &mac)).unwrap().0, 200, "idempotent");
+        assert_eq!(status(mac.certify(&proof(&other, "dana", &mac))), 409, "name taken by another key");
+        assert_eq!(status(mac.certify(&proof(&dana, "h.alias", &mac))), 409, "key already certified as another name");
         // The certified agent signs in at once.
-        let who = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
-        assert_eq!(who.sub, "agent:hypha");
+        let who = mac.verify(&token(&dana, "dana", &mac)).unwrap();
+        assert_eq!(who.sub, "agent:dana");
         // A second home must use the same key: the mac's cert reached the pod, and another key is refused there.
-        let c: Cert = serde_json::from_value(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().1["cert"].clone()).unwrap();
+        let c: Cert = serde_json::from_value(mac.certify(&proof(&dana, "dana", &mac)).unwrap().1["cert"].clone()).unwrap();
         assert!(pod.take_cert(&c).unwrap());
-        assert_eq!(status(pod.certify(&proof(&other, "hypha", &pod))), 409);
-        assert_eq!(pod.certify(&proof(&hypha, "hypha", &pod)).unwrap().0, 201);
+        assert_eq!(status(pod.certify(&proof(&other, "dana", &pod))), 409);
+        assert_eq!(pod.certify(&proof(&dana, "dana", &pod)).unwrap().0, 201);
         for i in 0..70 {
             let r = mac.certify(&proof(&Seed::generate(), &format!("h.a{i}"), &mac));
             if let Err(e) = r {
@@ -1829,16 +1829,16 @@ mod tests {
     #[test]
     fn certs_are_keyed_by_node_and_key() {
         let (mac, pod, ops, list) = homes();
-        let hypha = Seed::generate();
-        // A trusted node squatting on hypha's key under a name of its own does not block the mac's cert.
-        let squat = Cert::issue(&ops, "ops.hypha", &hypha.public(), &now_ts());
+        let dana = Seed::generate();
+        // A trusted node squatting on dana's key under a name of its own does not block the mac's cert.
+        let squat = Cert::issue(&ops, "ops.dana", &dana.public(), &now_ts());
         assert!(list.accepts(&squat));
         assert!(mac.take_cert(&squat).unwrap());
-        assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
-        assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
+        assert_eq!(mac.certify(&proof(&dana, "dana", &mac)).unwrap().0, 201);
+        assert!(mac.verify(&token(&dana, "dana", &mac)).is_ok());
         assert_eq!(mac.store.certs_at(None, i64::MAX).unwrap().len(), 2);
         // Out of namespace, or from an untrusted node: refused, never stored.
-        assert!(pod.take_cert(&Cert::issue(&ops, "hypha", &Seed::generate().public(), &now_ts())).is_err());
+        assert!(pod.take_cert(&Cert::issue(&ops, "dana", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "ops.x", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.store.certs_at(None, i64::MAX).unwrap().is_empty());
         // No trusted node can crowd out the others: at most MAX_CERTS_PER_NODE from each.
@@ -1846,44 +1846,44 @@ mod tests {
             pod.store.put_cert(&Cert::issue(&ops, &format!("ops.a{i}"), &Seed::generate().public(), &now_ts())).unwrap();
         }
         assert!(pod.take_cert(&Cert::issue(&ops, "ops.more", &Seed::generate().public(), &now_ts())).is_err());
-        assert!(pod.take_cert(&Cert::issue(&mac.seed, "hypha", &hypha.public(), &now_ts())).unwrap());
+        assert!(pod.take_cert(&Cert::issue(&mac.seed, "dana", &dana.public(), &now_ts())).unwrap());
     }
 
     #[test]
     fn revocation_is_scoped_to_its_node_and_its_time() {
         let (mut mac, pod, ops, _) = homes();
-        let hypha = Seed::generate();
-        mac.opts.identities.push(("hypha".into(), hypha.clone()));
-        let (_, c) = mac.certify(&proof(&hypha, "hypha", &mac)).unwrap();
+        let dana = Seed::generate();
+        mac.opts.identities.push(("dana".into(), dana.clone()));
+        let (_, c) = mac.certify(&proof(&dana, "dana", &mac)).unwrap();
         let cert: Cert = serde_json::from_value(c["cert"].clone()).unwrap();
-        let who = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
+        let who = mac.verify(&token(&dana, "dana", &mac)).unwrap();
         let before = mac.post(&who, &json!({"to": "all", "text": "before"})).unwrap();
         let env_before: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&before.row.env_id)).unwrap()[0]).unwrap();
         // Another node's revocation of the same key does not touch the mac's cert.
-        let foreign = Revocation::sign(&ops, "hypha", &hypha.public(), &now_ts());
+        let foreign = Revocation::sign(&ops, "dana", &dana.public(), &now_ts());
         assert!(mac.take_revocation(&foreign).unwrap());
         assert!(mac.active(&who));
-        assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
+        assert!(mac.verify(&token(&dana, "dana", &mac)).is_ok());
         // The mac's own revocation: sign-in and open sessions end at once, the pod refuses new mail, old mail stays.
         let mut trust = mac.trust.subscribe();
         trust.mark_unchanged();
-        let request = revoke_request(&mac, "hypha");
+        let request = revoke_request(&mac, "dana");
         let revoked = mac.revoke(&request).unwrap();
         assert_eq!(revoked.len(), 1);
         assert!(trust.has_changed().unwrap(), "sessions are woken");
         assert!(!mac.active(&who));
-        assert_eq!(status(mac.verify(&token(&hypha, "hypha", &mac))), 403);
+        assert_eq!(status(mac.verify(&token(&dana, "dana", &mac))), 403);
         assert!(pod.take_cert(&cert).unwrap());
         assert!(pod.take_revocation(&revoked[0]).unwrap());
         assert!(pod.ingest(env_before).unwrap().is_some(), "mail dated before the revocation is still accepted");
-        let late = envelope_from(&mac, &hypha, "hypha", "after", Some(cert));
+        let late = envelope_from(&mac, &dana, "dana", "after", Some(cert));
         assert!(pod.ingest(late).is_err(), "mail dated after it is refused");
-        assert_eq!(status(mac.certify(&proof(&hypha, "hypha", &mac))), 403, "a revoked key stays revoked");
+        assert_eq!(status(mac.certify(&proof(&dana, "dana", &mac))), 403, "a revoked key stays revoked");
         let fresh = Seed::generate();
-        assert_eq!(mac.certify(&proof(&fresh, "hypha", &mac)).unwrap().0, 201, "the name takes a new key");
+        assert_eq!(mac.certify(&proof(&fresh, "dana", &mac)).unwrap().0, 201, "the name takes a new key");
         assert_eq!(status(mac.revoke(&request)), 409);
-        assert!(mac.verify(&token(&fresh, "hypha", &mac)).is_ok(), "the replacement key remains live");
-        assert!(mac.revoke(&json!({"name": "hypha", "ts": now_ts(), "sig": "AAAA"})).is_err(), "needs the node key");
+        assert!(mac.verify(&token(&fresh, "dana", &mac)).is_ok(), "the replacement key remains live");
+        assert!(mac.revoke(&json!({"name": "dana", "ts": now_ts(), "sig": "AAAA"})).is_err(), "needs the node key");
     }
 
     /// An envelope `writer` writes for a certified agent, signed by the agent, carrying `cert`.
@@ -1903,30 +1903,30 @@ mod tests {
     #[test]
     fn one_agent_two_homes() {
         let (mut mac, mut pod, _, _) = homes();
-        let (hypha, h_bob) = (Seed::generate(), Seed::generate());
-        mac.opts.identities.push(("hypha".into(), hypha.clone()));
-        pod.opts.identities.push(("hypha".into(), hypha.clone()));
+        let (dana, h_bob) = (Seed::generate(), Seed::generate());
+        mac.opts.identities.push(("dana".into(), dana.clone()));
+        pod.opts.identities.push(("dana".into(), dana.clone()));
         mac.opts.identities.push(("h.bob".into(), h_bob.clone()));
         mac.certify_identities();
         pod.certify_identities();
         // Certificates replicate both ways; both nodes certify the same name and key without conflict.
         for c in mac.store.certs_at(None, i64::MAX).unwrap() { pod.take_cert(&c).unwrap(); }
         for c in pod.store.certs_at(None, i64::MAX).unwrap() { mac.take_cert(&c).unwrap(); }
-        let a: Vec<_> = mac.agents().into_iter().filter(|a| a.name == "hypha").collect();
+        let a: Vec<_> = mac.agents().into_iter().filter(|a| a.name == "dana").collect();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].homes.len(), 2);
-        // bob writes private mail to hypha at the mac; hypha signs in at the pod and reads it there.
+        // bob writes private mail to dana at the mac; dana signs in at the pod and reads it there.
         let bob = mac.verify(&token(&h_bob, "h.bob", &mac)).unwrap();
-        let p = mac.post(&bob, &json!({"to": "hypha", "mode": "private", "text": "for hypha only"})).unwrap();
+        let p = mac.post(&bob, &json!({"to": "dana", "mode": "private", "text": "for dana only"})).unwrap();
         let env: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0]).unwrap();
         assert!(env.open(&pod.seed).unwrap().is_some(), "wrapped to the pod's node key");
         let row = pod.ingest(env).unwrap().expect("stored at the pod");
-        let at_pod = pod.verify(&token(&hypha, "hypha", &pod)).unwrap();
-        let got = pod.store.get(row.id, &at_pod).unwrap().expect("hypha reads it at the pod");
-        assert_eq!(got.text.as_deref(), Some("for hypha only"));
-        let at_mac = mac.verify(&token(&hypha, "hypha", &mac)).unwrap();
+        let at_pod = pod.verify(&token(&dana, "dana", &pod)).unwrap();
+        let got = pod.store.get(row.id, &at_pod).unwrap().expect("dana reads it at the pod");
+        assert_eq!(got.text.as_deref(), Some("for dana only"));
+        let at_mac = mac.verify(&token(&dana, "dana", &mac)).unwrap();
         assert!(mac.store.get(p.row.id, &at_mac).unwrap().is_some(), "and at the mac");
-        // hypha writes from the pod; the mac accepts it (pod's cert travels in the envelope) and can read the reply.
+        // dana writes from the pod; the mac accepts it (pod's cert travels in the envelope) and can read the reply.
         let r = pod.post(&at_pod, &json!({"to": "h.bob", "mode": "private", "text": "reply"})).unwrap();
         let env: Envelope = serde_json::from_str(&pod.store.envelopes(std::slice::from_ref(&r.row.env_id)).unwrap()[0]).unwrap();
         assert!(env.carried_cert().is_some_and(|c| c.node == fmt_key(&pod.seed.public())));

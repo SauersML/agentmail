@@ -25,13 +25,13 @@ def main():
     im = os.path.abspath(a.islandmail)
     work = work_directory(a.workdir)
     os.makedirs(os.path.join(work, "keys"))
-    seed = os.path.join(work, "keys", "lab.seed")
+    seed = os.path.join(work, "keys", "dev.seed")
     pub = run(bin_, "keygen", seed)
     udp, port = free_port(socket.SOCK_DGRAM), free_port()
     trust = os.path.join(work, "trust.json")
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
-            {"name": "lab", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["lab."]}]}, f)
+            {"name": "dev", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["dev."]}]}, f)
     operator, held = os.path.join(work, "operator"), os.path.join(work, "operator", "identities")
     user_dir = os.path.join(work, "user")
 
@@ -42,12 +42,12 @@ def main():
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=60)
         return p.returncode, (p.stdout + p.stderr).strip()
 
-    # The operator makes lab.alice's key (no node needed) and keeps it in the node's identities_dir.
-    rc, out = cl(operator, "newkey", "lab.alice")
-    check("operator makes a key for lab.alice", rc == 0, out[-200:])
+    # The operator makes dev.alice's key (no node needed) and keeps it in the node's identities_dir.
+    rc, out = cl(operator, "newkey", "dev.alice")
+    check("operator makes a key for dev.alice", rc == 0, out[-200:])
     os.makedirs(os.path.join(user_dir, "identities"), mode=0o700)
-    with open(os.path.join(held, "lab.alice.json")) as f:  # the operator hands lab.alice its key file
-        write_private_json(os.path.join(user_dir, "identities", "lab.alice.json"), json.load(f))
+    with open(os.path.join(held, "dev.alice.json")) as f:  # the operator hands dev.alice its key file
+        write_private_json(os.path.join(user_dir, "identities", "dev.alice.json"), json.load(f))
     cfg = {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port, "iroh_port": udp,
            "node_key_file": seed, "members_file": trust, "sync_secs": 3, "identities_dir": held}
 
@@ -66,18 +66,18 @@ def main():
     check("certify identities_dir without identities_dir is refused at startup", *refused("bad", bad))
     check("an unknown certify value is refused at startup", *refused("typo", dict(cfg, certify="closed")))
 
-    node = Node(bin_, work, "lab", dict(cfg, certify="identities_dir"))
+    node = Node(bin_, work, "dev", dict(cfg, certify="identities_dir"))
     try:
         check("node starts with certify identities_dir", node.start())
-        rc, out = cl(user_dir, "--as", "lab.alice", "whoami")
-        check("the held identity signs in (certified at startup)", rc == 0 and "lab.alice" in out, out[-200:])
+        rc, out = cl(user_dir, "--as", "dev.alice", "whoami")
+        check("the held identity signs in (certified at startup)", rc == 0 and "dev.alice" in out, out[-200:])
         walkin = os.path.join(work, "walkin")
-        rc, out = cl(walkin, "--as", "lab.mallory", "whoami")
+        rc, out = cl(walkin, "--as", "dev.mallory", "whoami")
         check("a walk-in name is refused with 403", rc != 0 and "403" in out and "identities_dir" in out, out[-240:])
-        check("and its uncertified key is not kept", not os.path.exists(os.path.join(walkin, "identities", "lab.mallory.json")))
+        check("and its uncertified key is not kept", not os.path.exists(os.path.join(walkin, "identities", "dev.mallory.json")))
         rc, out = cl(walkin, "whoami")
         check("first use with the default name is refused too", rc != 0 and "403" in out, out[-240:])
-        rc, out = cl(user_dir, "--as", "lab.alice", "send", "--to", "lab.alice", "note to self")
+        rc, out = cl(user_dir, "--as", "dev.alice", "send", "--to", "dev.alice", "note to self")
         check("the held identity sends mail", rc == 0 and out.startswith("sent "), out[-200:])
     finally:
         node.stop()
@@ -86,8 +86,8 @@ def main():
     node = Node(bin_, work, "open", dict(cfg, data_dir=os.path.join(work, "data-open")))
     try:
         check("node starts with the default", node.start())
-        rc, out = cl(os.path.join(work, "walkin2"), "--as", "lab.bob", "whoami")
-        check("by default a local user certifies a free name", rc == 0 and "lab.bob" in out, out[-200:])
+        rc, out = cl(os.path.join(work, "walkin2"), "--as", "dev.bob", "whoami")
+        check("by default a local user certifies a free name", rc == 0 and "dev.bob" in out, out[-200:])
     finally:
         node.stop()
     failed = [r for r in RESULTS if not r[1]]

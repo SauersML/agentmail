@@ -200,14 +200,14 @@ mod tests {
 
     #[test]
     fn names_and_namespaces() {
-        assert!(valid_name("sauersml.lead") && valid_name("hypha") && valid_name("_x-1"));
+        assert!(valid_name("eng.lead") && valid_name("alice") && valid_name("_x-1"));
         assert!(!valid_name("all") && !valid_name("ALL") && !valid_name("a.") && !valid_name(".a") && !valid_name("a/b"));
         assert!(!valid_name("") && !valid_name(&"a".repeat(49)));
-        assert!(valid_namespace_entry("ops.") && valid_namespace_entry("hypha"));
+        assert!(valid_namespace_entry("ops.") && valid_namespace_entry("alice"));
         assert!(!valid_namespace_entry("*") && !valid_namespace_entry("all") && !valid_namespace_entry("all.")
                 && !valid_namespace_entry(".") && !valid_namespace_entry("a b."));
-        assert!(entry_covers("ops.", "Ops.Orchestrator") && entry_covers("hypha", "HYPHA"));
-        assert!(!entry_covers("ops.", "ops") && !entry_covers("ops.", "opswest.x") && !entry_covers("hypha", "hypha.x"));
+        assert!(entry_covers("ops.", "Ops.Bob") && entry_covers("alice", "ALICE"));
+        assert!(!entry_covers("ops.", "ops") && !entry_covers("ops.", "opswest.x") && !entry_covers("alice", "alice.x"));
     }
 
     #[test]

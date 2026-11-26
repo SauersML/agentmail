@@ -12,7 +12,7 @@ use crate::{b64u, b64u_decode};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Member {
-    /// Mail name (the token's `name`), e.g. sauersml.lead
+    /// Mail name (the token's `name`), e.g. eng.lead
     pub name: String,
     /// Durable principal id (the token's `sub`)
     pub sub: String,
@@ -279,10 +279,10 @@ pub(crate) mod tests {
     #[test]
     fn namespaces_are_checked_and_may_overlap_for_two_homes() {
         let mut l = list(&[], &[&Seed::generate(), &Seed::generate()]);
-        l.nodes[0].names = vec!["hypha".into(), "sauersml.".into()];
-        l.nodes[1].names = vec!["hypha".into()];
+        l.nodes[0].names = vec!["alice".into(), "eng.".into()];
+        l.nodes[1].names = vec!["alice".into()];
         l.validate().unwrap();
-        for bad in ["*", "all", "all.", "a b", "", "sauersml..", "/x"] {
+        for bad in ["*", "all", "all.", "a b", "", "eng..", "/x"] {
             l.nodes[1].names = vec![bad.into()];
             assert!(l.validate().is_err(), "{bad:?}");
         }

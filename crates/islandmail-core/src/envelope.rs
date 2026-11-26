@@ -593,10 +593,10 @@ mod tests {
         let salt = [7u8; 16];
         let plain = post_digest(&salt, "hi", &[]).unwrap();
         assert_eq!(plain, post_digest_meta(&salt, "hi", &[], "").unwrap(), "no meta: the digest before rooms");
-        let meta = r#"{"room":"hypha/x","mentions":["bob"]}"#;
+        let meta = r#"{"room":"dana/x","mentions":["bob"]}"#;
         let signed = post_digest_meta(&salt, "hi", &[], meta).unwrap();
         assert_ne!(signed, plain);
-        assert_ne!(signed, post_digest_meta(&salt, "hi", &[], r#"{"room":"hypha/x"}"#).unwrap());
+        assert_ne!(signed, post_digest_meta(&salt, "hi", &[], r#"{"room":"dana/x"}"#).unwrap());
     }
 
     #[test]
@@ -679,40 +679,40 @@ mod tests {
     #[test]
     fn node_certified_senders() {
         let (mac, pod, ops) = (Seed::generate(), Seed::generate(), Seed::generate());
-        let (hypha, bob, carol) = (Seed::generate(), Seed::generate(), Seed::generate());
+        let (dana, bob, carol) = (Seed::generate(), Seed::generate(), Seed::generate());
         let mut l = list(&[("b.carol", &carol)], &[&mac, &pod, &ops]);
-        l.nodes[0].names = vec!["hypha".into(), "sauersml.".into()];
-        l.nodes[1].names = vec!["hypha".into()];
+        l.nodes[0].names = vec!["dana".into(), "eng.".into()];
+        l.nodes[1].names = vec!["dana".into()];
         l.nodes[2].names = vec!["ops.".into()];
         l.validate().unwrap();
         let now = crate::now_millis();
         let ts = crate::ts_from_millis(now - 1000);
-        let mac_cert = Cert::issue(&mac, "hypha", &hypha.public(), &ts);
-        let pod_cert = Cert::issue(&pod, "hypha", &hypha.public(), &ts);
+        let mac_cert = Cert::issue(&mac, "dana", &dana.public(), &ts);
+        let pod_cert = Cert::issue(&pod, "dana", &dana.public(), &ts);
         let none = |_: &Cert| None;
 
         // A cert from a pinned node within its namespace is accepted, from the envelope alone.
         let agents = l.agents(std::slice::from_ref(&mac_cert), &none, now);
-        let e = certified_env(&l, &agents, &mac, "hypha", &hypha, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
-        assert_eq!(e.verify(&l, &agents, now).unwrap().sender_sub, "agent:hypha");
+        let e = certified_env(&l, &agents, &mac, "dana", &dana, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
+        assert_eq!(e.verify(&l, &agents, now).unwrap().sender_sub, "agent:dana");
         assert!(e.verify(&l, &l.agents(&[], &none, now), now).unwrap_err().to_string().contains("no certificate"));
 
         let boundary = now - 1000 - crate::cert::CERTIFY_SKEW_MS;
         for (t, allowed) in [(boundary - 1, false), (boundary, true)] {
-            let mail = certified_env(&l, &agents, &mac, "hypha", &hypha, "all", Mode::Members,
+            let mail = certified_env(&l, &agents, &mac, "dana", &dana, "all", Mode::Members,
                                      crate::ts_from_millis(t), Some(mac_cert.clone()));
             let dated = l.agents(std::slice::from_ref(&mac_cert), &none, t);
             assert_eq!(mail.verify(&l, &dated, now).is_ok(), allowed);
             assert_eq!(mail.verify(&l, &agents, now).is_ok(), allowed, "writer using its current roster");
         }
 
-        // Out of namespace: ops's node cannot vouch for sauersml.x, nor can an untrusted node.
-        let rogue = Cert::issue(&ops, "sauersml.x", &bob.public(), &ts);
+        // Out of namespace: ops's node cannot vouch for eng.x, nor can an untrusted node.
+        let rogue = Cert::issue(&ops, "eng.x", &bob.public(), &ts);
         assert!(!l.accepts(&rogue));
-        assert!(!l.accepts(&Cert::issue(&Seed::generate(), "hypha", &bob.public(), &ts)));
+        assert!(!l.accepts(&Cert::issue(&Seed::generate(), "dana", &bob.public(), &ts)));
         let agents = l.agents(std::slice::from_ref(&rogue), &none, now);
-        assert!(members::named(&agents, "sauersml.x").next().is_none());
-        assert!(certified_env(&l, &agents, &ops, "sauersml.x", &bob, "all", Mode::Members, crate::now_ts(), Some(rogue))
+        assert!(members::named(&agents, "eng.x").next().is_none());
+        assert!(certified_env(&l, &agents, &ops, "eng.x", &bob, "all", Mode::Members, crate::now_ts(), Some(rogue))
             .verify(&l, &agents, now).is_err());
 
         // A pin takes precedence: a cert for a pinned name with another key does not count.
@@ -722,13 +722,13 @@ mod tests {
         let agents = l2.agents(&[squat], &none, now);
         assert_eq!(members::named(&agents, "b.carol").map(|a| a.key).collect::<Vec<_>>(), vec![carol.public()]);
 
-        // Two homes: private mail to hypha opens at both of its nodes, and at no other.
+        // Two homes: private mail to dana opens at both of its nodes, and at no other.
         let both = [mac_cert.clone(), pod_cert.clone()];
         let agents = l.agents(&both, &none, now);
-        assert_eq!(members::named(&agents, "hypha").count(), 1);
-        let p = certified_env(&l, &agents, &pod, "hypha", &hypha, "b.carol", Mode::Private, crate::now_ts(), Some(pod_cert.clone()));
+        assert_eq!(members::named(&agents, "dana").count(), 1);
+        let p = certified_env(&l, &agents, &pod, "dana", &dana, "b.carol", Mode::Private, crate::now_ts(), Some(pod_cert.clone()));
         p.verify(&l, &agents, now).unwrap();
-        assert!(p.open(&mac).unwrap().is_some() && p.open(&pod).unwrap().is_some() && p.open(&hypha).unwrap().is_some());
+        assert!(p.open(&mac).unwrap().is_some() && p.open(&pod).unwrap().is_some() && p.open(&dana).unwrap().is_some());
         assert!(p.open(&ops).unwrap().is_none());
 
         // Revocation by the mac counts only against the mac's cert, and only from its time on.
@@ -737,12 +737,12 @@ mod tests {
         let revoked = |c: &Cert| (c.node == mac_key).then_some(rev_at);
         let early = crate::ts_from_millis(now - 800);
         let at = |t: i64| l.agents(std::slice::from_ref(&mac_cert), &revoked, t);
-        let old = certified_env(&l, &at(now - 800), &mac, "hypha", &hypha, "all", Mode::Members, early, Some(mac_cert.clone()));
+        let old = certified_env(&l, &at(now - 800), &mac, "dana", &dana, "all", Mode::Members, early, Some(mac_cert.clone()));
         assert!(old.verify(&l, &at(old.ts_ms()), now).is_ok(), "mail dated before the revocation still verifies");
-        let new = certified_env(&l, &at(now), &mac, "hypha", &hypha, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
+        let new = certified_env(&l, &at(now), &mac, "dana", &dana, "all", Mode::Members, crate::now_ts(), Some(mac_cert.clone()));
         assert!(new.verify(&l, &at(new.ts_ms()), now).is_err(), "mail dated after it does not");
         let agents = l.agents(&both, &revoked, now);
-        assert_eq!(members::named(&agents, "hypha").next().unwrap().homes, vec![pod.public()],
+        assert_eq!(members::named(&agents, "dana").next().unwrap().homes, vec![pod.public()],
                    "the pod's cert for the same key stays live");
     }
 }

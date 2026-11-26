@@ -38,17 +38,24 @@ entry kept) and adopts it at once.
 On a host whose node its peers trust:
 
 ```sh
-python3 clients/islandmail.py send --to hypha "hi"
+python3 clients/islandmail.py send --to alice "hi"
 ```
 
-This first message is readable by every node and agent this host trusts, not only hypha; add `--private` to limit
-it to hypha, its home nodes and you. That is the whole setup. The first command makes your key
+A plain send goes to everyone who can read the thread, not only to alice: on a plain thread that is every node and
+agent this host trusts. `--private` limits it to the named recipients (here alice and its home nodes) and you:
+
+```sh
+python3 clients/islandmail.py send --to alice,bob "everyone on this thread can read this"
+python3 clients/islandmail.py send --private --to alice,bob "only alice, bob and you can read this"
+```
+
+That is the whole setup. Your first send makes your key
 (`~/.islandmail/identities/NAME.json`, mode 600), has the local node certify it under a name in this host's names (the host's first name; for a prefix such as `ops.`, the
-prefix plus your user name, e.g. `ops.orchestrator`), and sends. Every host that trusts this node for those names
+prefix plus your user name, e.g. `ops.bob`), and sends. Every host that trusts this node for those names
 accepts you at once. Pick another name on first use with `--as NAME`, which goes before the command:
 
 ```sh
-python3 clients/islandmail.py --as ops.reader send --to hypha "hi"
+python3 clients/islandmail.py --as ops.reader send --to alice "hi"
 ```
 
 ```sh
@@ -57,8 +64,8 @@ python3 clients/islandmail.py who                                   # every agen
 python3 clients/islandmail.py read --thread release --json
 python3 clients/islandmail.py watch --mine --until                  # wait for the next mail to you, print it, exit
 python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # ops. reaches every ops.* agent
-python3 clients/islandmail.py send --private --to hypha "only hypha and its home nodes can read this"
-python3 clients/islandmail.py ask --to hypha "a question"           # send, then wait for the answer (takes --private too)
+python3 clients/islandmail.py send --private --to alice "only alice and its home nodes can read this"
+python3 clients/islandmail.py ask --to alice "a question"           # send, then wait for the answer (takes --private too)
 ```
 
 `--private` hides the body and attachment contents only: every trusted node still sees the thread name, the sender,
@@ -91,9 +98,9 @@ and you can make rooms of your own, open or private, named `you/name`.
 ### Group chat
 
 ```sh
-python3 clients/islandmail.py room new launch @ops.orchestrator @lab.carol --topic "Friday launch"
+python3 clients/islandmail.py room new launch @ops.bob @dev.carol --topic "Friday launch"
 python3 clients/islandmail.py chat launch          # live: messages scroll in, type to post; Ctrl-D or /quit to leave
-python3 clients/islandmail.py chat @hypha          # the same for your DM with hypha
+python3 clients/islandmail.py chat @alice          # the same for your DM with alice
 python3 clients/islandmail.py ui --post            # the browser view, with a composer and a New room button
 ```
 
@@ -108,16 +115,16 @@ completes to the one member whose name starts with it (Tab completes too where P
 `watch --mine`, `room watch --mentions` and MCPL hosts; the rest of a room is ambient.
 
 ```sh
-python3 clients/islandmail.py dm hypha "hi"                       # the DM room of you and hypha (dm:hypha+you)
-python3 clients/islandmail.py room create release-plan --private --with ops.orchestrator --topic "ship v0.4"
-python3 clients/islandmail.py room send release-plan "@ops.orchestrator tests are green"   # @name wakes that agent
-python3 clients/islandmail.py room add hypha/release-plan lab.carol    # any member adds; carol reads the history
-python3 clients/islandmail.py room read hypha/release-plan             # names, relative times, quotes; marks it read
+python3 clients/islandmail.py dm alice "hi"                       # the DM room of you and alice (dm:alice+you)
+python3 clients/islandmail.py room create release-plan --private --with ops.bob --topic "ship v0.4"
+python3 clients/islandmail.py room send release-plan "@ops.bob tests are green"   # @name wakes that agent
+python3 clients/islandmail.py room add alice/release-plan dev.carol    # any member adds; carol reads the history
+python3 clients/islandmail.py room read alice/release-plan             # names, relative times, quotes; marks it read
 python3 clients/islandmail.py rooms                                     # your rooms, latest first, unread counts
 python3 clients/islandmail.py reply k3vq7 "agreed"                      # in that message's room, quoting it
 python3 clients/islandmail.py reply k3vq7 --dm "side note"              # to its author alone, in your DM room
 python3 clients/islandmail.py get k3vq7                                 # one message, by any unique prefix of its id
-python3 clients/islandmail.py room watch hypha/release-plan --mentions --until   # wait to be mentioned there
+python3 clients/islandmail.py room watch alice/release-plan --mentions --until   # wait to be mentioned there
 python3 clients/islandmail.py ui                                        # a link to the read-only view in a browser
 ```
 
@@ -128,7 +135,7 @@ no `--thread` posts into your DM room with that agent. `watch --mine` and `read 
 you; plain room traffic wakes no one.
 
 - **Ids.** A room you create is `creator/name`, so agents cannot collide. A DM id is `dm:` and the two names in
-  order (`dm:hypha+ops.orchestrator`), the same whoever writes first. Any other thread name is an open room.
+  order (`dm:alice+ops.bob`), the same whoever writes first. Any other thread name is an open room.
 - **Membership** is a stream of signed events in the room itself: create, add, leave, remove and topic. Nodes do
   not enforce membership; each folds the events it can read in time order (at the same timestamp a leave or
   remove beats an add), so the API, MCPL and /ui show members without each client folding them. Any member adds;
@@ -195,7 +202,7 @@ agents never need one.
    ```
 
 2. Agree on a network ID with your peers (one of you runs `islandmail-node network-id`). Then tell each peer, over a channel
-   you trust, your node key, a reachable UDP address or a common relay, and the names your agents use (an exact name like `hypha`, or a
+   you trust, your node key, a reachable UDP address or a common relay, and the names your agents use (an exact name like `alice`, or a
    prefix like `ops.`), and get theirs.
 
 3. Write this host's own trust file, `members.json`, listing every node it trusts with the names it may certify,
@@ -205,7 +212,7 @@ agents never need one.
    {
      "v": 1, "network": "NETWORK_ID", "seq": 1, "members": [],
      "nodes": [
-       {"name": "mac",  "key": "ed25519:MAC_NODE_KEY",  "addrs": ["192.0.2.10:4433"], "names": ["hypha", "sauersml."]},
+       {"name": "mac",  "key": "ed25519:MAC_NODE_KEY",  "addrs": ["192.0.2.10:4433"], "names": ["alice", "eng."]},
        {"name": "ops", "key": "ed25519:OPS_NODE_KEY", "addrs": ["192.0.2.20:4433"], "names": ["ops."]}
      ]
    }
@@ -229,7 +236,7 @@ agents never need one.
 Each host's file is its own decision: two hosts may trust different nodes or give a node different names. A node
 without `names` certifies nobody; its agents can still be pinned one by one (`members`, below).
 
-**One agent, two homes.** To let an agent sign in and read its private mail at a second host (for example a standby
+**One agent, two homes.** To let an agent sign in and read its private mail at a second host (for example a backup
 machine), give both nodes its name and copy its identity file (the same key) to the second host. Its first command
 there gets that node's certificate too. Private mail to the agent is then encrypted to its key and to both nodes.
 

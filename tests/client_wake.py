@@ -43,7 +43,7 @@ def main():
     trust = os.path.join(work, "trust.json")
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
-            {"name": "mac", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["hypha", "s."]}]}, f)
+            {"name": "mac", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["alice", "s."]}]}, f)
     node = Node(bin_, work, "mac", {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port,
                                     "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
@@ -57,20 +57,20 @@ def main():
         return p.returncode, p.stdout, p.stderr
 
     def send(text, thread="general"):
-        rc, out, err = cl("s.peer", "send", "--to", "hypha", "--thread", thread, text)
+        rc, out, err = cl("s.peer", "send", "--to", "alice", "--thread", thread, text)
         m = re.search(r"sent ([a-z2-7]{8}) ", out)
         return m.group(1) if rc == 0 and m else None
 
     def seq(mid):
         # Cursors are local seq numbers (only in --json); people see the shared id.
-        rc, out, _ = cl("hypha", "get", mid or "x", "--json")
+        rc, out, _ = cl("alice", "get", mid or "x", "--json")
         return json.loads(out)["seq"] if rc == 0 else None
 
     def watch(*args, timeout=20):
-        return cl("hypha", "watch", "--mine", "--until", *args, timeout=timeout)
+        return cl("alice", "watch", "--mine", "--until", *args, timeout=timeout)
 
     def background_watch(*args):
-        p = subprocess.Popen([sys.executable, im, "--as", "hypha", "watch", "--mine", "--until", *args], env=env,
+        p = subprocess.Popen([sys.executable, im, "--as", "alice", "watch", "--mine", "--until", *args], env=env,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=work)
         time.sleep(3)  # it has read its starting point and opened the stream
         return p
@@ -83,10 +83,10 @@ def main():
             out, err = p.communicate()
         return p.returncode, out, err
 
-    cursor = lambda name: os.path.join(client_dir, "watch-%s-hypha-%s.last" % (hashlib.sha256(pub.encode()).hexdigest(), name))
+    cursor = lambda name: os.path.join(client_dir, "watch-%s-alice-%s.last" % (hashlib.sha256(pub.encode()).hexdigest(), name))
     try:
         check("node starts", node.start())
-        check("two agents", cl("hypha", "whoami")[0] == 0 and cl("s.peer", "whoami")[0] == 0)
+        check("two agents", cl("alice", "whoami")[0] == 0 and cl("s.peer", "whoami")[0] == 0)
 
         # read moves the default watch cursor; re-arming watch does not replay what was read.
         with open(cursor("main"), "w") as f:
@@ -97,7 +97,7 @@ def main():
         with open(cursor("side"), "w") as f:
             f.write(str(seq(m1)))
         m2, m3 = send("two"), send("three")
-        rc, out, _ = cl("hypha", "read", "--to-me", "--latest", "20")
+        rc, out, _ = cl("alice", "read", "--to-me", "--latest", "20")
         check("read shows the new mail", rc == 0 and "> two" in out and "> three" in out, out[-200:])
         check("read moved the default cursor to the newest mail it showed", open(cursor("main")).read().strip() == str(seq(m3)))
         send("four")
@@ -109,11 +109,11 @@ def main():
         # A read filtered by thread does not move the cursor past mail it did not show.
         send("in thread x", "x")
         send("in thread y", "y")
-        rc, out, _ = cl("hypha", "read", "--thread", "y")
+        rc, out, _ = cl("alice", "read", "--thread", "y")
         check("thread read shows its mail", rc == 0 and "> in thread y" in out, out[-200:])
         rc, out, _ = watch()
         check("watch still wakes for the other thread's mail", rc == 0 and "> in thread x" in out, out[-200:])
-        rc, out, _ = cl("hypha", "read", "--after", "0", "--limit", "1")
+        rc, out, _ = cl("alice", "read", "--after", "0", "--limit", "1")
         rc2, out2, _ = watch()
         check("a read that starts before the cursor but stops below it changes nothing",
               rc == 0 and rc2 == 0 and "> in thread y" in out2, out2[-200:])
@@ -139,7 +139,7 @@ def main():
         ev = events[0] if events else {}
         check("--exec ran once for the new mail", rc == 0 and len(events) == 1, err[-200:])
         check("the hook got the message as JSON on stdin", ev.get("event", {}).get("message", {}).get("text") == nasty
-              and ev["event"]["me"] == "hypha" and ev["event"]["to_me"] is True and ev["event"]["private"] is False)
+              and ev["event"]["me"] == "alice" and ev["event"]["to_me"] is True and ev["event"]["private"] is False)
         check("arguments are split like a shell would, but nothing is expanded", ev.get("argv") == ["two words", "$HOME"], str(ev.get("argv")))
         e = ev.get("env", {})
         check("ISLANDMAIL_* variables", e.get("ISLANDMAIL_ID") == str(mid) and e.get("ISLANDMAIL_FROM") == "s.peer"
@@ -147,7 +147,7 @@ def main():
               and e.get("ISLANDMAIL_TO_ME") == "1" and e.get("ISLANDMAIL_MENTION") == "0", str(e))
         check("no shell ran the sender's text", not os.path.exists(pwned))
         p = background_watch("--exec", "%s %s %s" % (sys.executable, hook, got))
-        rc_s, _, _ = cl("s.peer", "send", "--private", "--to", "hypha", "secret")
+        rc_s, _, _ = cl("s.peer", "send", "--private", "--to", "alice", "secret")
         rc, out, err = finish(p)
         events = [json.loads(line) for line in open(got)]
         check("private mail is flagged", rc_s == 0 and rc == 0 and len(events) == 2
@@ -188,17 +188,17 @@ def main():
         data = os.urandom(6 * 1024 * 1024 + 123)
         with open(big, "wb") as f:
             f.write(data)
-        rc, out, err = cl("s.peer", "send", "--to", "hypha", "--file", big, "big file", timeout=120)
+        rc, out, err = cl("s.peer", "send", "--to", "alice", "--file", big, "big file", timeout=120)
         check("big upload prints progress", rc == 0 and "uploading big.bin" in err and "(100%)" in err, (out + err)[-300:])
         small = os.path.join(work, "small.txt")
         with open(small, "w") as f:
             f.write("tiny")
-        rc, out, err = cl("s.peer", "send", "--to", "hypha", "--file", small, "small file")
+        rc, out, err = cl("s.peer", "send", "--to", "alice", "--file", small, "small file")
         check("small upload prints none", rc == 0 and "uploading" not in err, err[-200:])
-        rc, out, _ = cl("hypha", "read", "--json", "--latest", "2")
+        rc, out, _ = cl("alice", "read", "--json", "--latest", "2")
         files = [f for m in (json.loads(out) if rc == 0 else []) for f in m.get("files", []) if f["name"] == "big.bin"]
         dest = os.path.join(work, "big.out")
-        rc, out, err = cl("hypha", "download", files[0]["id"], "-o", dest) if files else (1, "", "no file")
+        rc, out, err = cl("alice", "download", files[0]["id"], "-o", dest) if files else (1, "", "no file")
         check("the big attachment downloads byte for byte", rc == 0 and open(dest, "rb").read() == data, (out + err)[-200:])
     finally:
         node.stop()

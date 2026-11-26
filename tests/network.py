@@ -4,7 +4,7 @@ throwaway made here.
 
   python3 tests/network.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 
-Hosts: "mac" (names hypha, s.), "pod" (names hypha: a second home for hypha) and "ops" (names ops.). The mac's trust
+Hosts: "mac" (names alice, s.), "pod" (names alice: a second home for alice) and "ops" (names ops.). The mac's trust
 file also lists an offline peer. Checks: an agent's first `islandmail.py send` on a host just works (key made with
 mode 600, certified by its node, mail delivered to another host) with no per-agent pins; names outside a host's names
 are refused; one agent served by two homes signs in and reads its private mail at either; a node's revocation ends
@@ -56,7 +56,7 @@ def main():
     api = {h: free_port() for h in hosts}
     network = run(bin_, "network-id")
     long_prefix = "a" * 46 + "."
-    names = {"mac": ["hypha", "s."], "pod": ["x" * 47 + ".", long_prefix, "hypha"], "ops": ["ops."]}
+    names = {"mac": ["alice", "s."], "pod": ["x" * 47 + ".", long_prefix, "alice"], "ops": ["ops."]}
 
     def node_entry(h, names_=None):
         return {"name": h, "key": pub[h], "addrs": ["127.0.0.1:%d" % udp[h]], "names": names_ if names_ is not None else names.get(h, [])}
@@ -109,52 +109,52 @@ def main():
 
         # The first command on a fresh host: key, certificate, delivery. No pins anywhere.
         t0 = time.time()
-        rc, out = cl("ops", "send", "--to", "hypha", "first words from ops", user="orchestrator")
+        rc, out = cl("ops", "send", "--to", "alice", "first words from ops", user="bob")
         check("first `send` on a host works with no setup", rc == 0, out[-200:])
         check("it took about a second", time.time() - t0 < 5, "%.1fs" % (time.time() - t0))
-        path = ident("ops", "ops.orchestrator")
+        path = ident("ops", "ops.bob")
         check("the key is made under the host's names, owner-only", owner_only(path))
-        rc, out = cl("mac", "send", "--to", "ops.orchestrator", "hi ops, from hypha")
-        check("the mac's first command makes hypha (its first name)", rc == 0 and os.path.exists(ident("mac", "hypha")), out[-200:])
-        got, t = wait_for(lambda: [m for m in read("ops") if m.get("from") == "hypha"], timeout=15)
-        check("ops reads hypha's mail on another host", got and got[0]["text"] == "hi ops, from hypha", "%.1fs" % t)
-        rc, out = cl("ops", "send", "--to", "hypha", "a reply", user="orchestrator")
+        rc, out = cl("mac", "send", "--to", "ops.bob", "hi ops, from alice")
+        check("the mac's first command makes alice (its first name)", rc == 0 and os.path.exists(ident("mac", "alice")), out[-200:])
+        got, t = wait_for(lambda: [m for m in read("ops") if m.get("from") == "alice"], timeout=15)
+        check("ops reads alice's mail on another host", got and got[0]["text"] == "hi ops, from alice", "%.1fs" % t)
+        rc, out = cl("ops", "send", "--to", "alice", "a reply", user="bob")
         got, t = wait_for(lambda: [m for m in read("mac") if m.get("text") == "a reply"], timeout=15)
-        check("and hypha reads ops's reply", rc == 0 and bool(got), "%.1fs" % t)
+        check("and alice reads ops's reply", rc == 0 and bool(got), "%.1fs" % t)
 
         # Outside the host's names: refused, and the uncertified key is dropped.
-        rc, out = cl("ops", "--as", "s.mallory", "send", "--to", "hypha", "spoof")
+        rc, out = cl("ops", "--as", "s.mallory", "send", "--to", "alice", "spoof")
         check("a name outside the host's names is refused", rc != 0 and "403" in out, out[-160:])
         check("the refused key is not kept", not os.path.exists(ident("ops", "s.mallory")))
         rc, out = cl("pod", "--as", "s.other", "whoami")
         check("the pod may not certify the mac's other names", rc != 0 and "403" in out, out[-160:])
 
-        # Two homes: hypha's key on the pod too. Its first use there gets the pod's certificate.
-        with open(ident("mac", "hypha")) as f:
-            client_module().write_private(ident("pod", "hypha"), f.read())
+        # Two homes: alice's key on the pod too. Its first use there gets the pod's certificate.
+        with open(ident("mac", "alice")) as f:
+            client_module().write_private(ident("pod", "alice"), f.read())
         # Resume an existing stream cursor: this path opens /api/stream without first calling /api/me.
-        cursor = "watch-%s-hypha-main.last" % hashlib.sha256(pub["pod"].encode()).hexdigest()
+        cursor = "watch-%s-alice-main.last" % hashlib.sha256(pub["pod"].encode()).hexdigest()
         with open(os.path.join(work, "client-pod", cursor), "w") as f:
             f.write("0")
-        # Send after hypha's mac certificate has replicated, so its key is in the signed recipient list.
-        rc, out = cl("ops", "send", "--to", "hypha", "watch at the second home")
+        # Send after alice's mac certificate has replicated, so its key is in the signed recipient list.
+        rc, out = cl("ops", "send", "--to", "alice", "watch at the second home")
         check("mail posted for second-home watch", rc == 0, out[-160:])
         rc, out = cl("pod", "watch", "--mine", "--until", timeout=25)
         check("resumed watch gets the second home's certificate", rc == 0 and "> " in out, out[-160:])
         rc, out = cl("pod", "whoami")
-        check("hypha signs in at its second home", rc == 0 and "hypha" in out, out[-200:])
+        check("alice signs in at its second home", rc == 0 and "alice" in out, out[-200:])
         homes = lambda: [x["homes"] for x in req("GET", api["ops"], "/api/agents", token=cl(
-            "ops", "selftoken", "--ttl", "60", user="orchestrator")[1])[1].get("agents", []) if x["name"] == "hypha"]
+            "ops", "selftoken", "--ttl", "60", user="bob")[1])[1].get("agents", []) if x["name"] == "alice"]
         got, t = wait_for(lambda: [sorted(h) for h in homes()] == [["mac", "pod"]], timeout=15)
-        check("ops's host sees hypha with two homes", bool(got), "%.1fs" % t)
-        rc, out = cl("ops", "send", "--private", "--to", "hypha", "for hypha only", user="orchestrator")
-        check("ops sends private mail to hypha", rc == 0, out[-200:])
+        check("ops's host sees alice with two homes", bool(got), "%.1fs" % t)
+        rc, out = cl("ops", "send", "--private", "--to", "alice", "for alice only", user="bob")
+        check("ops sends private mail to alice", rc == 0, out[-200:])
         for h in ("mac", "pod"):
-            got, t = wait_for(lambda: [m for m in read(h) if m.get("text") == "for hypha only"], timeout=15)
-            check("hypha reads the private mail at the %s" % h, bool(got), "%.1fs" % t)
-        rc, out = cl("pod", "send", "--private", "--to", "ops.orchestrator", "private reply from the pod")
+            got, t = wait_for(lambda: [m for m in read(h) if m.get("text") == "for alice only"], timeout=15)
+            check("alice reads the private mail at the %s" % h, bool(got), "%.1fs" % t)
+        rc, out = cl("pod", "send", "--private", "--to", "ops.bob", "private reply from the pod")
         got, t = wait_for(lambda: [m for m in read("ops") if m.get("text") == "private reply from the pod"], timeout=15)
-        check("hypha writes private mail from the pod", rc == 0 and bool(got), out[-120:])
+        check("alice writes private mail from the pod", rc == 0 and bool(got), out[-120:])
         got, _ = wait_for(lambda: [m for m in read("mac") if m.get("text") == "private reply from the pod"], timeout=15)
         check("and reads its own private mail at the mac", bool(got))
 
@@ -183,14 +183,14 @@ def main():
         time.sleep(4)  # a periodic sync with the offline peer is under way
         check("the stream is still open before the edit", reader.is_alive())
         t0 = time.time()
-        trust("mac", seq=2, mac_names=["hypha"])
+        trust("mac", seq=2, mac_names=["alice"])
         reader.join(30)
         took = events[-1][1] - t0 if events[-1][0] == "closed" else 99
         check("the idle stream is cut off promptly after the trust change", 0 <= took < 3, "%.2fs" % took)
         rc, out = cl("mac", "--as", "s.idle", "whoami")
         check("and s.idle no longer signs in", rc != 0 and "403" in out, out[-120:])
-        rc, out = cl("mac", "--as", "hypha", "whoami")
-        check("hypha still does", rc == 0, out[-120:])
+        rc, out = cl("mac", "--as", "alice", "whoami")
+        check("alice still does", rc == 0, out[-120:])
     finally:
         for n in nodes.values():
             n.stop()

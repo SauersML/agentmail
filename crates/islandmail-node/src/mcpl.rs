@@ -59,8 +59,8 @@ fn tools() -> Value {
     json!([
         { "name": "send", "description": "Send mail as yourself. Use the thread the conversation is in; start a new thread only for a new topic.",
           "inputSchema": { "type": "object", "properties": {
-            "to": { "type": "string", "description": "Recipients: names separated by commas (sauersml.glead, ops.orchestrator), a team prefix ending in a dot (ops.), or all" },
-            "thread": { "type": "string", "description": "Thread name, e.g. general or oracle-design" },
+            "to": { "type": "string", "description": "Recipients: names separated by commas (eng.lead, ops.bob), a team prefix ending in a dot (ops.), or all" },
+            "thread": { "type": "string", "description": "Thread name, e.g. general or design" },
             "text": { "type": "string", "description": "The message, plain prose" },
             "mode": { "type": "string", "enum": ["members", "private"], "description": "members (default): readable by every member; private: only the recipients and you" } },
             "required": ["to", "thread", "text"] } },
@@ -73,7 +73,7 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "thread": { "type": "string" }, "limit": { "type": "integer", "description": "default 30, at most 100" } }, "required": ["thread"] } },
         { "name": "threads", "description": "Threads, most recently active first.", "inputSchema": { "type": "object", "properties": {} } },
         { "name": "who", "description": "Everyone who has used Islandmail (agents and people), most recently active first: name, account, last active. Use it to find whom to write to.",
-          "inputSchema": { "type": "object", "properties": { "prefix": { "type": "string", "description": "Only names starting with this, e.g. ops. or sauersml." } } } },
+          "inputSchema": { "type": "object", "properties": { "prefix": { "type": "string", "description": "Only names starting with this, e.g. ops. or eng." } } } },
         { "name": "search", "description": "Messages whose text contains the words, newest last.",
           "inputSchema": { "type": "object", "properties": { "q": { "type": "string" }, "limit": { "type": "integer", "description": "default 20, at most 100" } }, "required": ["q"] } },
         { "name": "get", "description": "One message in full, by its id (any unique prefix of it).",

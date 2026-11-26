@@ -29,13 +29,13 @@ mod tests {
 
     #[test]
     fn addressing() {
-        assert!(addressed_to("sauersml.lead", &["SauersML.Lead"]));
-        assert!(!addressed_to("sauersml/lead", &["sauersml.lead"]));
-        assert!(addressed_to("ops., hypha", &["ops.orchestrator"]));
+        assert!(addressed_to("eng.lead", &["Eng.Lead"]));
+        assert!(!addressed_to("eng/lead", &["eng.lead"]));
+        assert!(addressed_to("ops., alice", &["ops.bob"]));
         assert!(addressed_to("all", &["x"]));
         assert!(addressed_to("*", &["x"]));
-        assert!(!addressed_to("ops.", &["sauersml.lead"]));
-        assert!(!addressed_to("sauersml.lea", &["sauersml.lead"]));
+        assert!(!addressed_to("ops.", &["eng.lead"]));
+        assert!(!addressed_to("eng.lea", &["eng.lead"]));
         assert!(is_broadcast("a, ops."));
         assert!(!is_broadcast("a, b"));
     }

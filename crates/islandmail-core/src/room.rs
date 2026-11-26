@@ -408,11 +408,11 @@ mod tests {
 
     #[test]
     fn dm_ids_are_symmetric() {
-        assert_eq!(dm_id("hypha", "Ops.Orchestrator"), dm_id("ops.orchestrator", "HYPHA"));
+        assert_eq!(dm_id("dana", "Ops.Bob"), dm_id("ops.bob", "DANA"));
         assert_eq!(dm_id("b", "a"), "dm:a+b");
         assert_eq!(dm_pair("dm:a+b"), Some(("a".into(), "b".into())));
         assert_eq!(dm_pair("dm:b+a"), None);
-        assert!(room_to("hypha/plan") == "room:hypha/plan" && room_to("a b") == "room:");
+        assert!(room_to("dana/plan") == "room:dana/plan" && room_to("a b") == "room:");
     }
 
     #[test]
@@ -433,38 +433,38 @@ mod tests {
         let add_eve = Event::Add { members: vec!["eve".into()] };
         let mut events = vec![
             ev("2", "2026-01-01T00:00:02.000Z", "bob", &add_carol),
-            ev("1", "2026-01-01T00:00:01.000Z", "hypha", &create),
+            ev("1", "2026-01-01T00:00:01.000Z", "dana", &create),
             // carol leaves at the same time someone re-adds her: the leave wins.
             ev("3", "2026-01-01T00:00:03.000Z", "carol", &leave),
             ev("4", "2026-01-01T00:00:03.000Z", "bob", &add_carol),
             // eve is not a member: her add does nothing. bob cannot remove others... but may remove himself.
             ev("5", "2026-01-01T00:00:04.000Z", "eve", &add_eve),
         ];
-        let s = fold("hypha/plan", &mut events);
+        let s = fold("dana/plan", &mut events);
         assert_eq!(s.kind, Kind::Private);
-        assert_eq!(s.members.keys().collect::<Vec<_>>(), ["bob", "hypha"]);
+        assert_eq!(s.members.keys().collect::<Vec<_>>(), ["bob", "dana"]);
         assert!(s.former.contains("carol"));
-        let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "hypha", &create),
-                              ev("2", "2026-01-01T00:00:02.000Z", "hypha", &remove_bob)];
-        let s = fold("hypha/plan", &mut events);
-        assert_eq!(s.members.keys().collect::<Vec<_>>(), ["hypha"]);
+        let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "dana", &create),
+                              ev("2", "2026-01-01T00:00:02.000Z", "dana", &remove_bob)];
+        let s = fold("dana/plan", &mut events);
+        assert_eq!(s.members.keys().collect::<Vec<_>>(), ["dana"]);
         // A create by someone other than the id's creator is ignored.
         let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "eve", &create)];
-        assert!(!fold("hypha/plan", &mut events).created);
+        assert!(!fold("dana/plan", &mut events).created);
     }
 
     #[test]
     fn plans_follow_membership() {
         let create = Event::Create { private: true, history: History::Full, topic: String::new(), members: vec!["bob".into()] };
-        assert_eq!(plan("hypha/x", None, "hypha", Some(&create)).unwrap(), (true, Some(vec!["bob".into(), "hypha".into()])));
-        assert!(plan("hypha/x", None, "bob", Some(&create)).is_err());
-        assert!(plan("hypha/x", None, "hypha", None).is_err());
-        let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "hypha", &create)];
-        let s = fold("hypha/x", &mut events);
-        assert!(plan("hypha/x", Some(&s), "eve", None).is_err());
+        assert_eq!(plan("dana/x", None, "dana", Some(&create)).unwrap(), (true, Some(vec!["bob".into(), "dana".into()])));
+        assert!(plan("dana/x", None, "bob", Some(&create)).is_err());
+        assert!(plan("dana/x", None, "dana", None).is_err());
+        let mut events = vec![ev("1", "2026-01-01T00:00:01.000Z", "dana", &create)];
+        let s = fold("dana/x", &mut events);
+        assert!(plan("dana/x", Some(&s), "eve", None).is_err());
         let add = Event::Add { members: vec!["carol".into()] };
-        assert_eq!(plan("hypha/x", Some(&s), "bob", Some(&add)).unwrap().1.unwrap(), ["bob", "carol", "hypha"]);
-        assert!(plan("hypha/x", Some(&s), "bob", Some(&Event::Remove { members: vec!["hypha".into()] })).is_err());
+        assert_eq!(plan("dana/x", Some(&s), "bob", Some(&add)).unwrap().1.unwrap(), ["bob", "carol", "dana"]);
+        assert!(plan("dana/x", Some(&s), "bob", Some(&Event::Remove { members: vec!["dana".into()] })).is_err());
         assert_eq!(plan("general", None, "eve", None).unwrap(), (false, None));
         assert_eq!(plan(&dm_id("a", "b"), None, "a", None).unwrap(), (true, Some(vec!["a".into(), "b".into()])));
         assert!(plan(&dm_id("a", "b"), None, "c", None).is_err());
@@ -475,7 +475,7 @@ mod tests {
         assert!(Meta::parse("").unwrap().is_empty());
         assert!(Meta::parse("{}").is_err());
         assert!(Meta::parse(r#"{"room":"x","extra":1}"#).is_err());
-        let m = Meta::parse(r#"{"room":"hypha/x","event":{"op":"add","members":["bob"]}}"#).unwrap();
+        let m = Meta::parse(r#"{"room":"dana/x","event":{"op":"add","members":["bob"]}}"#).unwrap();
         assert_eq!(m.event, Some(Event::Add { members: vec!["bob".into()] }));
         assert!(Meta::parse(r#"{"event":{"op":"leave"}}"#).is_err());
         assert!(Meta::parse(r#"{"grant":[{"env":"x","ck":"y"}]}"#).is_err());

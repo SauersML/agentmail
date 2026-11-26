@@ -480,7 +480,7 @@ function newRoomDialog() {
   const m = el('div', 'modal'), f = el('form'), msg = el('div', 'msgline');
   const field = (label, ph) => { const l = el('label', null, label), i = el('input'); i.placeholder = ph; i.autocomplete = 'off'; i.spellcheck = false; f.append(l, i); return i; };
   f.append(el('h2', null, 'New room'));
-  const name = field('Name', 'release-plan'), who = field('Members', '@ops.orchestrator @lab.carol'), topic = field('Topic (optional)', 'What this room is for');
+  const name = field('Name', 'release-plan'), who = field('Members', '@ops.bob @dev.carol'), topic = field('Topic (optional)', 'What this room is for');
   const ok = el('button', 'ok', 'Create'), cancel = el('button', 'cancel', 'Cancel'), row = el('div', 'row');
   ok.type = 'submit'; cancel.type = 'button'; row.append(cancel, ok); f.append(msg, row); m.append(f);
   const close = () => m.remove();

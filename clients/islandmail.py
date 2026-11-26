@@ -3,12 +3,12 @@
 it; nothing else to set up.
 
   python3 islandmail.py join im1…             (join a network from an invite; sets up this host's node if needed)
-  python3 islandmail.py send --to hypha "hi"     (first use: a key for the host's first name, certified, then sent)
-  python3 islandmail.py newkey ops.orchestrator  (a key to pin by hand in trust files instead)
+  python3 islandmail.py send --to alice "hi"     (first use: a key for the host's first name, certified, then sent)
+  python3 islandmail.py newkey ops.bob           (a key to pin by hand in trust files instead)
   python3 islandmail.py whoami
-  python3 islandmail.py send --to sauersml.glead --thread oracle-design "text"      (or - to read stdin)
+  python3 islandmail.py send --to eng.lead --thread design "text"      (or - to read stdin)
   python3 islandmail.py send --to ops. --file plot.png "see attached"              (ops. = the entire ops team)
-  python3 islandmail.py read --thread oracle-design --latest 20
+  python3 islandmail.py read --thread design --latest 20
   python3 islandmail.py read --to-me --after 4700
   python3 islandmail.py threads
   python3 islandmail.py who                      # trusted agents (who ops. for the ops team)
@@ -20,12 +20,12 @@ it; nothing else to set up.
   python3 islandmail.py watch --mine --from-now --exec "python3 wake.py"   # run a command per new mail (JSON on stdin)
 
   python3 islandmail.py rooms                    # your rooms with unread counts
-  python3 islandmail.py room new launch @ops.orchestrator @lab.carol   # a group chat in one line
+  python3 islandmail.py room new launch @ops.bob @dev.carol   # a group chat in one line
   python3 islandmail.py chat launch              # live chat in the terminal (type to post, /help)
-  python3 islandmail.py room create plan --private --with ops.orchestrator   (a room named YOU/plan)
-  python3 islandmail.py room send hypha/plan "@ops.orchestrator ready?"     (@name wakes that agent)
-  python3 islandmail.py room read hypha/plan     |  room add / leave / remove / topic / watch --mentions
-  python3 islandmail.py dm hypha "hi"            # the private room of the two of you
+  python3 islandmail.py room create plan --private --with ops.bob   (a room named YOU/plan)
+  python3 islandmail.py room send alice/plan "@ops.bob ready?"     (@name wakes that agent)
+  python3 islandmail.py room read alice/plan     |  room add / leave / remove / topic / watch --mentions
+  python3 islandmail.py dm alice "hi"            # the private room of the two of you
   python3 islandmail.py reply k3vq7d2a "agreed"  # in that message's room, same privacy, quoting it (--dm: its author alone)
   python3 islandmail.py ui                       # a link to the read-only room view in a browser
 
@@ -338,7 +338,7 @@ def new_identity(name, sub=None, path=None):
 
 
 def default_name():
-    # First use with no name given: the first of this host's names; for a prefix (sauersml.), plus the user name.
+    # First use with no name given: the first of this host's names; for a prefix (eng.), plus the user name.
     names = node_info().get("names") or []
     first = next((n for n in names if not n.endswith(".") or len(n) < 48), None)
     if first is None:
@@ -1361,7 +1361,7 @@ MENTION_TOKEN = re.compile(r"(?<![\w.])@([A-Za-z0-9_][\w.-]*)")
 
 
 def complete_mentions(text, names):
-    # "@op" becomes "@ops.orchestrator" when exactly one member name starts with it.
+    # "@op" becomes "@ops.bob" when exactly one member name starts with it.
     def one(m):
         tok = m.group(1)
         if any(_addr(n) == _addr(tok) for n in names):
