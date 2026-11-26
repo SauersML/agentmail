@@ -27,7 +27,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Mutex;
 
-use islandmail_core::cert::{valid_name, valid_namespace_entry};
+use islandmail_core::cert::{self, valid_name, valid_namespace_entry};
 use islandmail_core::keys::{fmt_key, parse_key};
 use islandmail_core::members::NodeEntry;
 use islandmail_core::{b64u, b64u_decode, now_millis, MemberList};
@@ -331,6 +331,32 @@ fn holder(list: &MemberList, name: &str, except: Option<&str>) -> Option<String>
     list.nodes.iter().find(|n| Some(n.key.as_str()) != except && n.covers(name)).map(|n| format!("node {:?}", n.name))
 }
 
+/// Whether two namespace entries can cover a common name (an exact name, or a prefix ending in '.').
+fn overlaps(a: &str, b: &str) -> bool {
+    let (a, b) = (islandmail_core::addr::norm(a), islandmail_core::addr::norm(b));
+    match (a.ends_with('.'), b.ends_with('.')) {
+        (false, false) => a == b,
+        (true, false) => b.starts_with(&a),
+        (false, true) => a.starts_with(&b),
+        (true, true) => a.starts_with(&b) || b.starts_with(&a),
+    }
+}
+
+/// An inviting node signs its own `names` into the invite. Trusting them as given would let it certify (impersonate,
+/// and read the private mail of) agents this host already gives to another node, its own included, or pins: refuse
+/// any of its names that overlaps one held here by anyone but the inviter itself.
+fn claims_held(list: &MemberList, inviter: &NodeEntry) -> Option<String> {
+    for e in &inviter.names {
+        if let Some(m) = list.members.iter().find(|m| cert::entry_covers(e, &m.name)) {
+            return Some(format!("{e} (it covers {}, pinned in this trust file)", m.name));
+        }
+        if let Some(n) = list.nodes.iter().find(|n| n.key != inviter.key && n.names.iter().any(|x| overlaps(e, x))) {
+            return Some(format!("{e} (node {:?} holds it here)", n.name));
+        }
+    }
+    None
+}
+
 static EDIT: Mutex<()> = Mutex::new(());
 
 /// Edits the trust file on disk (the source of truth) and adopts the result: seq one above both the file and the
@@ -459,6 +485,9 @@ pub fn join_prepare(node: &Node, body: &Value) -> Result<JoinPlan, ApiError> {
             return Err(ApiError::new(409, format!("{n} is held here by {h}")));
         }
     }
+    if let Some(c) = claims_held(&node.members.read().unwrap(), &inv.node) {
+        return Err(ApiError::new(409, format!("the inviting node claims a name held here: {c}")));
+    }
     let mut mine = own_entry(node)?;
     mine.name = inv.name.clone();
     let reply = encode_reply(&Reply { network, node: mine, name: inv.name.clone(), nonce: inv.nonce }, node);
@@ -481,6 +510,9 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
             if let Some(h) = holder(list, n, Some(me)) {
                 return Err(ApiError::new(409, format!("{n} is held here by {h}")));
             }
+        }
+        if let Some(c) = claims_held(list, &inv.node) {
+            return Err(ApiError::new(409, format!("the inviting node claims a name held here: {c}")));
         }
         let mine = list.nodes.iter_mut().find(|n| n.key == me).expect("own entry");
         for n in &names {
@@ -796,6 +828,33 @@ mod tests {
         let d = fresh();
         let flood: Vec<Value> = (0..8).map(|_| answer(&a, &d, "imr1junk")).collect();
         assert!(flood.iter().any(|v| v["error"].as_str().unwrap().contains("too many")));
+    }
+
+    #[test]
+    fn a_joining_host_refuses_an_inviter_that_claims_names_held_here() {
+        // The joining host already runs a node for carol and trusts another node for ops.; the inviting node's
+        // invite (which it signs itself) claims carol and ops.x as its own names.
+        let a = node_on([5u8; 32], &["carol", "ops.x"]);
+        let j = node_on([5u8; 32], &["carol"]);
+        let other = islandmail_core::keys::Seed::generate();
+        edit_trust(&j, |list, _| {
+            list.nodes.push(NodeEntry { name: "ops".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec!["ops.".into()] });
+            Ok(())
+        }).unwrap();
+        let inv = invite(&a, &signed(&a, "invite", "bob|||604800|", json!({ "name": "bob", "ttl_s": 604800, "key": "" })))
+            .unwrap()["invite"].as_str().unwrap().to_string();
+        let err = join_prepare(&j, &signed(&j, "join", &inv, json!({ "invite": inv }))).err().expect("refused");
+        assert_eq!(err.status, 409, "{}", err.message);
+        assert!(err.message.contains("carol"), "{}", err.message);
+        // Nothing changed: the inviting node is not trusted here.
+        assert!(j.members.read().unwrap().node_by_key(&a.seed.public()).is_none());
+        // An inviter that claims only names nobody here holds is fine.
+        let a2 = node_on([5u8; 32], &["dave"]);
+        let inv2 = invite(&a2, &signed(&a2, "invite", "bob|||604800|", json!({ "name": "bob", "ttl_s": 604800, "key": "" })))
+            .unwrap()["invite"].as_str().unwrap().to_string();
+        let plan = join_prepare(&j, &signed(&j, "join", &inv2, json!({ "invite": inv2 }))).map_err(|e| e.message).unwrap();
+        join_finish(&j, plan, Outcome::Unreachable("test".into())).map_err(|e| e.message).unwrap();
+        assert!(j.members.read().unwrap().node_by_key(&a2.seed.public()).is_some());
     }
 
     fn node() -> Node {
