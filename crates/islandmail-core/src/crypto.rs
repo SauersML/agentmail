@@ -98,7 +98,7 @@ pub fn seal(plain: &[u8], ad: &[u8], targets: &[[u8; 32]]) -> Result<Sealed> {
     while keys.len() < slots_for(seen.len()) {
         keys.push(Wrapped { tag: crate::random_bytes(), k: crate::random_bytes::<WRAP_LEN>().to_vec() });
     }
-    keys.sort_by(|a, b| a.tag.cmp(&b.tag));
+    keys.sort_by_key(|w| w.tag);
     Ok(Sealed { ciphertext, epk, keys })
 }
 
@@ -166,7 +166,7 @@ pub const fn padded_len(n: usize, chunk: usize) -> usize {
 
 /// Whether `len` is a size `pad` can produce.
 pub fn is_padded_len(len: usize, chunk: usize) -> bool {
-    BUCKETS.contains(&len) || (len > BUCKETS[3] && len % chunk == 0)
+    BUCKETS.contains(&len) || (len > BUCKETS[3] && len.is_multiple_of(chunk))
 }
 
 /// u32 length || data || zeros, to a bucket.

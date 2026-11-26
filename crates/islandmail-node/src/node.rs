@@ -1699,11 +1699,12 @@ mod tests {
     }
 
     fn envelope_at(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str) -> Envelope {
-        envelope_in(writer, list, agent, text, ts, meta, "all", "t")
+        envelope_in(writer, list, agent, text, ts, meta, ("all", "t"))
     }
 
-    fn envelope_in(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str, to: &str,
-                   thread: &str) -> Envelope {
+    /// A members-mode post with this `(to, thread)`.
+    fn envelope_in(writer: &Seed, list: &MemberList, agent: &Seed, text: &str, ts: String, meta: &str,
+                   (to, thread): (&str, &str)) -> Envelope {
         let salt = islandmail_core::random_bytes::<16>();
         let digest = islandmail_core::envelope::post_digest_meta(&salt, text, &[], meta).unwrap();
         let st = PostStatement {
@@ -1738,7 +1739,7 @@ mod tests {
         };
         let first = node.ingest(envelope(&writer, &list, &alice, "first")).unwrap().unwrap();
         let meta = format!(r#"{{"reply_to":"{}","room":"t"}}"#, first.env_id);
-        let reply = node.ingest(envelope_in(&writer, &list, &alice, "re first", now_ts(), &meta, "room:t", "t")).unwrap().unwrap();
+        let reply = node.ingest(envelope_in(&writer, &list, &alice, "re first", now_ts(), &meta, ("room:t", "t"))).unwrap().unwrap();
         assert_eq!(reply.meta.as_deref(), Some(meta.as_str()));
         // What a build that could not parse these room fields left behind: plain mail, no meta.
         node.store.forget_room_fields(&reply.env_id).unwrap();

@@ -555,7 +555,8 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     let mut row: Option<(String, String)> = None;
     let list = edit_trust(node, |list, _| {
         let db = node.store.conn();
-        let got: Option<(String, String, String, i64, Option<String>, Option<String>)> = db.query_row(
+        type InviteRow = (String, String, String, i64, Option<String>, Option<String>);
+        let got: Option<InviteRow> = db.query_row(
             "SELECT name, room, from_, exp, spent_by, for_key FROM join_invites WHERE nonce = ?", [&nonce],
             |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?, x.get(5)?))).ok();
         let Some((want, room, from, exp, spent, for_key)) = got else {

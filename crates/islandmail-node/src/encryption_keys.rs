@@ -54,7 +54,7 @@ impl EncryptionKeys {
                 else { continue };
             out.push((epoch, crate::config::read_seed(&entry.path())?));
         }
-        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out.sort_by_key(|e| std::cmp::Reverse(e.0));
         Ok(out)
     }
 }
