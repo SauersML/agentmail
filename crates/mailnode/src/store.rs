@@ -564,12 +564,14 @@ impl Store {
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
     }
 
-    pub fn certs(&self) -> Result<Vec<mailcore::Cert>> {
-        self.trust_rows("certs", "", &[], -1)
-    }
-
-    pub fn certs_named(&self, name: &str) -> Result<Vec<mailcore::Cert>> {
-        self.trust_rows("certs", "WHERE lname = ?", &[&norm(name)], -1)
+    /// Stored certificates whose issuer had not revoked that key at the requested instant.
+    pub fn certs_at(&self, name: Option<&str>, at_ms: i64) -> Result<Vec<mailcore::Cert>> {
+        let eligible = "WHERE NOT EXISTS (SELECT 1 FROM revocations r
+                        WHERE r.node=certs.node AND r.key=certs.key AND r.ts <= ?1)";
+        match name {
+            Some(name) => self.trust_rows("certs", &format!("{eligible} AND lname = ?2"), &[&at_ms, &norm(name)], -1),
+            None => self.trust_rows("certs", eligible, &[&at_ms], -1),
+        }
     }
 
     pub fn cert(&self, node: &str, key: &str) -> Result<Option<mailcore::Cert>> {
@@ -636,14 +638,6 @@ impl Store {
     pub fn revoked_at(&self, node: &str, key: &str) -> Result<Option<i64>> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT ts FROM revocations WHERE node = ? AND key = ?", params![node, key], |r| r.get(0)).optional()?)
-    }
-
-    /// (node, key) → when that node revoked that key.
-    pub fn revocation_times(&self) -> Result<std::collections::HashMap<(String, String), i64>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT node, key, ts FROM revocations")?;
-        let rows = st.query_map([], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
     }
 
     pub fn names(&self, members: &[mailcore::Member]) -> Result<Vec<(String, String, i64)>> {

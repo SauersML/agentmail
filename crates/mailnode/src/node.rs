@@ -133,8 +133,8 @@ impl Node {
         let list = self.members.read().unwrap();
         let mut roster = self.roster.write().unwrap();
         // Serialize snapshot publication so a slow refresh cannot reinstate a revoked certificate.
-        *roster = match self.store.revocation_times().and_then(|revs| Ok((revs, self.store.certs()?))) {
-            Ok((revs, certs)) => list.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), i64::MAX),
+        *roster = match self.store.certs_at(None, i64::MAX) {
+            Ok(certs) => list.agents(&certs, &|_| None, i64::MAX),
             Err(e) => {
                 tracing::error!("reading certificate state: {e:#}");
                 list.agents(&[], &|_| None, i64::MAX)
@@ -595,10 +595,14 @@ impl Node {
         // Who this host accepted as the sender at the envelope's time: pins, stored certificates and the one the
         // envelope carries. A revocation counts against mail dated at or after it.
         let carried = env.carried_cert().filter(|c| members.accepts(c)).cloned();
-        let mut certs = self.store.certs_named(&env.from)?;
-        certs.extend(carried.iter().cloned());
-        let revs = self.store.revocation_times()?;
-        let at = members.agents(&certs, &|c| revs.get(&(c.node.clone(), c.key.clone())).copied(), env.ts_ms());
+        let ts = env.ts_ms();
+        let mut certs = self.store.certs_at(Some(&env.from), ts)?;
+        if let Some(c) = &carried {
+            if self.store.revoked_at(&c.node, &c.key)?.is_none_or(|t| ts < t) {
+                certs.push(c.clone());
+            }
+        }
+        let at = members.agents(&certs, &|_| None, ts);
         let v = env.verify(&members, &at, now_millis())?;
         let keys = std::iter::once(&self.seed).chain(self.opts.identities.iter().map(|(_, s)| s));
         let body = env.open_for(keys)?;
@@ -1253,7 +1257,7 @@ mod tests {
         });
         codes.sort();
         assert_eq!(codes, [201, 409]);
-        assert_eq!(node.store.certs_named("hypha").unwrap().len(), 1);
+        assert_eq!(node.store.certs_at(Some("hypha"), i64::MAX).unwrap().len(), 1);
     }
 
     #[test]
@@ -1301,11 +1305,11 @@ mod tests {
         assert!(mac.take_cert(&squat).unwrap());
         assert_eq!(mac.certify(&proof(&hypha, "hypha", &mac)).unwrap().0, 201);
         assert!(mac.verify(&token(&hypha, "hypha", &mac)).is_ok());
-        assert_eq!(mac.store.certs().unwrap().len(), 2);
+        assert_eq!(mac.store.certs_at(None, i64::MAX).unwrap().len(), 2);
         // Out of namespace, or from an untrusted node: refused, never stored.
         assert!(pod.take_cert(&Cert::issue(&ops, "hypha", &Seed::generate().public(), &now_ts())).is_err());
         assert!(pod.take_cert(&Cert::issue(&Seed::generate(), "ops.x", &Seed::generate().public(), &now_ts())).is_err());
-        assert!(pod.store.certs().unwrap().is_empty());
+        assert!(pod.store.certs_at(None, i64::MAX).unwrap().is_empty());
         // No trusted node can crowd out the others: at most MAX_CERTS_PER_NODE from each.
         for i in 0..crate::store::MAX_CERTS_PER_NODE {
             pod.store.put_cert(&Cert::issue(&ops, &format!("ops.a{i}"), &Seed::generate().public(), &now_ts())).unwrap();
@@ -1375,8 +1379,8 @@ mod tests {
         mac.certify_identities();
         pod.certify_identities();
         // Certificates replicate both ways; both nodes certify the same name and key without conflict.
-        for c in mac.store.certs().unwrap() { pod.take_cert(&c).unwrap(); }
-        for c in pod.store.certs().unwrap() { mac.take_cert(&c).unwrap(); }
+        for c in mac.store.certs_at(None, i64::MAX).unwrap() { pod.take_cert(&c).unwrap(); }
+        for c in pod.store.certs_at(None, i64::MAX).unwrap() { mac.take_cert(&c).unwrap(); }
         let a: Vec<_> = mac.agents().into_iter().filter(|a| a.name == "hypha").collect();
         assert_eq!(a.len(), 1);
         assert_eq!(a[0].homes.len(), 2);
