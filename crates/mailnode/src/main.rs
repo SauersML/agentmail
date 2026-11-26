@@ -13,6 +13,7 @@ mod encryption_keys;
 mod mcpl;
 mod net;
 mod node;
+mod private_fs;
 mod store;
 
 use std::path::Path;
@@ -117,10 +118,9 @@ async fn run(path: &Path) -> Result<()> {
     };
     anyhow::ensure!(listen.ip().is_loopback(), "api_listen must be a loopback address");
     let listener = tokio::net::TcpListener::bind(listen).await.with_context(|| format!("binding {listen}"))?;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(&cfg.data_dir)?;
+    private_fs::create_dir(&cfg.data_dir)?;
     anyhow::ensure!(cfg.data_dir.symlink_metadata()?.is_dir(), "data_dir must be a directory");
-    std::fs::set_permissions(&cfg.data_dir, std::fs::Permissions::from_mode(0o700))?;
+    private_fs::restrict_dir(&cfg.data_dir)?;
     let seed = cfg.node_seed()?;
     let members = cfg.members()?;
     if !members.is_node(&seed.public()) {

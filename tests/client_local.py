@@ -13,24 +13,34 @@ im = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(im)
 
 with tempfile.TemporaryDirectory() as d:
-    im.DIR = d
+    im.DIR = os.path.join(d, "keys")
     path = im.ident_path("t.alice")
     im.write_private(path, json.dumps({"name": "t.alice", "sub": "agent:t.alice", "seed": "ab" * 32}))
     assert im._read_identity("t.alice")["name"] == "t.alice"
-    if os.name != "nt":
+    # Open it to another user, by mode bits on POSIX or by an access list entry for Everyone on Windows.
+    if os.name == "nt":
+        im.win_set_dacl(path, "D:P(A;;FA;;;%s)(A;;FR;;;WD)" % im._win_user_sid())
+    else:
         os.chmod(path, 0o644)
-        try:
-            im._read_identity("t.alice")
-        except im.Fail:
-            pass
-        else:
-            raise AssertionError("a group-readable identity was accepted on POSIX")
-        # Windows reports group/other bits for every writable file; the mode check is POSIX-only.
-        im._POSIX_MODES = False
-        assert im._read_identity("t.alice")["name"] == "t.alice"
-        im._POSIX_MODES = True
+    try:
+        im._read_identity("t.alice")
+    except im.Fail as e:
+        assert "can access it" in str(e), e
+    else:
+        raise AssertionError("an identity other users can read was accepted")
+    im.restrict(path)
+    assert im._read_identity("t.alice")["name"] == "t.alice"
     assert im._IDENT_OPEN & os.O_RDONLY == os.O_RDONLY
-print("ok: identity files read with only the open flags and mode checks the platform has")
+
+me = "S-1-5-21-1-2-3-1001"
+assert im.sddl_others("O:%sD:P(A;;FA;;;%s)" % (me, me), me) is None
+assert im.sddl_others("O:BAD:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;OICIID;FA;;;%s)" % me, me) is None
+assert im.sddl_others("O:BAD:P(A;OICIIO;GA;;;CO)(D;;FA;;;WD)", me) is None
+assert im.sddl_others("O:%sD:P(A;;FR;;;WD)" % me, me) == "WD"
+assert im.sddl_others("O:%sD:AI(A;ID;0x1200a9;;;BU)" % me, me) == "BU"
+assert im.sddl_others("O:%sD:P(A;;FA;;;S-1-5-21-1-2-3-1002)" % me, me) == "S-1-5-21-1-2-3-1002"
+assert im.sddl_others("O:%sD:NO_ACCESS_CONTROL" % me, me) and im.sddl_others("O:" + me, me)
+print("ok: identity files must be owner-only (mode bits on POSIX, access list on Windows)")
 
 # A send confirms that this node stored the message, not that the recipients' nodes have it (they may be offline).
 note = im.send_note(["t.bob"], "t.bob")

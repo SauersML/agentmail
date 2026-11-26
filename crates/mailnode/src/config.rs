@@ -107,20 +107,15 @@ impl Config {
     }
 }
 
-/// Refuses a key file other users could read or write: any group or world permission bit, or not a regular file.
+/// Refuses a key file other users could read or write (see private_fs), or one that is not a regular file.
 pub fn read_private(path: &Path) -> Result<String> {
     use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = crate::private_fs::options().read(true).open(path).with_context(|| format!("opening {}", path.display()))?;
     let md = file.metadata()?;
     if !md.is_file() {
         anyhow::bail!("{} is not a regular file", path.display());
     }
-    let mode = md.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        anyhow::bail!("{} holds a private key but has mode {mode:o}; run chmod 600 on it", path.display());
-    }
+    crate::private_fs::check_file(&file, path)?;
     let mut text = String::new();
     file.take(16_385).read_to_string(&mut text)?;
     anyhow::ensure!(text.len() <= 16_384, "private key file too large");
@@ -133,22 +128,22 @@ pub fn read_seed(path: &Path) -> Result<Seed> {
 
 pub fn write_seed(path: &Path, seed: &Seed) -> Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".mailnode-{}.tmp", mailcore::b64u(&mailcore::random_bytes::<16>())));
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    let mut f = crate::private_fs::options().write(true).create_new(true).open(&tmp)?;
     // Publish the complete file without replacing a key another process just created.
-    let result = (|| -> std::io::Result<()> {
+    let result = (|| -> Result<()> {
+        crate::private_fs::restrict_file(&f, &tmp)?;
         f.write_all(seed.to_hex().as_bytes())?;
         f.sync_all()?;
-        std::fs::hard_link(&tmp, path)
+        Ok(std::fs::hard_link(&tmp, path)?)
     })();
+    drop(f);
     let cleanup = std::fs::remove_file(&tmp);
     result.with_context(|| format!("creating {}", path.display()))?;
     cleanup?;
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    crate::private_fs::sync_dir(dir)
 }
 
 pub fn read_or_create_seed(path: &Path) -> Result<Seed> {
@@ -168,7 +163,6 @@ pub fn read_or_create_seed(path: &Path) -> Result<Seed> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn concurrent_first_starts_share_one_complete_private_seed() {
@@ -186,7 +180,7 @@ mod tests {
         let original = read_seed(&path).unwrap().public();
         assert!(write_seed(&path, &Seed::generate()).is_err());
         assert_eq!(read_seed(&path).unwrap().public(), original);
-        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        crate::private_fs::check_file(&std::fs::File::open(&path).unwrap(), &path).unwrap();
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }

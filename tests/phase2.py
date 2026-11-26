@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory, write_private_json  # noqa: E402
 
 
 def main():
@@ -69,9 +69,8 @@ def main():
     os.makedirs(os.path.join(im_dir, "identities"))
     for n in agents:
         path = os.path.join(im_dir, "identities", agents[n] + ".json")
-        json.dump({"name": agents[n], "sub": "agent:%s@test" % n, "id": pub[n], "seed": open(k(n)).read().strip()},
-                  open(path, "w"))
-        os.chmod(path, 0o600)  # the client refuses identity files other users can read
+        # the client refuses identity files other users can read
+        write_private_json(path, {"name": agents[n], "sub": "agent:%s@test" % n, "id": pub[n], "seed": open(k(n)).read().strip()})
     def im(port, who, *args, timeout=60):
         env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir,
                    ISLANDMAIL_AS=agents[who])

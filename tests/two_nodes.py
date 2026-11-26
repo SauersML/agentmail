@@ -22,6 +22,16 @@ import urllib.request
 RESULTS = []
 
 
+def write_private_json(path, obj):
+    # Owner-only on every platform (mode 600, or a Windows access list with only this user), as the client writes it.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "islandmail", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "clients", "islandmail.py"))
+    im = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(im)
+    im.write_private(path, json.dumps(obj))
+
+
 def check(name, ok, detail=""):
     RESULTS.append((name, bool(ok), detail))
     print("%s %s %s" % ("PASS" if ok else "FAIL", name, detail), flush=True)
@@ -152,9 +162,9 @@ def main():
         d = os.path.join(work, "ids" + host, "identities")
         os.makedirs(d, exist_ok=True)
         seed = open(k(who)).read().strip()
-        with open(os.path.join(d, agents[who] + ".json"), "w") as f:
-            json.dump({"name": agents[who], "sub": "agent:%s@test" % who, "id": pub[who], "seed": seed}, f)
-        os.chmod(os.path.join(d, agents[who] + ".json"), 0o600)  # nodes skip identity files others can read
+        # nodes skip identity files others can read
+        write_private_json(os.path.join(d, agents[who] + ".json"),
+                           {"name": agents[who], "sub": "agent:%s@test" % who, "id": pub[who], "seed": seed})
 
     def cfg(host):
         return {

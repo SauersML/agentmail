@@ -1,10 +1,9 @@
 //! Private encryption seeds live in a dedicated owner-only directory. Only signed public records leave it.
 
-use std::fs::{self, DirBuilder, File};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use mailcore::keys::Seed;
 use mailcore::node_key::{NodeEncryptionKey, ROTATION_MS};
 
@@ -17,9 +16,8 @@ impl EncryptionKeys {
     pub fn new(data_dir: &Path, days: u32) -> Result<Self> {
         ensure!(days > 0, "encryption_key_retention_days must be positive");
         let dir = data_dir.join("encryption-keys");
-        DirBuilder::new().mode(0o700).recursive(true).create(&dir)?;
-        let md = dir.symlink_metadata()?;
-        ensure!(md.is_dir() && md.permissions().mode() & 0o077 == 0, "encryption key directory must be private");
+        crate::private_fs::create_dir(&dir)?;
+        crate::private_fs::check_dir(&dir).context("encryption key directory must be private")?;
         Ok(Self { dir, retention_epochs: i64::from(days) * 4 })
     }
 
@@ -42,7 +40,7 @@ impl EncryptionKeys {
                 anyhow::bail!("clock precedes a stored encryption key");
             }
         }
-        if removed { File::open(&self.dir)?.sync_all()?; }
+        if removed { crate::private_fs::sync_dir(&self.dir)?; }
         let secret = crate::config::read_or_create_seed(&self.dir.join(format!("{epoch}.seed")))?;
         Ok(NodeEncryptionKey::issue(identity, network, epoch, &secret))
     }

@@ -6,7 +6,6 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
-libc = "0.2"
 mailcore = { path = "../mailcore" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
@@ -24,6 +23,12 @@ tracing = "0.1"
 unicode-normalization = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 iroh-relay = { version = "1", default-features = false, features = ["server"] }

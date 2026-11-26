@@ -116,12 +116,128 @@ class Fail(Exception):
     pass
 
 
+# Owner-only files. POSIX: mode 600 (folders 700). Windows: a protected access list with one entry, the current user;
+# a file passes when every allow entry names that user, the file's owner, SYSTEM or Administrators.
+_SDDL_ACE = re.compile(r"\(([^;()]*);[^;()]*;[^;()]*;[^;()]*;[^;()]*;([^;()]*)[^()]*\)")
+_SDDL_PRIVILEGED = {"SY", "S-1-5-18", "BA", "S-1-5-32-544", "OW", "S-1-3-4", "CO", "S-1-3-0"}
+
+
+def sddl_others(sddl, user):
+    """The first trustee other than user (a SID string), the owner, SYSTEM or Administrators that an allow entry in
+    this SDDL grants access to; None if there is none. A missing (NULL) access list grants everyone."""
+    owner = re.match(r"O:(S-[0-9-]+|[A-Z]{2})", sddl)
+    at = sddl.find("D:")
+    if at < 0:
+        return "everyone (no access list)"
+    dacl = sddl[at + 2:]
+    if "NO_ACCESS_CONTROL" in dacl.split("(", 1)[0]:
+        return "everyone (no access list)"
+    for kind, sid in _SDDL_ACE.findall(dacl):
+        if kind not in ("A", "OA", "XA", "ZA"):
+            continue
+        if sid == user or (owner and sid == owner.group(1)) or sid in _SDDL_PRIVILEGED or (sid == "LA" and user.endswith("-500")):
+            continue
+        return sid
+    return None
+
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _P = ctypes.c_void_p
+    _PP = ctypes.POINTER(ctypes.c_void_p)
+    for _fn, _args, _res in [
+        (_kernel.GetCurrentProcess, [], wintypes.HANDLE),
+        (_kernel.CloseHandle, [wintypes.HANDLE], wintypes.BOOL),
+        (_kernel.LocalFree, [_P], _P),
+        (_advapi.OpenProcessToken, [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)], wintypes.BOOL),
+        (_advapi.GetTokenInformation, [wintypes.HANDLE, ctypes.c_int, _P, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (_advapi.ConvertSidToStringSidW, [_P, ctypes.POINTER(wintypes.LPWSTR)], wintypes.BOOL),
+        (_advapi.GetSecurityInfo, [wintypes.HANDLE, ctypes.c_int, wintypes.DWORD, _PP, _PP, _PP, _PP, _PP], wintypes.DWORD),
+        (_advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW, [_P, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(wintypes.LPWSTR), ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (_advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW, [wintypes.LPCWSTR, wintypes.DWORD, _PP, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        (_advapi.GetSecurityDescriptorDacl, [_P, ctypes.POINTER(wintypes.BOOL), _PP, ctypes.POINTER(wintypes.BOOL)], wintypes.BOOL),
+        (_advapi.SetNamedSecurityInfoW, [wintypes.LPCWSTR, ctypes.c_int, wintypes.DWORD, _P, _P, _P, _P], wintypes.DWORD),
+    ]:
+        _fn.argtypes, _fn.restype = _args, _res
+
+    def _win_check(ok):
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def _win_user_sid():
+        token = wintypes.HANDLE()
+        _win_check(_advapi.OpenProcessToken(_kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)))  # TOKEN_QUERY
+        try:
+            size = wintypes.DWORD()
+            _advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))  # TokenUser
+            buf = ctypes.create_string_buffer(size.value)
+            _win_check(_advapi.GetTokenInformation(token, 1, buf, size, ctypes.byref(size)))
+        finally:
+            _kernel.CloseHandle(token)
+        s = wintypes.LPWSTR()
+        _win_check(_advapi.ConvertSidToStringSidW(ctypes.cast(buf, _PP)[0], ctypes.byref(s)))
+        try:
+            return s.value
+        finally:
+            _kernel.LocalFree(s)
+
+    def _win_sddl(fd):
+        sd, s, what = _P(), wintypes.LPWSTR(), 1 | 4  # OWNER_ and DACL_SECURITY_INFORMATION
+        err = _advapi.GetSecurityInfo(msvcrt.get_osfhandle(fd), 1, what, None, None, None, None, ctypes.byref(sd))
+        if err:
+            raise ctypes.WinError(err)
+        try:
+            _win_check(_advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, what, ctypes.byref(s), None))
+        finally:
+            _kernel.LocalFree(sd)
+        try:
+            return s.value
+        finally:
+            _kernel.LocalFree(s)
+
+    def win_set_dacl(path, sddl):
+        sd, present, dacl, defaulted = _P(), wintypes.BOOL(), _P(), wintypes.BOOL()
+        _win_check(_advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(sd), None))
+        try:
+            _win_check(_advapi.GetSecurityDescriptorDacl(sd, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)))
+            err = _advapi.SetNamedSecurityInfoW(path, 1, 4 | 0x80000000, None, None, dacl, None)  # DACL, PROTECTED_DACL
+            if err:
+                raise ctypes.WinError(err)
+        finally:
+            _kernel.LocalFree(sd)
+
+
+def restrict(path, folder=False):
+    """Make path (and, for a folder, what is later created in it) accessible only to the current user."""
+    if os.name == "nt":
+        win_set_dacl(path, "D:P(A;%s;FA;;;%s)" % ("OICI" if folder else "", _win_user_sid()))
+    else:
+        os.chmod(path, 0o700 if folder else 0o600)
+
+
+def others_with_access(fd):
+    """Who other than the owner (and the system's administrators) can access this open file; None if no one."""
+    if os.name == "nt":
+        return sddl_others(_win_sddl(fd), _win_user_sid())
+    mode = os.fstat(fd).st_mode & 0o777
+    return ("mode %o" % mode) if mode & 0o077 else None
+
+
 def write_private(path, data, *, create=False, create_dirs=True):
     folder = os.path.dirname(path) or "."
-    if create_dirs:
+    if create_dirs and not os.path.isdir(folder):
         os.makedirs(folder, mode=0o700, exist_ok=True)
+        if os.name == "nt":
+            restrict(folder, folder=True)
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".islandmail-")
     try:
+        if os.name == "nt":
+            restrict(tmp)  # before any data goes in; mkstemp's 0600 means nothing on Windows
         with os.fdopen(fd, "wb") as f:
             f.write(data.encode("utf-8") if isinstance(data, str) else data)
             f.flush()
@@ -218,19 +334,20 @@ def certify(ident):
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
 
-# Windows has neither flag and reports synthetic group/other bits; there the folder's ACL (by default the user's
-# profile) keeps the file private, so only POSIX checks the mode.
+# Windows has neither flag; there the access list check below does the work of mode 600.
 _IDENT_OPEN = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
-_POSIX_MODES = os.name != "nt"
 
 
 def _read_identity(name):
     try:
         fd = os.open(ident_path(name), _IDENT_OPEN)
         with os.fdopen(fd) as f:
-            mode = os.fstat(fd).st_mode
-            if not stat.S_ISREG(mode) or (_POSIX_MODES and mode & 0o077):
-                raise Fail("identity must be a regular file accessible only to its owner (mode 600)")
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise Fail("identity must be a regular file")
+            who = others_with_access(fd)
+            if who:
+                raise Fail("identity must be accessible only to its owner (mode 600 or a Windows access list with "
+                           "only your user), but %s can access it" % who)
             if os.fstat(fd).st_size > 16_384:
                 raise Fail("identity file exceeds 16 KiB")
             ident = json.loads(f.read(16_385))
