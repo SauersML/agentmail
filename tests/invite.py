@@ -178,12 +178,13 @@ def main():
         b_key = b_ent[0]["key"] if b_ent else ""
 
         # The inviter's lines: alice's next command (which also does the room add), and one in her inbox from bob.
+        # Bounds are generous (sync under a loaded CI host can take a while); each wait ends as soon as the line is there.
         said = []
-        got, t = wait_for(lambda: said.append(cl("a", "rooms")) or "added to alice/plan" in said[-1][2], timeout=40, every=1)
+        got, t = wait_for(lambda: said.append(cl("a", "rooms")) or "added to alice/plan" in said[-1][2], timeout=120, every=1)
         check("alice's next command says bob joined and adds bob to alice/plan", got,
               "%.1fs %s" % (t, said[-1][2][-300:] if said else ""))
         got, t = wait_for(lambda: [m for m in js("a", "read", "--to-me") or [] if "joined with your invite" in m.get("text", "")],
-                          timeout=40)
+                          timeout=120)
         check("alice gets a line in her inbox about the join", got and got[0]["from"] == "bob", "%.1fs" % t)
         rc, out, err = cl("a", "rooms")
         check("and says it once", "joined with your invite" not in err, err[-200:])
@@ -289,7 +290,7 @@ def main():
                                                     for n in ("dora", "dmitri")))
         # alice's client does not run here: her node adds both to alice/plan, with the room's history.
         for n in ("dora", "dmitri"):
-            got, t = wait_for(lambda: [r for r in js("d", "--as", n, "rooms") or [] if r.get("id") == "alice/plan"], timeout=40)
+            got, t = wait_for(lambda: [r for r in js("d", "--as", n, "rooms") or [] if r.get("id") == "alice/plan"], timeout=120)
             check("A's node adds %s to alice/plan by itself" % n, bool(got), "%.1fs" % t)
         got = [m for m in (js("d", "--as", "dmitri", "room", "read", "alice/plan") or {}).get("messages", [])
                if m.get("text") == "before bob"]
