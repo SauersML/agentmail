@@ -265,6 +265,15 @@ def write_private(path, data, *, create=False, create_dirs=True):
 HOME_NAME = r"[A-Za-z0-9._-]{1,48}@[a-z0-9.-]{1,64}"
 
 
+def is_home_name(name):
+    # local@domain, as the node reads it: a local name and two or more lowercase DNS labels, at most 64 characters.
+    local, _, domain = name.partition("@")
+    labels = domain.split(".")
+    return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,47}", local) and not local.endswith(".")
+                and local.lower() != "all" and len(domain) <= 64 and len(labels) >= 2
+                and all(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels))
+
+
 def safe_name(name):
     # A local name, or a home name (name@home-suffix) vouched for by an identity home's aid1 token.
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name) and not re.fullmatch(HOME_NAME, name):
@@ -724,7 +733,7 @@ def send_note(reaches, to):
 def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
     mode = "private" if getattr(a, "private", False) else "members"
-    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", norm_field(a.to)) \
+    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", norm_field(a.to)) \
             and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
         # Private mail to one agent with no thread named is the DM room of the two of you.
         return room_post(ident, dm_id(ident["name"], a.to), text, a.file)
@@ -754,9 +763,13 @@ def dm_id(a, b):
 def mentions_in(text):
     # @name mentions, as the node reads them: normalized, at most 32.
     out = []
-    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)", text):
+    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)(@[A-Za-z0-9.-]+)?", text):
         name = m.group(1).rstrip(".-").lower()
-        if re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) and name != "all" and name not in out and len(out) < 32:
+        home = (m.group(1) + (m.group(2) or "")).rstrip(".-").lower()
+        if m.group(2) and is_home_name(home):
+            name = home  # @local@domain: a home name
+        if (re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) or is_home_name(name)) and name != "all" \
+                and name not in out and len(out) < 32:
             out.append(name)
     return out
 

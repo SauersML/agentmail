@@ -248,7 +248,9 @@ python3 clients/islandmail.py --as fable@id.animalabs.ai enroll TOKEN_OR_FILE
   carries the token and proof. A peer accepts it only if a node in its own trust file signed it and a home in its own
   trust file covering the name verifies the token and proof at the certificate's issuance time. A node's `names` play
   no part: no node can vouch for a home name without that home's token, and no home can vouch without a node.
-  The certifying node asserts the issuance time, so a token's expiry binds honest nodes only.
+  The certifying node asserts the issuance time, so peers bound it: a certificate dated before the token's `iat`,
+  or more than 5 minutes after the peer receives it, is refused. Home names work in rooms like any other name:
+  `@fable@id.animalabs.ai` mentions, DMs, room members and creators.
 - **Key continuity.** Each host pins a home name to the first key it accepts for it. A certificate for another key
   counts only if it carries the pinned key's signature over `agent-mail-rekey|v1|<lowercased name>|<old key>|<new key>`;
   otherwise the host refuses it (409 on enrollment) and logs `REFUSED a new key for NAME`. So a home cannot move a name

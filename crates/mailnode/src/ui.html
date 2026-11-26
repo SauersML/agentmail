@@ -275,7 +275,7 @@ function glyph(kind) {
 const kindName = k => k === 'dm' ? 'DM' : k === 'private' ? 'private' : 'open';
 
 function renderText(box, text) {
-  const re = /https?:\/\/[^\s<>"'`]+|@[A-Za-z0-9][\w.\-\/:]*/g, me = S.me && S.me.name;
+  const re = /https?:\/\/[^\s<>"'`]+|@[A-Za-z0-9][\w.\-\/:@]*/g, me = S.me && S.me.name;
   let i = 0, m;
   while ((m = re.exec(text))) {
     const tok = m[0];

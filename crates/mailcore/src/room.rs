@@ -140,7 +140,7 @@ impl Meta {
         if let Some(r) = &m.room {
             ensure!(valid_room_id(r), "invalid room id");
         }
-        ensure!(m.mentions.len() <= MAX_MENTIONS && m.mentions.iter().all(|n| crate::cert::valid_name(n)), "invalid mentions");
+        ensure!(m.mentions.len() <= MAX_MENTIONS && m.mentions.iter().all(|n| crate::cert::valid_agent_name(n)), "invalid mentions");
         if let Some(r) = &m.reply_to {
             ensure!(crate::envelope::is_id(r), "reply_to must be an envelope id");
         }
@@ -166,7 +166,7 @@ impl Meta {
                 }
                 Event::Leave {} => &[],
             };
-            ensure!(names.len() <= MAX_ROOM_MEMBERS && names.iter().all(|n| crate::cert::valid_name(n)), "invalid member names");
+            ensure!(names.len() <= MAX_ROOM_MEMBERS && names.iter().all(|n| crate::cert::valid_agent_name(n)), "invalid member names");
         }
         Ok(m)
     }
@@ -192,18 +192,18 @@ pub fn dm_id(a: &str, b: &str) -> String {
 /// The two names of a DM room id.
 pub fn dm_pair(id: &str) -> Option<(String, String)> {
     let (a, b) = id.strip_prefix("dm:")?.split_once('+')?;
-    (crate::cert::valid_name(a) && crate::cert::valid_name(b) && dm_id(a, b) == id).then(|| (a.to_string(), b.to_string()))
+    (crate::cert::valid_agent_name(a) && crate::cert::valid_agent_name(b) && dm_id(a, b) == id).then(|| (a.to_string(), b.to_string()))
 }
 
 /// The creator part of `creator/name`.
 pub fn creator_of(id: &str) -> Option<&str> {
     let (c, name) = id.split_once('/')?;
-    (crate::cert::valid_name(c) && valid_room_name(name)).then_some(c)
+    (crate::cert::valid_agent_name(c) && valid_room_name(name)).then_some(c)
 }
 
 /// `to` of a room post that is not a DM: it addresses no agent, so only mentions wake anyone.
 pub fn room_to(id: &str) -> String {
-    if id.chars().all(|c| c.is_ascii_alphanumeric() || "._:/+-".contains(c)) && id.len() <= 100 {
+    if id.chars().all(|c| c.is_ascii_alphanumeric() || "._:/+-@".contains(c)) && id.len() <= 100 {
         format!("room:{id}")
     } else {
         "room:".into()
@@ -222,8 +222,19 @@ pub fn mentions_in(text: &str) -> Vec<String> {
             while j < chars.len() && (word(chars[j]) || chars[j] == '.' || chars[j] == '-') {
                 j += 1;
             }
-            let name: String = chars[i + 1..j].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
-            if crate::cert::valid_name(&name) && !out.contains(&name) && out.len() < MAX_MENTIONS {
+            let mut name: String = chars[i + 1..j].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
+            // A home name, @local@domain, when the part after the second '@' makes one.
+            if j < chars.len() && chars[j] == '@' {
+                let mut k = j + 1;
+                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '.' || chars[k] == '-') {
+                    k += 1;
+                }
+                let home = chars[i + 1..k].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
+                if crate::home::split_name(&home).is_some() {
+                    (name, j) = (home, k);
+                }
+            }
+            if crate::cert::valid_agent_name(&name) && !out.contains(&name) && out.len() < MAX_MENTIONS {
                 out.push(name);
             }
             i = j;
@@ -407,6 +418,10 @@ mod tests {
     #[test]
     fn mentions() {
         assert_eq!(mentions_in("hi @Alice and @ops.bob. mail a@b.c @@x @a_1-"), vec!["alice", "ops.bob", "a_1"]);
+        assert_eq!(mentions_in("@Fable@id.test. and @nell@x then @bob@"), vec!["fable@id.test", "nell", "bob"]);
+        assert_eq!(dm_pair(&dm_id("p.bob", "fable@id.test")), Some(("fable@id.test".into(), "p.bob".into())));
+        assert_eq!(creator_of("fable@id.test/plan"), Some("fable@id.test"));
+        assert_eq!(room_to("fable@id.test/plan"), "room:fable@id.test/plan");
     }
 
     #[test]

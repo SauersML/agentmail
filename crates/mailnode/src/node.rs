@@ -317,10 +317,12 @@ impl Node {
             return Err(ApiError::new(403, format!("no home in this host's trust file vouches for {name}")));
         }
         let mut why = String::new();
-        if !homes.iter().any(|h| h.check(name, key, &proof, now).map_err(|e| why = format!("{e:#}")).is_ok()) {
+        let Some(token) = homes.iter().find_map(|h| h.check(name, key, &proof, now).map_err(|e| why = format!("{e:#}")).ok()) else {
             tracing::warn!("enrollment of {name} refused: {why}");
             return Err(ApiError::new(403, format!("enrollment refused: {why}")));
-        }
+        };
+        // Peers refuse a certificate dated before the token's iat; a home clock slightly ahead dates it at iat.
+        let issued = now.max((token.iat * 1000.0).ceil() as i64);
         if self.store.revoked_at(&fmt_key(&me), key)?.is_some() {
             return Err(ApiError::new(403, "this node revoked that key; make a new one"));
         }
@@ -333,7 +335,7 @@ impl Node {
             }
             return Ok((200, json!({ "cert": c })));
         }
-        let cert = Cert::issue_home(&self.seed, name, &k, &now_ts(), proof);
+        let cert = Cert::issue_home(&self.seed, name, &k, &ts_from_millis(issued), proof);
         if !list.accepts(&cert) {
             return Err(ApiError::new(403, "enrollment refused: the certificate would not verify under this trust file"));
         }

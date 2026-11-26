@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -221,6 +222,53 @@ def main():
         check("mail from the new key reaches the pod", rc == 0 and bool(got), out[-160:])
         old = [m for m in read("pod", "p.bob") if m.get("text") == "hello from a home agent"]
         check("mail from the old key still verifies there", bool(old))
+
+        # Home names in rooms: a DM, and an @mention of name@home.
+        rc, out = cl("pod", "--as", "p.bob", "dm", "fable@id.test", "a dm for a home agent")
+        got, t = wait_for(lambda: [m for m in read("mac", "fable@id.test") if m.get("text") == "a dm for a home agent"],
+                          timeout=20)
+        check("p.bob DMs fable@id.test", rc == 0 and bool(got), out[-200:])
+        rc, out = cl("pod", "--as", "p.bob", "room", "send", "lobby", "@fable@id.test please look")
+        got, t = wait_for(lambda: [m for m in read("mac", "fable@id.test")
+                                   if m.get("text") == "@fable@id.test please look"], timeout=20)
+        check("an @mention of fable@id.test names it in full", rc == 0 and bool(got)
+              and got[0].get("mentions") == ["fable@id.test"], (out[-160:], got and got[0].get("mentions")))
+
+        # The certifying node's claimed issuance time is bounded: not before the token's iat, not more than five
+        # minutes after the peer receives it. Certificates signed with the mac's node key go straight into its store
+        # (as a misbehaving node would hold them); the pod gets them by sync and judges each.
+        node_priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(open(k("mac")).read().strip()))
+        now = int(time.time())
+        forged = {}
+
+        def forge(local, iat, issued_ms):
+            agent = Ed25519PrivateKey.generate()
+            name, tok = local + "@id.test", home.mint(local, kid(agent), iat=iat, exp=now + 3600)
+            ts, jti = canon_ts(issued_ms / 1000), b64u(os.urandom(16))
+            present = "archipelago-present|v1|id.test|agentmail|%s|%s|%s" % (ts, jti, b64u(hashlib.sha256(tok.encode()).digest()))
+            c = {"v": 1, "name": name, "key": kid(agent), "node": pub["mac"], "issued": ts, "sig": "",
+                 "home": {"aid1": tok, "ts": ts, "jti": jti, "pop": b64u(agent.sign(present.encode()))}}
+            msg = b"agent-mail/agent-cert/v1\n" + json.dumps(c, separators=(",", ":")).encode()
+            c["sig"] = b64u(node_priv.sign(msg))
+            forged[name] = c
+
+        forge("early", now, now * 1000 - 1000)       # a second before the token's iat
+        forge("atiat", now, now * 1000)              # exactly at iat: the boundary, accepted
+        forge("ahead", now, now * 1000 + 360_000)    # six minutes ahead of the peer's clock
+        forge("soon", now, now * 1000 + 240_000)     # four minutes ahead: within the allowance
+        nodes["mac"].stop()
+        db = sqlite3.connect(os.path.join(work, "data-mac", "mail.sqlite"))
+        for name, c in forged.items():
+            db.execute("INSERT INTO certs (node, key, lname, json) VALUES (?, ?, ?, ?)",
+                       (c["node"], c["key"], name, json.dumps(c, separators=(",", ":"))))
+        db.commit()
+        db.close()
+        check("mac node restarts", nodes["mac"].start())
+        got, t = wait_for(lambda: {"atiat@id.test", "soon@id.test"} <= set(agents("pod", "p.bob")), timeout=30)
+        check("a certificate dated at iat, and one four minutes ahead, are accepted", bool(got), "%.1fs" % t)
+        seen = agents("pod", "p.bob")
+        check("a certificate dated before its token's iat is refused", "early@id.test" not in seen)
+        check("a certificate dated six minutes ahead is refused", "ahead@id.test" not in seen)
     finally:
         for nd in nodes.values():
             nd.stop()

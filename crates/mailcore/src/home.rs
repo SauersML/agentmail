@@ -152,17 +152,27 @@ impl HomeEntry {
 
 /// Checks the home part of a certificate against the homes a trust file pins: a home name needs a proof that one of
 /// them accepts at the certificate's issuance time; any other name must carry none.
+///
+/// The certifying node claims the issuance time, so it is bounded on both sides: not before the token's `iat`, and not
+/// more than five minutes after this host's clock when it receives the certificate (a future-dated claim).
 pub fn check_cert(homes: &[HomeEntry], c: &Cert) -> Result<()> {
+    check_cert_at(homes, c, crate::now_millis())
+}
+
+/// `check_cert` with this host's clock at `now_ms`.
+pub fn check_cert_at(homes: &[HomeEntry], c: &Cert, now_ms: i64) -> Result<()> {
     match (&c.home, is_home_name(&c.name)) {
         (None, false) => Ok(()),
         (Some(_), false) => bail!("a home proof on a name outside every home suffix"),
         (None, true) => bail!("{} is a home name but the certificate carries no home token", c.name),
         (Some(p), true) => {
             let at = parse_ts(&c.issued).ok_or_else(|| anyhow!("bad certificate time"))?;
+            ensure!(at <= now_ms.saturating_add(CERTIFY_SKEW_MS), "certificate for {} is dated in the future", c.name);
             let mut last = anyhow!("no home in this host's trust file vouches for {}", c.name);
             for h in homes.iter().filter(|h| h.covers(&c.name)) {
                 match h.check(&c.name, &c.key, p, at) {
-                    Ok(_) => return Ok(()),
+                    Ok(t) if t.iat * 1000.0 <= at as f64 => return Ok(()),
+                    Ok(_) => last = anyhow!("certificate for {} is dated before its token's iat", c.name),
                     Err(e) => last = e,
                 }
             }
@@ -220,6 +230,25 @@ mod tests {
         let mut forged = p.clone();
         forged.pop = b64u(&Seed::generate().sign(b"x"));
         assert!(h.check("fable@id.test", &key, &forged, NOW_MS).is_err(), "proof by another key");
+    }
+
+    #[test]
+    fn issuance_time_is_bounded_by_iat_and_receipt() {
+        let h = entry();
+        let holder = Seed::from_hex(HOLDER_SEED).unwrap();
+        let node = Seed::generate();
+        let iat_ms = 1_785_100_000_000; // the GOOD vector's iat
+        let cert = |issued_ms: i64| {
+            let p = proof(&holder, GOOD.trim(), issued_ms);
+            Cert::issue_home(&node, "fable@id.test", &holder.public(), &crate::ts_from_millis(issued_ms), p)
+        };
+        let homes = std::slice::from_ref(&h);
+        check_cert_at(homes, &cert(iat_ms), NOW_MS).unwrap();
+        let early = check_cert_at(homes, &cert(iat_ms - 1), NOW_MS).unwrap_err().to_string();
+        assert!(early.contains("before its token's iat"), "{early}");
+        check_cert_at(homes, &cert(NOW_MS + 300_000), NOW_MS).unwrap();
+        let future = check_cert_at(homes, &cert(NOW_MS + 300_001), NOW_MS).unwrap_err().to_string();
+        assert!(future.contains("dated in the future"), "{future}");
     }
 
     #[test]
