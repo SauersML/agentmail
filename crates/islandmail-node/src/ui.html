@@ -73,7 +73,9 @@ input, textarea { font: inherit; color: var(--text); background: var(--input); }
 .quote { border-left: 2px solid var(--line); padding-left: 8px; margin: 2px 0; color: var(--muted); font-size: 13px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
 .rep { visibility: hidden; color: var(--muted); font-size: 12px; margin-left: 8px; }
-.msg:hover .rep { visibility: visible; }
+.msg > .rep { float: right; }
+.msg:hover .rep, .msg.tap .rep { visibility: visible; }
+@media (hover: none) { .rep { font-size: 13px; padding: 2px 6px; } }
 .file { display: inline-block; margin: 4px 8px 0 0; color: var(--accent); font-size: 13px; }
 .thumb { display: block; max-width: min(320px, 100%); max-height: 320px; margin-top: 4px; border-radius: 6px; border: 1px solid var(--line); }
 
@@ -313,6 +315,7 @@ function buildView() {
   const scroll = el('div', 'scroll'), more = el('button', 'earlier', 'Show earlier messages'), msgs = el('div');
   more.type = 'button'; more.hidden = true; more.onclick = loadEarlier;
   scroll.append(more, msgs);
+  msgs.addEventListener('click', onTap);
   V = { head: el('header'), details: el('div', 'details'), scroll, more, msgs, c: null, pinned: true };
   V.details.hidden = true;
   scroll.addEventListener('scroll', () => { V.pinned = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }, { passive: true });
@@ -353,9 +356,12 @@ function msgNode(m, newDay, first) {
     const top = el('div'), t = el('span', 'at', d ? fTime.format(d) : '');
     if (d) t.title = fFull.format(d);
     top.append(el('span', 'who', m.from), t);
-    if (canPost()) { const r = el('button', 'rep', 'reply'); r.type = 'button'; r.onclick = () => setReply(m); top.append(r); }
+    if (canPost()) top.append(replyBtn(m));
     row.append(top);
-  } else if (d) row.title = fFull.format(d);
+  } else {
+    if (d) row.title = fFull.format(d);
+    if (canPost()) row.append(replyBtn(m));
+  }
   if (m.quote) {
     const q = el('div', 'quote', (m.quote.from || '') + ': ' + oneLine(m.quote.text));
     q.title = 'Reply to ' + (m.quote.id || m.reply_to || ''); q.onclick = () => jumpTo(m.quote.id); row.append(q);
@@ -363,6 +369,20 @@ function msgNode(m, newDay, first) {
   if (m.text) { const x = el('div', 'text'); renderText(x, m.text); row.append(x); }
   for (const f of m.files || []) row.append(fileNode(f));
   return row;
+}
+function replyBtn(m) {
+  const r = el('button', 'rep', 'reply'); r.type = 'button';
+  r.onclick = ev => { ev.stopPropagation(); setReply(m); tapped(null); };
+  return r;
+}
+// Without hover (touch), tapping a message shows its reply button; tapping elsewhere hides it.
+let tappedRow = null;
+function tapped(row) { if (tappedRow) tappedRow.classList.remove('tap'); tappedRow = row; if (row) row.classList.add('tap'); }
+function onTap(ev) {
+  if (ev.target.closest('a, button, img')) return;
+  const row = ev.target.closest('.msg');
+  if (!row || row.classList.contains('event') || (window.getSelection && String(window.getSelection()))) return tapped(null);
+  tapped(row === tappedRow ? null : row);
 }
 function fileNode(f) {
   const box = el('div'), a = el('a', 'file', '\u{1F4CE} ' + (f.name || 'file'));
