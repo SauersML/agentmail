@@ -273,20 +273,24 @@ def write_private(path, data, *, create=False, create_dirs=True):
         if create:
             os.link(tmp, path)
         else:
-            os.replace(tmp, path)
+            _while_open_elsewhere(os.replace, tmp, path)
     finally:
-        # On Windows the temporary name cannot be removed while another process has the new file open (a second
-        # first command reading the key just linked): it is one file under two names. Retry for a few seconds.
-        for i in range(100):
-            try:
-                os.unlink(tmp)
-                break
-            except FileNotFoundError:
-                break
-            except PermissionError:
-                if os.name != "nt" or i == 99:
-                    raise
-                time.sleep(0.05)
+        try:
+            _while_open_elsewhere(os.unlink, tmp)
+        except FileNotFoundError:
+            pass
+
+
+def _while_open_elsewhere(fn, *args):
+    # Windows refuses to replace or remove a file another process has open (a concurrent command reading it, or the
+    # new key linked a moment ago under this temporary name). Those readers are brief: retry for a few seconds.
+    for i in range(100):
+        try:
+            return fn(*args)
+        except PermissionError:
+            if os.name != "nt" or i == 99:
+                raise
+            time.sleep(0.05)
 
 
 HOME_NAME = r"[A-Za-z0-9._-]{1,48}@[a-z0-9.-]{1,64}"
@@ -748,7 +752,7 @@ def cmd_enroll(a):
         raise Fail("the token is bound to %s, not to the key being enrolled (%s)" % (cnf, key["id"]))
     if nxt:
         enroll(nxt, token, old=ident)
-        os.replace(pending_path(name), ident_path(name))
+        _while_open_elsewhere(os.replace, pending_path(name), ident_path(name))
         print("enrolled %s with its new key %s (handed over by %s)" % (name, nxt["id"], ident["id"]))
     else:
         enroll(ident, token)
