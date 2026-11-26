@@ -544,7 +544,7 @@ impl Ctx {
                 for id in &page {
                     anyhow::ensure!(islandmail_core::envelope::is_id(id) && id > &after, "invalid peer id page");
                     after.clone_from(id);
-                    if !node.store.has(id)? {
+                    if !node.store.has(id)? && !node.refused_now(id) {
                         missing.push(id.clone());
                     }
                 }
@@ -557,10 +557,11 @@ impl Ctx {
                     for raw in resp.envelopes {
                         let env: Envelope = serde_json::from_str(&raw)?;
                         anyhow::ensure!(rest[..taken].contains(&env.id), "unsolicited envelope");
+                        let id = env.id.clone();
                         match node.ingest(env) {
                             Ok(Some(_)) => added += 1,
                             Ok(None) => {}
-                            Err(e) => tracing::warn!("sync from {}: refused an envelope: {e:#}", peer.fmt_short()),
+                            Err(e) => node.note_refused(&id, &format!("sync from {}", peer.fmt_short()), &e),
                         }
                     }
                     rest = &rest[taken..];
@@ -730,12 +731,18 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                         }
                         continue;
                     }
-                    match serde_json::from_slice::<Envelope>(&msg.content).map_err(anyhow::Error::from).and_then(|e| c.node.ingest(e)) {
+                    let env = match serde_json::from_slice::<Envelope>(&msg.content) {
+                        Ok(env) => env,
+                        Err(e) => { tracing::debug!("gossip: not an envelope: {e}"); continue; }
+                    };
+                    let id = env.id.clone();
+                    if c.node.refused_now(&id) { continue; }
+                    match c.node.ingest(env) {
                         Ok(Some(r)) => {
                             tracing::info!("gossip: stored #{} {}", r.id, &r.env_id[..12]);
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!("gossip: refused an envelope: {e:#}"),
+                        Err(e) => c.node.note_refused(&id, "gossip", &e),
                     }
                 }
                 Ok(Event::NeighborUp(peer)) => {

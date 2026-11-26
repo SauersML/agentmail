@@ -116,6 +116,9 @@ pub struct Node {
     /// Agent keys a post-capable /ui session lent this node (in memory only, until the session expires): agent key ->
     /// (seed, expiry ms).
     lent: Mutex<HashMap<String, (Seed, i64)>>,
+    /// Envelopes refused at the trust generation (`trust`) they were refused at: sync skips them until trust,
+    /// certificates, held identities or a room vouch change, and each is logged once.
+    refused: Mutex<HashMap<String, u64>>,
 }
 
 impl Node {
@@ -147,6 +150,7 @@ impl Node {
             touched: Mutex::new(HashMap::new()),
             auth_seen: Mutex::new(HashSet::new()),
             lent: Mutex::new(HashMap::new()),
+            refused: Mutex::new(HashMap::new()),
         };
         node.refresh();
         node
@@ -165,6 +169,33 @@ impl Node {
             }
         };
         self.trust.send_modify(|g| *g += 1);
+    }
+
+    /// Whether `id` was refused and nothing that could change the answer has happened since.
+    pub fn refused_now(&self, id: &str) -> bool {
+        let generation = *self.trust.borrow();
+        self.refused.lock().unwrap().get(id) == Some(&generation)
+    }
+
+    /// Remember a refused envelope (retried after the next trust change) and log it the first time only.
+    pub fn note_refused(&self, id: &str, from: &str, e: &anyhow::Error) {
+        if e.downcast_ref::<rusqlite::Error>().is_some() {
+            // A local database failure says nothing about the envelope: fetch it again next time.
+            return tracing::warn!("{from}: could not store envelope {}: {e:#}", id.get(..12).unwrap_or(id));
+        }
+        let generation = *self.trust.borrow();
+        let mut refused = self.refused.lock().unwrap();
+        if refused.len() >= 100_000 {
+            refused.clear();
+        }
+        let first = refused.insert(id.to_string(), generation).is_none();
+        drop(refused);
+        let short = id.get(..12).unwrap_or(id);
+        if first {
+            tracing::warn!("{from}: refused envelope {short}: {e:#} (skipped until trust changes; not logged again)");
+        } else {
+            tracing::debug!("{from}: refused envelope {short} again: {e:#}");
+        }
     }
 
     pub fn current_encryption_key(&self) -> Option<islandmail_core::node_key::NodeEncryptionKey> {
@@ -1139,6 +1170,9 @@ impl Node {
         let mut cur = self.opts.identities.write().unwrap();
         if key(&cur) == key(&ids) { return false; }
         *cur = ids;
+        drop(cur);
+        // New keys may open envelopes refused before.
+        self.trust.send_modify(|g| *g += 1);
         true
     }
 
