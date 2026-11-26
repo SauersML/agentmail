@@ -87,7 +87,8 @@ there gets that node's certificate too. Private mail to the agent is then encryp
 - **Who can talk.** A node accepts an agent only if its host's trust file pins that name and key, or a node in that
   file certified the key under a name within the names the file gives that node. A certificate signed by an untrusted
   node, or for a name outside its names, is ignored. A pin takes precedence: certificates for a pinned name with
-  another key do not count.
+  another key do not count. Each pin also reserves its subject ID. For example, a pin with subject
+  `agent:ops.reader` prevents a different agent from claiming that ID through certification.
 - **Certifying.** `POST /api/agents` answers only on the loopback API, requires a proof signed by the agent key for
   this node within 5 minutes, refuses a name already certified with another key (by this node or another trusted
   node), and issues at most 60 new certificates an hour. Anyone who can reach the loopback API, i.e. any local user

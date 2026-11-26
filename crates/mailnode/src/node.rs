@@ -237,7 +237,7 @@ impl Node {
             return Err(ApiError::new(403, "this node revoked that key; make a new one"));
         }
         if !list.permits_agent_key(name, &k) {
-            return Err(ApiError::new(409, "agent name or key conflicts with a pin in this host's trust file"));
+            return Err(ApiError::new(409, "agent name, subject or key conflicts with a pin in this host's trust file"));
         }
         if let Some(c) = self.store.cert(&fmt_key(&me), key)? {
             if !mailcore::addr::same(&c.name, name) {

@@ -130,17 +130,16 @@ impl MemberList {
         self.nodes.iter().find(|n| n.key == key)
     }
 
-    /// Pins reserve their encryption keys, including the other Ed25519 sign encoding with the same X25519 image.
-    /// A pinned agent can still obtain a home certificate for its own name and exact signing key.
+    /// Pins reserve their subject and encryption key, including both sign encodings with the same X25519 image.
     pub fn permits_agent_key(&self, name: &str, key: &PublicKey) -> bool {
         let exact = fmt_key(key);
         let mut opposite = *key;
         opposite[31] ^= 0x80;
         let opposite = fmt_key(&opposite);
-        !self.nodes.iter().any(|n| n.key == exact || n.key == opposite)
-            && self.members.iter().all(|m| {
-                if addr::same(&m.name, name) { m.key == exact } else { m.key != exact && m.key != opposite }
-            })
+        if self.nodes.iter().any(|n| n.key == exact || n.key == opposite) { return false; }
+        if let Some(pin) = self.member_by_name(name) { return pin.key == exact; }
+        self.members.iter().all(|m| m.key != exact && m.key != opposite
+            && !m.sub.strip_prefix("agent:").is_some_and(|reserved| reserved.eq_ignore_ascii_case(name)))
     }
 
     /// Whether this host trusts `c`: well formed, signed by a node on this list whose namespace covers its name.
@@ -246,9 +245,12 @@ pub(crate) mod tests {
     fn certificates_respect_pinned_key_roles_and_encryption_requirements() {
         let (home, agent) = (Seed::generate(), Seed::generate());
         let mut l = list(&[("a.bob", &agent)], &[&home]);
+        l.members[0].sub = "agent:a.reserved".into();
         l.nodes[0].names = vec!["a.".into()];
         let accepts = |name, key| l.accepts(&Cert::issue(&home, name, &key, &crate::now_ts()));
         assert!(accepts("a.bob", agent.public()));
+        assert!(!accepts("a.reserved", Seed::generate().public()));
+        assert!(!accepts("a.Reserved", Seed::generate().public()));
         assert!(accepts("a.other", Seed::generate().public()));
         assert!(!accepts("a.other", agent.public()));
         assert!(!accepts("a.other", home.public()));
