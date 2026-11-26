@@ -354,8 +354,8 @@ async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Resul
 }
 
 /// POST /api/ui-sessions: a key for the /ui page, bound to the caller, for at most 12 hours. Read-only by default;
-/// `{"post": true, "seed": HEX}` lends the node the caller's agent key (memory only, until the key expires) so the page
-/// can post as the caller.
+/// `{"post": true, "seed": HEX}` lends the node the caller's agent key so the page can post as the caller: it lives only
+/// in `Node::lent` (memory, never written to disk or logged; `Seed` does not print) until the view key expires.
 async fn ui_session(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
     let v: Value = if body.is_empty() { json!({}) } else {
         serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?

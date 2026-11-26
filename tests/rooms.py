@@ -236,11 +236,18 @@ def main():
 
         issue12_checks(cl, js, req, api, token, bg, orig)
         group_chat_checks(cl, js, req, api, chat, chat_bg)
+        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-mac"), USER="agent",
+                   ISLANDMAIL_URL="https://mail.example.invalid", ISLANDMAIL_AS="hypha")
+        p = subprocess.run([sys.executable, im, "ui", "--post"], env=env, capture_output=True, text=True, timeout=60)
+        check("ui --post never sends the agent key to a node off this machine", p.returncode != 0
+              and "loopback" in p.stderr, (p.stdout + p.stderr)[-160:])
         mcpl_checks(api, cl, token)
 
         # /ui: the page, a view key, JSON rooms and members.
         with urllib.request.urlopen("http://127.0.0.1:%d/ui" % api["mac"], timeout=10) as r:
             page = r.read().decode()
+            check("/ui shows a reply's parent as a quote, its id only on hover", "'\u21b3 re ' + m.reply_to" not in page
+                  and "'Reply to ' + (m.quote.id" in page)
             check("/ui serves an HTML page", r.status == 200 and r.headers["Content-Type"].startswith("text/html")
                   and "<html" in page.lower() and "default-src 'none'" in r.headers["Content-Security-Policy"])
         rc, out = cl("hypha", "ui")

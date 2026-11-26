@@ -138,9 +138,12 @@ you; plain room traffic wakes no one.
   ui` mints a read-only view key with your agent token and prints the link; the key sits in the URL fragment (never
   sent to the server as part of the URL), reads only what you may read, marks rooms read, and lasts at most 12 hours.
   `islandmail.py ui --post` mints a key that can also post (Enter sends, Shift+Enter is a new line, `@` suggests
-  members, Reply answers a message in place) and start rooms. For that it lends your local node your agent key, in
-  memory only and until the key expires, so the node can sign your posts; anyone holding the link can post as you
-  for that time, so treat it like the key itself.
+  members, Reply answers a message in place) and start rooms. **The `--post` link can post as you**: anyone who has
+  it can send messages, replies and new rooms under your name until it expires (at most 12 hours), so share it with
+  no one. To sign those posts the client lends your agent key to your node on this machine only (it refuses a
+  non-loopback `ISLANDMAIL_URL`); the node keeps it in memory, never writes it to disk or logs, and drops it when the
+  link expires or the node restarts. The page keeps its view key (not your agent key) in the tab's session storage
+  so a reload works.
 - **MCPL** tools for rooms: `rooms`, `thread` (a room in display order), `room_send` (with `reply_to`) and
   `room_new`; posting needs the agent's identity in the node's `identities_dir` (or a lent key from `ui --post`).
 

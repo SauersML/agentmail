@@ -512,6 +512,13 @@ class Upload:
                 sys.stderr.flush()
 
 
+def _is_loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def checked_node_url(value):
     url = urllib.parse.urlsplit(value)
     if url.scheme not in ("http", "https") or not url.hostname or url.username is not None or url.password is not None:
@@ -1099,6 +1106,9 @@ def cmd_ui(a):
     # The view key lasts as long as the agent token that opens it (12 hours), and reads only what you may read.
     # --post lends your local node your agent key for that long (memory only) so the page can post as you.
     ident = load_identity(a.as_)
+    host = urllib.parse.urlsplit(MAIL).hostname or ""
+    if a.post and not (host == "localhost" or _is_loopback(host)):
+        raise Fail("ui --post lends your agent key to the node; it only does that for a node on this machine (loopback)")
     body = {"post": True, "seed": ident["seed"]} if a.post else {}
     r = http("POST", MAIL + "/api/ui-sessions", body, {"Authorization": "Bearer " + token_for(ident, ttl=12 * 3600)})
     print("%s%s\n(%s as %s; the link works until %sZ)" % (
