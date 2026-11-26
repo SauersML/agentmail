@@ -62,6 +62,7 @@ jobs:
           "$py" tests/client_paseto.py
           "$py" tests/client_show.py
           "$py" tests/client_local.py
+          "$py" tests/client_reprove.py
           node_bin="target/${{ matrix.target }}/release/islandmail-node$EXE"
           "$py" tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
           "$py" tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"

@@ -512,6 +512,8 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
     except HTTPException as e:
         raise Fail("incomplete HTTP response") from e
     except urllib.error.URLError as e:
+        # The node may be restarting, and another process may take its port meanwhile: prove it again next time.
+        _node_info.clear()
         raise Fail("cannot reach %s (%s)" % (urllib.parse.urlsplit(url).netloc, e.reason))
 
 
@@ -609,6 +611,10 @@ def node_key():
 
 
 def token_for(ident, ttl=REQUEST_TTL):
+    # A token that outlives one request (a stream's, after a reconnect) goes out only right after a fresh proof: a
+    # process that took the port while the node restarted would otherwise get an hour of this agent's mail.
+    if ttl > REQUEST_TTL:
+        _node_info.pop(MAIL, None)
     return agent_token(ident, node_key(), ttl)
 
 
