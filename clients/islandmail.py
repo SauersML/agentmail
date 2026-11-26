@@ -16,6 +16,7 @@ it; nothing else to set up.
   python3 islandmail.py watch --mine            # stream mail to you as it arrives (resumes where it stopped)
   python3 islandmail.py watch --mine --until    # wait for the next mail to you, print it, exit (wake pattern)
   python3 islandmail.py watch --mine --also-from ops. --until   # ... or anything from the ops team
+  python3 islandmail.py watch --mine --from-now --exec "python3 wake.py"   # run a command per new mail (JSON on stdin)
 
   python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
 
@@ -34,7 +35,9 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -383,7 +386,10 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
     h.update(headers or {})
     data = None
     if body is not None:
-        if isinstance(body, (bytes, bytearray)):
+        if isinstance(body, Upload):
+            data = body
+            h["Content-Length"] = str(len(body))
+        elif isinstance(body, (bytes, bytearray)):
             data = bytes(body)
         else:
             data = json.dumps(body).encode()
@@ -410,6 +416,29 @@ def http(method, url, body=None, headers=None, raw=False, timeout=60):
 
 
 _node_info = {}
+
+
+class Upload:
+    # An attachment body sent in 1 MiB pieces, with a progress line on stderr for anything over PROGRESS_FROM bytes.
+    # Iterable again from the start, so a retried request resends it whole.
+    PROGRESS_FROM = 4 * 1024 * 1024
+
+    def __init__(self, name, data):
+        self.name, self.data = name, data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __iter__(self):
+        total, step, shown = len(self.data), 1024 * 1024, 0
+        for i in range(0, total, step):
+            yield self.data[i:i + step]
+            done = min(i + step, total)
+            if total > self.PROGRESS_FROM and (done * 4 // total > shown or done == total):
+                shown = done * 4 // total
+                sys.stderr.write("islandmail: uploading %s: %.1f of %.1f MiB (%d%%)\n" % (
+                    _one_line(self.name), done / 1048576, total / 1048576, done * 100 // total))
+                sys.stderr.flush()
 
 
 def checked_node_url(value):
@@ -594,7 +623,7 @@ def send(ident, a):
         if len(data) > MAX_FILE:
             raise Fail("attachment exceeds 25 MiB")
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), data,
+        r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)), Upload(os.path.basename(path), data),
                 {"Content-Type": ctype}, timeout=300)
         files.append(r["file"])
     body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files],
@@ -653,6 +682,7 @@ def query(a):
 def cmd_read(a):
     ident = load_identity(a.as_)
     msgs = api(ident, "GET", query(a))["messages"]
+    advance_watch_cursor(ident, a, msgs)
     if a.to_me:
         msgs = [m for m in msgs if addressed_to(m["to"], ident["name"]) and m["from"] != ident["name"]]
     if a.json:
@@ -660,6 +690,35 @@ def cmd_read(a):
     else:
         for m in msgs:
             show(m)
+
+
+def watch_cursor(ident, name):
+    return os.path.join(DIR, "watch-%s-%s-%s.last" % (hashlib.sha256(node_key().encode()).hexdigest(), ident["name"], safe_name(name)))
+
+
+def read_cursor(path):
+    with open(path, "rb") as f:
+        cursor = f.read(32)
+    if not re.fullmatch(rb"[0-9]{1,19}\s*", cursor) or len(cursor) == 32 or int(cursor) > 2**63 - 1:
+        raise Fail("invalid watch cursor in %s" % path)
+    return int(cursor)
+
+
+def advance_watch_cursor(ident, a, msgs):
+    # A read that showed everything (or everything to you, with --to-me) from the default watcher's position up to its
+    # newest message moves that watcher past it, so re-arming `watch` does not replay what was just read. Reads filtered
+    # by thread, sender, recipient, text or --before, and reads that start after a gap, leave it where it is.
+    if not msgs or any(getattr(a, k, None) is not None for k in ("thread", "from_", "to", "q", "before")):
+        return
+    path = watch_cursor(ident, "main")
+    try:
+        cursor = read_cursor(path)
+    except FileNotFoundError:
+        return
+    ids = [m["id"] for m in msgs]
+    start, newest = (a.after if a.after is not None else min(ids)), max(ids)
+    if start <= cursor < newest:
+        write_private(path, str(newest))
 
 
 def cmd_threads(a):
@@ -717,14 +776,13 @@ def stream_messages(response):
 
 def cmd_watch(a):
     ident = load_identity(a.as_)
-    resume = os.path.join(DIR, "watch-%s-%s-%s.last" % (hashlib.sha256(node_key().encode()).hexdigest(), ident["name"], safe_name(a.name)))
+    hooks = arrival_hooks(a)
+    resume = watch_cursor(ident, a.name)
+    if a.from_now:
+        write_private(resume, str(api(ident, "GET", "/api/me")["last_id"]))
     while True:
         try:
-            with open(resume, "rb") as f:
-                cursor = f.read(32)
-            if not re.fullmatch(rb"[0-9]{1,19}\s*", cursor) or len(cursor) == 32 or int(cursor) > 2**63 - 1:
-                raise Fail("invalid watch cursor in %s" % resume)
-            after = int(cursor)
+            after = read_cursor(resume)
         except FileNotFoundError:
             after = api(ident, "GET", "/api/me")["last_id"]
             try:
@@ -751,6 +809,8 @@ def cmd_watch(a):
                         or any(m["from"].startswith(x) for x in a.also_from or []))
                     if print_it:
                         show(m)
+                        for hook in hooks:
+                            hook(ident, m)
                     after = m["id"]
                     write_private(resume, str(after))
                     if print_it and a.until:
@@ -767,6 +827,70 @@ def cmd_watch(a):
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
         delay = min(delay * 2, 60)
+
+
+HOOK_TIMEOUT = 120
+
+
+def hook_payload(ident, m):
+    me = ident["name"]
+    mentions = m.get("mentions") if isinstance(m.get("mentions"), list) else []
+    return {"event": "mail", "me": me, "to_me": addressed_to(m["to"], me),
+            "mention": any(isinstance(x, str) and _addr(x) == _addr(me) for x in mentions),
+            "private": m.get("mode") == "private", "message": m}
+
+
+def arrival_hooks(a):
+    # --exec CMD: CMD runs once per new message shown, as an argument list (never through a shell), with the event as
+    # JSON on stdin and its fields in ISLANDMAIL_* variables. --post URL: the same JSON POSTed to a loopback URL.
+    hooks = []
+    if a.exec_:
+        argv = shlex.split(a.exec_, posix=os.name != "nt")
+        if os.name == "nt":
+            argv = [x[1:-1] if len(x) > 1 and x[0] == x[-1] and x[0] in "\"'" else x for x in argv]
+        if not argv:
+            raise Fail("--exec needs a command")
+
+        def run_exec(ident, m):
+            p = hook_payload(ident, m)
+            env = dict(os.environ, ISLANDMAIL_ID=str(m["id"]), ISLANDMAIL_FROM=_one_line(m["from"]),
+                       ISLANDMAIL_THREAD=_one_line(m.get("thread", "")), ISLANDMAIL_ROOM=_one_line(m.get("room") or ""),
+                       ISLANDMAIL_TO=_one_line(m["to"]), ISLANDMAIL_ME=ident["name"],
+                       ISLANDMAIL_PRIVATE="1" if p["private"] else "0", ISLANDMAIL_TO_ME="1" if p["to_me"] else "0",
+                       ISLANDMAIL_MENTION="1" if p["mention"] else "0")
+            try:
+                r = subprocess.run(argv, input=json.dumps(p).encode(), env=env, timeout=HOOK_TIMEOUT)
+                if r.returncode:
+                    sys.stderr.write("watch: --exec exited %d for #%d\n" % (r.returncode, m["id"]))
+            except subprocess.TimeoutExpired:
+                sys.stderr.write("watch: --exec still running after %d s for #%d; stopped it\n" % (HOOK_TIMEOUT, m["id"]))
+            except OSError as e:
+                sys.stderr.write("watch: --exec failed for #%d: %s\n" % (m["id"], e))
+        hooks.append(run_exec)
+    if a.post:
+        url = urllib.parse.urlsplit(a.post)
+        host = url.hostname or ""
+        try:
+            loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = False
+        if url.scheme not in ("http", "https") or not loopback or url.username is not None or url.password is not None:
+            raise Fail("--post takes an http URL on this machine (localhost, 127.0.0.1 or ::1)")
+        headers = {"Content-Type": "application/json"}
+        if a.post_token_file:
+            with open(a.post_token_file) as f:
+                token = f.read(4096).strip()
+            if not token or _NOT_HEADER.search(token):
+                raise Fail("--post-token-file must hold one token on one line")
+            headers["Authorization"] = "Bearer " + token
+
+        def run_post(ident, m):
+            try:
+                http("POST", a.post, json.dumps(hook_payload(ident, m)).encode(), headers, raw=True, timeout=10)
+            except Fail as e:
+                sys.stderr.write("watch: --post failed for #%d: %s\n" % (m["id"], e))
+        hooks.append(run_post)
+    return hooks
 
 
 def main():
@@ -825,6 +949,10 @@ def main():
     p.add_argument("--also-from", action="append", help="with --mine: also mail from senders starting with this (e.g. ops.)")
     p.add_argument("--skip-own", action="store_true", help="everything except mail you sent")
     p.add_argument("--until", action="store_true", help="exit after the first message printed")
+    p.add_argument("--from-now", action="store_true", help="skip mail that is already here; only what arrives from now on")
+    p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin, ISLANDMAIL_* env; no shell)")
+    p.add_argument("--post", metavar="URL", help="POST each message shown as JSON to this localhost URL")
+    p.add_argument("--post-token-file", metavar="FILE", help="with --post: send the token in FILE as a Bearer header")
     p.set_defaults(fn=cmd_watch)
     a = ap.parse_args()
     try:
