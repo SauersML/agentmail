@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Peer-to-peer agent mail. On a host whose node has names, the first command makes your key and has the node certify
+"""Islandmail client: peer-to-peer mail between agents. On a host whose node has names, the first command makes your key and has the node certify
 it; nothing else to set up.
 
   python3 islandmail.py send --to hypha "hi"     (first use: a key for the host's first name, certified, then sent)
@@ -87,7 +87,7 @@ def b64u(b):
 # ---- PASETO v4.public (https://github.com/paseto-standard/paseto-spec): Ed25519 over PAE(h, m, f, i) ----
 
 PASETO_HEADER = b"v4.public."
-AGENT_TOKEN_IMPLICIT = b"agentmail-auth-v1"
+AGENT_TOKEN_IMPLICIT = b"islandmail-auth-v1"
 
 
 def pae(*pieces):
@@ -354,7 +354,7 @@ def certify(ident):
     key, ts = node_key(), canon_ts()
     seed = bytes.fromhex(ident["seed"])
     kid = "ed25519:" + b64u(ed25519_public(seed))
-    statement = "agent-mail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, key, ts)
+    statement = "islandmail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, key, ts)
     body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode()))}
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
@@ -385,13 +385,13 @@ def enroll(ident, token, old=None):
     seed = bytes.fromhex(ident["seed"])
     kid = "ed25519:" + b64u(ed25519_public(seed))
     jti = b64u(os.urandom(16))
-    statement = "agent-mail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, node, ts)
+    statement = "islandmail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, node, ts)
     present = "archipelago-present|v1|%s|%s|%s|%s|%s" % (
         payload.get("iss"), payload.get("aud"), ts, jti, b64u(hashlib.sha256(token.encode()).digest()))
     body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode())),
             "aid1": token, "jti": jti, "pop": b64u(ed25519_sign(seed, present.encode()))}
     if old:
-        rekey = "agent-mail-rekey|v1|%s|%s|%s" % (ident["name"].lower(), old["id"], kid)
+        rekey = "islandmail-rekey|v1|%s|%s|%s" % (ident["name"].lower(), old["id"], kid)
         body["rekey"] = {"key": old["id"], "sig": b64u(ed25519_sign(bytes.fromhex(old["seed"]), rekey.encode()))}
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
@@ -531,8 +531,8 @@ def checked_node_url(value):
 def node_info():
     if MAIL not in _node_info:
         info = http("GET", MAIL + "/api/node")
-        if info.get("envelope_version") != 3 or "agent-token" not in info.get("auth", []):
-            raise Fail("node must support envelope version 3 and agent tokens")
+        if info.get("envelope_version") != 1 or "agent-token" not in info.get("auth", []):
+            raise Fail("node must support envelope version 1 and agent tokens")
         pin = os.environ.get("ISLANDMAIL_NODE_KEY", "").strip()
         if pin and info.get("node") != pin:
             raise Fail("node public key does not match ISLANDMAIL_NODE_KEY")
@@ -705,18 +705,18 @@ def signed_block(ident, to, thread, text, files, mode, meta="", keys=None):
     now = datetime.datetime.now(datetime.timezone.utc)
     ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
     salt = os.urandom(16)
-    digest = hashlib.sha256(pae(b"agent-mail/body-digest/v2", salt, text.encode()))
+    digest = hashlib.sha256(pae(b"islandmail/body-digest/v1", salt, text.encode()))
     for f in files:
         digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))
     if meta:
-        digest.update(pae(b"agent-mail/body-meta/v1", meta.encode()))
+        digest.update(pae(b"islandmail/body-meta/v1", meta.encode()))
     topic = base64.urlsafe_b64decode(node_info()["network_id"] + "=")
     header = [ident["name"], ident["sub"], to, thread, mode, ts, digest.hexdigest()]
     if keys is None:
         query = urllib.parse.urlencode({"to": to, "mode": mode})
         keys = api(ident, "GET", "/api/recipients?" + query)["keys"]
     audience = pae(*sorted(base64.urlsafe_b64decode(k + "=") for k in keys))
-    statement = pae(b"agent-mail/post/v3", topic, *(s.encode() for s in header), audience, *(f["id"].encode() for f in files))
+    statement = pae(b"islandmail/post/v1", topic, *(s.encode() for s in header), audience, *(f["id"].encode() for f in files))
     return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
 
 
@@ -1376,7 +1376,7 @@ def main():
     p.add_argument("--to", required=True)
     p.add_argument("--thread", help="default general; --private to one agent with no thread: your DM room")
     p.add_argument("--file", action="append")
-    p.add_argument("--private", action="store_true", help="only the recipients can read it (agent-mail nodes only)")
+    p.add_argument("--private", action="store_true", help="only the recipients can read it")
     p.add_argument("text", nargs="?", help="the message, or - for stdin")
     p.set_defaults(fn=cmd_send)
     p = sub.add_parser("ask", help="send to one agent and wait for its answer")

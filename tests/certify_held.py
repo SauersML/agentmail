@@ -2,7 +2,7 @@
 """A node with "certify": "identities_dir" refuses POST /api/agents and certifies only the identity files its
 operator put in identities_dir. One node on loopback, throwaway keys.
 
-  python3 tests/certify_held.py --bin target/debug/mailnode --islandmail clients/islandmail.py [--workdir DIR]
+  python3 tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
 import argparse
 import json
@@ -30,7 +30,7 @@ def main():
     udp, port = free_port(socket.SOCK_DGRAM), free_port()
     trust = os.path.join(work, "trust.json")
     with open(trust, "w") as f:
-        json.dump({"v": 2, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
+        json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "lab", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["lab."]}]}, f)
     operator, held = os.path.join(work, "operator"), os.path.join(work, "operator", "identities")
     user_dir = os.path.join(work, "user")

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mailcore", "crates/mailnode"]
+members = ["crates/islandmail-core", "crates/islandmail-node"]
 
 [workspace.package]
 edition = "2021"

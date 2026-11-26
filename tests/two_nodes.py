@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Two-node integration test for mailnode. Run on a Linux box with the release binary built:
+"""Two-node integration test for islandmail-node. Run on a Linux box with the release binary built:
 
-  python3 tests/two_nodes.py --bin target/debug/mailnode --islandmail /path/to/islandmail.py [--workdir DIR]
+  python3 tests/two_nodes.py --bin target/debug/islandmail-node --islandmail /path/to/islandmail.py [--workdir DIR]
 
 Everything is throwaway: node keys and agent identities in --workdir.
 Needs `websockets` (pip) for the MCPL check; skipped if missing.
@@ -40,7 +40,7 @@ def check(name, ok, detail=""):
 
 def work_directory(path):
     if not path:
-        return tempfile.mkdtemp(prefix="agentmail-")
+        return tempfile.mkdtemp(prefix="islandmail-")
     path = os.path.abspath(path)
     os.makedirs(path, mode=0o700, exist_ok=False)
     return path
@@ -96,7 +96,7 @@ class Node:
             json.dump(self.cfg, f, indent=1)
         log = open(os.path.join(self.work, self.name + ".log"), "a")
         self.proc = subprocess.Popen([self.bin, "run", path], stdout=log, stderr=subprocess.STDOUT,
-                                     env=dict(os.environ, RUST_LOG=os.environ.get("MAILNODE_LOG", "mailnode=info,iroh=warn,iroh_gossip=warn")))
+                                     env=dict(os.environ, RUST_LOG=os.environ.get("ISLANDMAIL_NODE_LOG", "islandmail_node=info,iroh=warn,iroh_gossip=warn")))
         ok, _ = wait_for(lambda: self._up(), timeout=30)
         return ok
 
@@ -148,7 +148,7 @@ def main():
     agents = {"alice": "t.alice", "bob": "t.bob", "carol": "u.carol"}
     ports = {"apiA": free_port(), "apiB": free_port(), "udpA": free_port(socket.SOCK_DGRAM), "udpB": free_port(socket.SOCK_DGRAM)}
     roster = {
-        "v": 2, "network": run(bin_, "network-id"), "seq": 1,
+        "v": 1, "network": run(bin_, "network-id"), "seq": 1,
         "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents],
         "nodes": [{"name": "A", "key": pub["nodeA"], "addrs": ["127.0.0.1:%d" % ports["udpA"]]},
                   {"name": "B", "key": pub["nodeB"], "addrs": ["127.0.0.1:%d" % ports["udpB"]]}],
@@ -340,7 +340,7 @@ def main():
                 ws.send(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}))
                 return ws, init
             ws, init = rpc_session(token("B", "bob"))
-            check("MCPL initialize", init["result"]["serverInfo"]["name"] == "agentmail" and "mcpl" in init["result"]["capabilities"]["experimental"])
+            check("MCPL initialize", init["result"]["serverInfo"]["name"] == "islandmail" and "mcpl" in init["result"]["capabilities"]["experimental"])
             ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             tl = json.loads(ws.recv(timeout=5))
             check("MCPL tools/list", [t["name"] for t in tl["result"]["tools"]] == ["send", "inbox", "thread", "threads", "who", "search", "get", "rooms", "room_send"])
@@ -377,7 +377,7 @@ def main():
             ws.close()
             check("MCPL backlog on reconnect: only the unacknowledged mail", len(texts) == 1 and "while you were away" in texts[0],
                   "%d pushed" % len(texts))
-            # The same with an agent token (a Connectome host with no home): `mailnode agent-token` mints it from bob's
+            # The same with an agent token (a Connectome host with no home): `islandmail-node agent-token` mints it from bob's
             # identity file. B holds bob's key, so it signs his MCPL sends with it.
             node_b = req("GET", pb, "/api/node")[1]["node"]
             bob_id = os.path.join(work, "idsB", "identities", "t.bob.json")

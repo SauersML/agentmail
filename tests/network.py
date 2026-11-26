@@ -2,7 +2,7 @@
 """Integration test for node-certified agents: three hosts on loopback, each with its own trust file, every key a
 throwaway made here.
 
-  python3 tests/network.py --bin target/debug/mailnode --islandmail clients/islandmail.py [--workdir DIR]
+  python3 tests/network.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 
 Hosts: "mac" (names hypha, s.), "pod" (names hypha: a second home for hypha) and "ops" (names ops.). The mac's trust
 file also lists an offline peer. Checks: an agent's first `islandmail.py send` on a host just works (key made with
@@ -69,7 +69,7 @@ def main():
             nodes.append(node_entry("ghost", []))
         path = os.path.join(work, "trust-%s.json" % h)
         with open(path + ".tmp", "w") as f:
-            json.dump({"v": 2, "network": network, "seq": seq, "members": [], "nodes": nodes}, f)
+            json.dump({"v": 1, "network": network, "seq": seq, "members": [], "nodes": nodes}, f)
         os.replace(path + ".tmp", path)
         return path
 
@@ -168,7 +168,7 @@ def main():
         rc, out = cl("ops", "--as", "ops.temp", "whoami", user="temp")
         check("a second agent on ops's host", rc == 0, out[-120:])
         p = subprocess.run([bin_, "revoke", os.path.join(work, "ops.json"), "ops.temp"], capture_output=True, text=True)
-        check("mailnode revoke", p.returncode == 0 and "revoked ops.temp" in p.stdout, (p.stdout + p.stderr)[-160:])
+        check("islandmail-node revoke", p.returncode == 0 and "revoked ops.temp" in p.stdout, (p.stdout + p.stderr)[-160:])
         rc, out = cl("ops", "--as", "ops.temp", "whoami", user="temp")
         check("the revoked agent cannot sign in", rc != 0 and "403" in out, out[-160:])
         tok = lambda: cl("mac", "selftoken", "--ttl", "60")[1]

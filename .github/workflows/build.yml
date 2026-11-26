@@ -41,7 +41,7 @@ jobs:
       - name: Test
         run: cargo test --locked --target ${{ matrix.target }}
       - name: Build
-        run: cargo build --locked --release -p mailnode --target ${{ matrix.target }}
+        run: cargo build --locked --release -p islandmail-node --target ${{ matrix.target }}
       - name: Exercise direct-peer mail and agent clients
         run: |
           host_python=$(command -v python3 || command -v python)
@@ -51,7 +51,7 @@ jobs:
           "$py" tests/client_paseto.py
           "$py" tests/client_show.py
           "$py" tests/client_local.py
-          node_bin="target/${{ matrix.target }}/release/mailnode$EXE"
+          node_bin="target/${{ matrix.target }}/release/islandmail-node$EXE"
           "$py" tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
           "$py" tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
           "$py" tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
@@ -62,12 +62,12 @@ jobs:
       - name: Package
         run: |
           mkdir -p out
-          cp "target/${{ matrix.target }}/release/mailnode$EXE" out/
+          cp "target/${{ matrix.target }}/release/islandmail-node$EXE" out/
           cd out
           host_python=$(command -v python3 || command -v python)
-          "$host_python" -c 'import hashlib, sys; n = sys.argv[1]; print(hashlib.sha256(open(n, "rb").read()).hexdigest() + "  " + n)' "mailnode$EXE" > "mailnode$EXE.sha256"
+          "$host_python" -c 'import hashlib, sys; n = sys.argv[1]; print(hashlib.sha256(open(n, "rb").read()).hexdigest() + "  " + n)' "islandmail-node$EXE" > "islandmail-node$EXE.sha256"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mailnode-${{ matrix.target }}
+          name: islandmail-node-${{ matrix.target }}
           path: out/
           if-no-files-found: error

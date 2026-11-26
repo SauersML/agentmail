@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rooms across three hosts on loopback, every key a throwaway made here.
 
-  python3 tests/rooms.py --bin target/debug/mailnode --islandmail clients/islandmail.py [--workdir DIR]
+  python3 tests/rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 
 Hosts: "mac" (names hypha), "pod" (names ops.) and "lab" (names lab.), each trusting the others. Agents get their
 keys and certificates from their first islandmail.py command. Checks: DM ids are symmetric; a plain thread works as
@@ -44,7 +44,7 @@ def main():
     udp = {h: free_port(socket.SOCK_DGRAM) for h in hosts}
     api = {h: free_port() for h in hosts}
     network = run(bin_, "network-id")
-    trust = {"v": 2, "network": network, "seq": 1, "members": [],
+    trust = {"v": 1, "network": network, "seq": 1, "members": [],
              "nodes": [{"name": h, "key": pub[h], "addrs": ["127.0.0.1:%d" % udp[h]], "names": names[h]} for h in hosts]}
     with open(os.path.join(work, "trust.json"), "w") as f:
         json.dump(trust, f)

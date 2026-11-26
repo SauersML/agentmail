@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Direct-peer integration tests for sender signatures, attachments and membership changes.
 
-  python3 tests/phase2.py --bin target/debug/mailnode --repo . [--workdir DIR]
+  python3 tests/phase2.py --bin target/debug/islandmail-node --repo . [--workdir DIR]
 """
 import argparse
 import importlib.util
@@ -40,7 +40,7 @@ def main():
 
     def member_list(seq, nodes, extra_members=()):
         lst = {
-            "v": 2, "network": network_id, "seq": seq,
+            "v": 1, "network": network_id, "seq": seq,
             "members": [{"name": agents[n], "sub": "agent:%s@test" % n, "key": pub[n]} for n in agents]
                        + [{"name": "u.dave", "sub": "agent:dave@test", "key": pub["dave"]} for _ in extra_members],
             "nodes": [{"name": h, "key": pub["node" + h], "addrs": ["127.0.0.1:%d" % P["udp" + h]]} for h in nodes],

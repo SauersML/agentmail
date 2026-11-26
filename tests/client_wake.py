@@ -2,7 +2,7 @@
 """Waking agents: `watch --from-now`, `read` moving the default watch cursor, arrival hooks (`watch --exec`, `watch
 --post`) and the upload progress line. One node on loopback, throwaway keys.
 
-  python3 tests/client_wake.py --bin target/debug/mailnode --islandmail clients/islandmail.py [--workdir DIR]
+  python3 tests/client_wake.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
 import argparse
 import hashlib
@@ -42,7 +42,7 @@ def main():
     udp, port = free_port(socket.SOCK_DGRAM), free_port()
     trust = os.path.join(work, "trust.json")
     with open(trust, "w") as f:
-        json.dump({"v": 2, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
+        json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "mac", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["hypha", "s."]}]}, f)
     node = Node(bin_, work, "mac", {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port,
                                     "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})

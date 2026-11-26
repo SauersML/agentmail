@@ -2,7 +2,7 @@
 """Integration test for identity homes: two hosts on loopback whose trust files pin two test homes (aid1 issuers made
 here: "id.test" vouching for @id.test, "other.test" for @other.test). Every key is a throwaway.
 
-  python3 tests/homes.py --bin target/debug/mailnode [--islandmail clients/islandmail.py] [--workdir DIR]
+  python3 tests/homes.py --bin target/debug/islandmail-node [--islandmail clients/islandmail.py] [--workdir DIR]
 
 Checks: an agent enrolls as fable@id.test with a key-bound aid1 token and mails an agent on the other host, which
 accepts the certificate against its own trust file; names outside the home's suffix are refused (a bare name, another
@@ -57,7 +57,7 @@ class Home:
     def mint(self, local, cnf, **over):
         now = int(time.time())
         p = {"v": 1, "iss": self.iss, "sub": "agent:%s@guest" % local, "kind": "agent", "name": local,
-             "aud": "agentmail", "scopes": ["mail:send"], "iat": now, "exp": now + 600, "kg": self.kg, "cnf": cnf}
+             "aud": "islandmail", "scopes": ["mail:send"], "iat": now, "exp": now + 600, "kg": self.kg, "cnf": cnf}
         p.update(over)
         p = {k: v for k, v in p.items() if v is not None}
         signed = "aid1." + b64u(json.dumps(p).encode())
@@ -88,7 +88,7 @@ def main():
         nodes = [{"name": n, "key": pub[n], "addrs": ["127.0.0.1:%d" % udp[n]], "names": names[n]} for n in hosts]
         path = os.path.join(work, "trust-%s.json" % h)
         with open(path, "w") as f:
-            json.dump({"v": 2, "network": network, "seq": 1, "members": [], "nodes": nodes,
+            json.dump({"v": 1, "network": network, "seq": 1, "members": [], "nodes": nodes,
                        "homes": [home.entry("test"), other.entry("other")]}, f)
         return path
 
@@ -104,17 +104,17 @@ def main():
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout + p.stderr).strip()
 
-    def enroll(h, priv, name, token, *, holder=None, aud="agentmail", iss=None, rekey_from=None):
+    def enroll(h, priv, name, token, *, holder=None, aud="islandmail", iss=None, rekey_from=None):
         # POST /api/agents as islandmail.py enroll sends it; `holder` signs the proof of possession instead.
         node = req("GET", api[h], "/api/node")[1]["node"]
         ts, jti = canon_ts(), b64u(os.urandom(16))
-        st = "agent-mail-certify|v1|%s|%s|%s|%s" % (name, kid(priv), node, ts)
+        st = "islandmail-certify|v1|%s|%s|%s|%s" % (name, kid(priv), node, ts)
         present = "archipelago-present|v1|%s|%s|%s|%s|%s" % (
             iss or home.iss, aud, ts, jti, b64u(hashlib.sha256(token.encode()).digest()))
         body = {"name": name, "key": kid(priv), "ts": ts, "sig": b64u(priv.sign(st.encode())), "aid1": token,
                 "jti": jti, "pop": b64u((holder or priv).sign(present.encode()))}
         if rekey_from:
-            msg = "agent-mail-rekey|v1|%s|%s|%s" % (name.lower(), kid(rekey_from), kid(priv))
+            msg = "islandmail-rekey|v1|%s|%s|%s" % (name.lower(), kid(rekey_from), kid(priv))
             body["rekey"] = {"key": kid(rekey_from), "sig": b64u(rekey_from.sign(msg.encode()))}
         return req("POST", api[h], "/api/agents", body=body)
 
@@ -245,10 +245,10 @@ def main():
             agent = Ed25519PrivateKey.generate()
             name, tok = local + "@id.test", home.mint(local, kid(agent), iat=iat, exp=now + 3600)
             ts, jti = canon_ts(issued_ms / 1000), b64u(os.urandom(16))
-            present = "archipelago-present|v1|id.test|agentmail|%s|%s|%s" % (ts, jti, b64u(hashlib.sha256(tok.encode()).digest()))
+            present = "archipelago-present|v1|id.test|islandmail|%s|%s|%s" % (ts, jti, b64u(hashlib.sha256(tok.encode()).digest()))
             c = {"v": 1, "name": name, "key": kid(agent), "node": pub["mac"], "issued": ts, "sig": "",
                  "home": {"aid1": tok, "ts": ts, "jti": jti, "pop": b64u(agent.sign(present.encode()))}}
-            msg = b"agent-mail/agent-cert/v1\n" + json.dumps(c, separators=(",", ":")).encode()
+            msg = b"islandmail/agent-cert/v1\n" + json.dumps(c, separators=(",", ":")).encode()
             c["sig"] = b64u(node_priv.sign(msg))
             forged[name] = c
 
