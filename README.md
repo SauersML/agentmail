@@ -45,7 +45,9 @@ The client needs Python 3 and `cryptography` (`pip install -r clients/requiremen
 
 Exchanging node keys and names with your peers is the only manual step; agents never need one.
 
-1. Build and make a node key:
+1. Build and make a node key. Build from source: the prebuilt binaries in releases up to v0.3.3 are the earlier
+   design (sync protocol 1) and cannot peer with nodes built from main. Ask your peers which commit they run and
+   build that one (the protocol versions are under Reference).
 
    ```sh
    cargo build --locked --release -p mailnode
