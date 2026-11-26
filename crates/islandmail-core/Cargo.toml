@@ -4,6 +4,7 @@ description = "Envelope, crypto, agent tokens, membership and thread order for I
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 anyhow = "1"
