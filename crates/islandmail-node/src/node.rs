@@ -76,6 +76,8 @@ pub struct Opts {
     pub members_file: Option<std::path::PathBuf>,
     /// Config "relay", told to invited nodes.
     pub relay: Vec<String>,
+    /// Config "mcpl_push_off", lowercased: names whose MCPL sessions get no pushes.
+    pub push_off: Vec<String>,
 }
 
 /// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.

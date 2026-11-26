@@ -168,6 +168,7 @@ async fn run(path: &Path) -> Result<()> {
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
         members_file: Some(cfg.members_file.clone()),
         relay: cfg.relay.clone(),
+        push_off: cfg.mcpl_push_off.iter().map(|n| n.trim().to_lowercase()).collect(),
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));

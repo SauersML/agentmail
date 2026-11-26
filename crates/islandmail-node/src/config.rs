@@ -41,6 +41,10 @@ pub struct Config {
     /// Base URL for attachment links in formatted mail (default http://<api_listen>).
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Agent names (exact, any case) that opted out of MCPL notifications: their MCPL sessions get the tools but no
+    /// push/event and no channel deliveries. Everyone else is pushed to by default.
+    #[serde(default)]
+    pub mcpl_push_off: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]

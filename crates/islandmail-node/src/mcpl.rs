@@ -571,9 +571,14 @@ impl Conn {
         }
     }
 
+    /// The agent opted out of notifications (config "mcpl_push_off"): tools only.
+    fn opted_out(&self) -> bool {
+        self.node.opts.push_off.iter().any(|n| *n == self.who.name.to_lowercase())
+    }
+
     fn push_allowed(&self) -> bool {
-        if !self.mcpl {
-            return false; // plain MCP: tools only, never an MCPL frame
+        if !self.mcpl || self.opted_out() {
+            return false; // plain MCP or opted out: tools only, never a push
         }
         if let Some(g) = &self.grant {
             return capability_in(g, "pushEvents");
@@ -587,7 +592,7 @@ impl Conn {
     }
 
     fn channels_allowed(&self) -> bool {
-        self.mcpl && self.grant.as_ref().is_some_and(|g| ROOM_CAPS.iter().all(|c| capability_in(g, c)))
+        self.mcpl && !self.opted_out() && self.grant.as_ref().is_some_and(|g| ROOM_CAPS.iter().all(|c| capability_in(g, c)))
     }
 
     /// Post as the connected agent in a room (the node signs: the agent's identity file is in identities_dir).
