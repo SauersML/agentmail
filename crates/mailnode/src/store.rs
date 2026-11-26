@@ -22,6 +22,7 @@ pub const MAX_CERTS_PER_NODE: i64 = 1000;
 pub const MAX_SYNC_CERTS: usize = 10_000;
 
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS node_encryption_keys (node TEXT PRIMARY KEY, epoch INTEGER NOT NULL, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS local_trust (id INTEGER PRIMARY KEY CHECK(id=1), node TEXT NOT NULL, roster TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -545,6 +546,22 @@ impl Store {
         Ok(())
     }
 
+    /// The first authenticated public key seen for a peer in an interval survives restarts.
+    pub fn remember_encryption_key(&self, key: &mailcore::node_key::NodeEncryptionKey) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let record = serde_json::to_string(key)?;
+        let changed = db.execute("INSERT INTO node_encryption_keys VALUES (?1,?2,?3)
+            ON CONFLICT(node) DO UPDATE SET epoch=excluded.epoch, record=excluded.record
+            WHERE excluded.epoch > node_encryption_keys.epoch",
+            params![key.node, key.epoch, record])?;
+        if changed == 0 {
+            let matches = db.prepare("SELECT 1 FROM node_encryption_keys WHERE node=? AND epoch=? AND record->>'x25519'=?")?
+                .exists(params![key.node, key.epoch, key.x25519])?;
+            anyhow::ensure!(matches, "peer encryption key rolled back or changed within an interval");
+        }
+        Ok(())
+    }
+
     /* Certificates, keyed by (issuing node, agent key): one node's certificate never displaces another's. */
 
     /// Ok(true) when new. A second certificate from the same node for the same key is ignored, and so is anything
@@ -741,6 +758,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_encryption_keys_refuse_conflicting_records_and_rollback_after_restart() -> Result<()> {
+        use mailcore::{keys::Seed, node_key::NodeEncryptionKey};
+        let dir = std::env::temp_dir().join(format!("peer-record-{}", mailcore::b64u(&mailcore::random_bytes::<9>())));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("store");
+        let node = Seed::generate();
+        let record = |epoch| NodeEncryptionKey::issue(&node, "net", epoch, &Seed::generate());
+        let original = record(3);
+        let store = Store::open(&path)?;
+        store.remember_encryption_key(&original)?;
+        drop(store);
+        let store = Store::open(&path)?;
+        store.remember_encryption_key(&original)?;
+        assert!(store.remember_encryption_key(&record(3)).is_err());
+        store.remember_encryption_key(&record(4))?;
+        assert!(store.remember_encryption_key(&original).is_err());
+        drop(store);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn pending_attachments_survive_upgrade_and_page_past_missing_files() -> Result<()> {

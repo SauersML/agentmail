@@ -48,6 +48,8 @@ enum Req {
 struct Resp {
     #[serde(default)]
     days: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption_key: Option<mailcore::node_key::NodeEncryptionKey>,
     #[serde(default)]
     ids: Vec<String>,
     #[serde(default)]
@@ -172,7 +174,10 @@ fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
             r.taken = Some(taken);
         }
         Req::Blob { id } => r.blob = node.store.get_blob(&id)?.map(|b| mailcore::b64u(&b)),
-        Req::Certs => (r.certs, r.revocations, r.more_trust) = node.store.sync_trust(None, crate::store::MAX_SYNC_CERTS)?,
+        Req::Certs => {
+            r.encryption_key = node.current_encryption_key();
+            (r.certs, r.revocations, r.more_trust) = node.store.sync_trust(None, crate::store::MAX_SYNC_CERTS)?;
+        }
         Req::CertsFor { issuer } => {
             (r.certs, r.revocations, r.more_trust) = node.store.sync_trust(Some(&issuer), crate::store::MAX_CERTS_PER_NODE as usize)?;
         }
@@ -276,6 +281,13 @@ impl Ctx {
         let conn = self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?;
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
+        if let Some(record) = &trust.encryption_key {
+            // A stale announcement near a clock boundary must not interrupt mail or revocation sync.
+            if let Err(e) = record.verify(peer.as_bytes(), &network, mailcore::now_millis())
+                .and_then(|_| node.store.remember_encryption_key(record)) {
+                tracing::warn!("refused encryption key from {}: {e:#}", peer.fmt_short());
+            }
+        }
         if trust.more_trust {
             // Only a peer advertising a truncated list receives this optional sync-v4 request.
             let issuers = node.members.read().unwrap().node_keys();
@@ -652,7 +664,10 @@ mod tests {
         assert!(remote.addr().relay_urls().next().is_some());
         assert!(remote.addr().ip_addrs().next().is_none());
         let peer = hosts[0].1.endpoint.connect(remote.id(), SYNC_ALPN).await?;
-        let certs = call(&peer, &network, &Req::Certs).await?.certs;
+        let reply = call(&peer, &network, &Req::Certs).await?;
+        let record = reply.encryption_key.context("peer did not publish an encryption key")?;
+        record.verify(remote.id().as_bytes(), &network, mailcore::now_millis())?;
+        let certs = reply.certs;
         assert!(certs.iter().any(|c| c.name == "a1"));
         let issuer = fmt_key(&reader.seed.public());
         let page = call(&peer, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;

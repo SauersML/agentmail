@@ -145,6 +145,11 @@ impl Node {
         self.trust.send_modify(|g| *g += 1);
     }
 
+    pub fn current_encryption_key(&self) -> Option<mailcore::node_key::NodeEncryptionKey> {
+        let epoch = now_millis().div_euclid(mailcore::node_key::ROTATION_MS);
+        self.encryption_key.read().unwrap().as_ref().filter(|k| k.epoch == epoch).cloned()
+    }
+
     pub fn agents(&self) -> Vec<Agent> {
         self.roster.read().unwrap().clone()
     }
