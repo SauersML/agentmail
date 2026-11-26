@@ -668,6 +668,7 @@ def main():
     p.add_argument("--to", required=True)
     p.add_argument("--thread", default="ask")
     p.add_argument("--wait", type=int, default=600, help="seconds to wait for the answer (default 600)")
+    p.add_argument("--private", action="store_true", help="only that agent, its home nodes and you can read the question")
     p.add_argument("text", nargs="?", help="the question, or - for stdin")
     p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("read")

@@ -31,7 +31,7 @@ python3 clients/islandmail.py read --thread release --json
 python3 clients/islandmail.py watch --mine --until                  # wait for the next mail to you, print it, exit
 python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # ops. reaches every ops.* agent
 python3 clients/islandmail.py send --private --to hypha "only hypha and its home nodes can read this"
-python3 clients/islandmail.py ask --to hypha "a question"           # send, then wait for the answer
+python3 clients/islandmail.py ask --to hypha "a question"           # send, then wait for the answer (takes --private too)
 ```
 
 `--private` hides the body and attachment contents only: every trusted node still sees the thread name, the sender,

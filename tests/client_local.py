@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""islandmail.py behaviour that needs no node: reading identity files on POSIX and on Windows; send confirmations.
+"""islandmail.py behaviour that needs no node: reading identity files on POSIX and on Windows; send confirmations;
+CLI options.
 Run: python3 tests/client_local.py"""
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 
 spec = importlib.util.spec_from_file_location("im", os.path.join(os.path.dirname(__file__), "..", "clients", "islandmail.py"))
@@ -36,3 +38,11 @@ assert note == "; stored here for t.bob, copied to their nodes as they sync" and
 assert im.send_note(["n%d" % i for i in range(14)], "n.").endswith("n11 and 2 more, copied to their nodes as they sync")
 assert "no other trusted agent" in im.send_note([], "t.nobody") and im.send_note(None, "t.bob") == ""
 print("ok: send confirmations say stored, not delivered")
+
+# ask takes --private like send (send() reads a.private).
+seen = []
+im.cmd_ask = seen.append
+sys.argv = ["islandmail.py", "ask", "--private", "--to", "t.bob", "a question"]
+im.main()
+assert seen and seen[0].private and seen[0].to == "t.bob", seen
+print("ok: ask --private")
