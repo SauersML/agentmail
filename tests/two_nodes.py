@@ -286,7 +286,7 @@ def main():
             watcher.terminate()
             watcher.communicate(timeout=5)
         rc, out = im(pa, "alice", "send", "--to", "t.bob", "--thread", "t2", "sent with islandmail.py")
-        check("islandmail.py send (A)", rc == 0 and out.startswith("sent #") and "reaches t.bob" in out, out)
+        check("islandmail.py send (A)", rc == 0 and out.startswith("sent #") and "stored here for t.bob, copied to their nodes as they sync" in out, out)
         delivered, _ = wait_for(lambda: req("GET", pb, "/api/messages?thread=t2", token("B", "bob"))[1]["messages"])
         check("message reached B while watcher was stopped", bool(delivered))
         watcher = watch()

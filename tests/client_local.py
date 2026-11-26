@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""islandmail.py behaviour that needs no node: reading identity files on POSIX and on Windows.
+"""islandmail.py behaviour that needs no node: reading identity files on POSIX and on Windows; send confirmations.
 Run: python3 tests/client_local.py"""
 import importlib.util
 import json
@@ -29,3 +29,10 @@ with tempfile.TemporaryDirectory() as d:
         im._POSIX_MODES = True
     assert im._IDENT_OPEN & os.O_RDONLY == os.O_RDONLY
 print("ok: identity files read with only the open flags and mode checks the platform has")
+
+# A send confirms that this node stored the message, not that the recipients' nodes have it (they may be offline).
+note = im.send_note(["t.bob"], "t.bob")
+assert note == "; stored here for t.bob, copied to their nodes as they sync" and "reaches" not in note, note
+assert im.send_note(["n%d" % i for i in range(14)], "n.").endswith("n11 and 2 more, copied to their nodes as they sync")
+assert "no other trusted agent" in im.send_note([], "t.nobody") and im.send_note(None, "t.bob") == ""
+print("ok: send confirmations say stored, not delivered")

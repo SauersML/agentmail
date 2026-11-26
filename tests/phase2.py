@@ -101,7 +101,7 @@ def main():
         pa, pb, pc = A.port, B.port, C.port
 
         rc, out = im(pa, "alice", "send", "--to", "t.bob", "--thread", "signed", "signed by alice's key")
-        check("islandmail.py signed send on A", rc == 0 and "reaches t.bob" in out, out)
+        check("islandmail.py signed send on A", rc == 0 and "stored here for t.bob, copied to their nodes as they sync" in out, out)
         got, dt = wait_for(lambda: [m for m in msgs(pb, "bob", "thread=signed")])
         check("B shows it attest=agent", got and got[0]["attest"] == "agent" and got[0]["text"] == "signed by alice's key", "%.2fs" % dt)
         rc, out = im(pa, "alice", "send", "--private", "--to", "t.bob", "--thread", "signed", "private and signed")

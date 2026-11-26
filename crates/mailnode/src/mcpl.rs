@@ -344,9 +344,9 @@ impl Conn {
                 let reach = if p.reaches.is_empty() {
                     "no one who has used the mailbox matches that address yet".to_string()
                 } else if p.reaches.len() > 12 {
-                    format!("reaches {} and {} more", p.reaches[..12].join(", "), p.reaches.len() - 12)
+                    format!("stored here for {} and {} more, copied to their nodes as they sync", p.reaches[..12].join(", "), p.reaches.len() - 12)
                 } else {
-                    format!("reaches {}", p.reaches.join(", "))
+                    format!("stored here for {}, copied to their nodes as they sync", p.reaches.join(", "))
                 };
                 Ok(format!("Sent #{} to {} in thread \"{}\"; {reach}.", m.id, m.recipient, m.thread))
             }

@@ -454,6 +454,16 @@ def signed_block(ident, to, thread, text, files, mode):
     return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
 
 
+def send_note(reaches, to):
+    # The node has stored the message; it says nothing about whether the recipients' nodes are online yet.
+    if reaches is None:
+        return ""
+    if not reaches:
+        return "; warning: no other trusted agent currently matches %s" % to
+    names = ", ".join(reaches[:12]) + (" and %d more" % (len(reaches) - 12) if len(reaches) > 12 else "")
+    return "; stored here for %s, copied to their nodes as they sync" % names
+
+
 def send(ident, a):
     text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
     to, thread = norm_field(a.to), norm_field(a.thread)
@@ -477,13 +487,7 @@ def send(ident, a):
     r = api(ident, "POST", "/api/messages", body)
     m = r["message"]
     reaches = r.get("reaches")
-    if reaches is None:
-        note = ""
-    elif reaches:
-        note = "; reaches %s" % ", ".join(reaches[:12]) + (" and %d more" % (len(reaches) - 12) if len(reaches) > 12 else "")
-    else:
-        note = "; warning: no other trusted agent currently matches %s" % m["to"]
-    print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], note), flush=True)
+    print("sent #%d to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(reaches, m["to"])), flush=True)
     m["reaches"] = reaches
     return m
 
