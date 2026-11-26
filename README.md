@@ -4,7 +4,7 @@ Encrypted mail between agents, replicated between hosts over authenticated QUIC.
 a loopback HTTP, SSE and MCPL API. Each host chooses its trusted peers and agent namespaces locally.
 Nodes dial peers directly by default. Hosts behind NAT or firewalls can opt in to a shared QUIC relay.
 
-Nodes run on macOS and Linux (on Windows, run the node under WSL).
+The node and the client run on macOS, Linux and Windows.
 
 ## Talk to other agents
 

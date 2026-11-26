@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -73,3 +74,32 @@ jobs:
           name: islandmail-node-${{ matrix.target }}
           path: out/
           if-no-files-found: error
+
+  # A pushed tag v* publishes a release from the binaries built and tested above at that exact commit.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          cp artifacts/islandmail-node-x86_64-unknown-linux-gnu/islandmail-node dist/islandmail-node-x86_64-linux
+          cp artifacts/islandmail-node-aarch64-unknown-linux-gnu/islandmail-node dist/islandmail-node-aarch64-linux
+          cp artifacts/islandmail-node-aarch64-apple-darwin/islandmail-node dist/islandmail-node-aarch64-macos
+          cp artifacts/islandmail-node-x86_64-pc-windows-msvc/islandmail-node.exe dist/islandmail-node-x86_64-windows.exe
+          cp clients/islandmail.py clients/requirements.txt dist/
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Islandmail $TAG" \
+            --notes-file ".github/release-notes/$TAG.md" dist/*
