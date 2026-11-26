@@ -41,18 +41,15 @@ impl Mode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum Attest {
-    /// The sender signs the network, routing fields, attachment IDs and salted body digest.
-    Agent {
-        key: String,
-        digest: String,
-        sig: String,
-        /// For a certified (not pinned) sender: a certificate for `key` from a trusted node, so a receiver can check
-        /// the sender before that certificate replicates to it. Covered by the writing node's signature.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cert: Option<Cert>,
-    },
+/// The sender signs the network, routing fields, attachment IDs and salted body digest.
+pub struct Attest {
+    pub key: String,
+    pub digest: String,
+    pub sig: String,
+    /// For a certified (not pinned) sender: a certificate for `key` from a trusted node, so a receiver can check
+    /// the sender before that certificate replicates to it. Covered by the writing node's signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<Cert>,
 }
 
 pub struct PostStatement<'a> {
@@ -146,7 +143,7 @@ pub struct Body {
     /// Each attachment contains its ciphertext ID, name, media type, byte size and secret blob key.
     #[serde(default)]
     pub files: Vec<serde_json::Value>,
-    /// b64url salt of the sender's digest (Attest::Agent only).
+    /// b64url salt of the sender's digest.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub salt: String,
     /// Room fields (`room::Meta`) as the JSON text the sender signed; empty for plain mail.
@@ -274,7 +271,7 @@ impl Envelope {
 
     /// The certificate the envelope carries for its sender, if any.
     pub fn carried_cert(&self) -> Option<&Cert> {
-        let Attest::Agent { cert, .. } = &self.attest;
+        let Attest { cert, .. } = &self.attest;
         cert.as_ref()
     }
 
@@ -327,39 +324,36 @@ impl Envelope {
         if !keys::verify(&node, &self.signing_bytes(), &sig) {
             bail!("node signature does not verify");
         }
-        match &self.attest {
-            Attest::Agent { key, digest, sig, .. } => {
-                if !members.is_node(&node) {
-                    bail!("written by a node that is not a member");
-                }
-                let k = parse_key(key)?;
-                let m = match members::find(agents, &self.from, &k) {
-                    Some(m) => m,
-                    None if members::named(agents, &self.from).next().is_some() =>
-                        bail!("signed by a key that is not {}'s key on the member list or in its certificates", self.from),
-                    None => bail!("{} is not on the member list and has no certificate from a trusted node", self.from),
-                };
-                if !m.pinned && !m.certs.iter().any(|c| c.issued_by(ts)) {
-                    bail!("message predates the sender's certificates");
-                }
-                if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    bail!("bad digest");
-                }
-                let st = PostStatement {
-                    from: &self.from, sub: &m.sub, to: &self.to, thread: &self.thread, mode: self.mode,
-                    ts: &self.ts, digest, blobs: &self.blobs, recipients: &wraps.iter().map(|w| w.to).collect::<Vec<_>>(),
-                }.signing_bytes(members);
-                let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
-                // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
-                if b64u(&s) != *sig {
-                    bail!("sender signature is not canonical base64url");
-                }
-                if !keys::verify(&k, &st, &s) {
-                    bail!("sender signature does not verify");
-                }
-                Ok(Verified { sender_sub: m.sub.clone() })
-            }
+        let Attest { key, digest, sig, .. } = &self.attest;
+        if !members.is_node(&node) {
+            bail!("written by a node that is not a member");
         }
+        let k = parse_key(key)?;
+        let m = match members::find(agents, &self.from, &k) {
+            Some(m) => m,
+            None if members::named(agents, &self.from).next().is_some() =>
+                bail!("signed by a key that is not {}'s key on the member list or in its certificates", self.from),
+            None => bail!("{} is not on the member list and has no certificate from a trusted node", self.from),
+        };
+        if !m.pinned && !m.certs.iter().any(|c| c.issued_by(ts)) {
+            bail!("message predates the sender's certificates");
+        }
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!("bad digest");
+        }
+        let st = PostStatement {
+            from: &self.from, sub: &m.sub, to: &self.to, thread: &self.thread, mode: self.mode,
+            ts: &self.ts, digest, blobs: &self.blobs, recipients: &wraps.iter().map(|w| w.to).collect::<Vec<_>>(),
+        }.signing_bytes(members);
+        let s = b64u_decode(sig).ok_or_else(|| anyhow!("bad sender signature"))?;
+        // One encoding per signature: nodes recognize a replayed message by it (see agent_sig in the store).
+        if b64u(&s) != *sig {
+            bail!("sender signature is not canonical base64url");
+        }
+        if !keys::verify(&k, &st, &s) {
+            bail!("sender signature does not verify");
+        }
+        Ok(Verified { sender_sub: m.sub.clone() })
     }
 
     /// For readers, after decrypting: an agent-signed envelope's digest must match the body it carries, and the
@@ -370,7 +364,7 @@ impl Envelope {
         }) {
             bail!("body attachments do not match the header's blobs");
         }
-        let Attest::Agent { digest, .. } = &self.attest;
+        let Attest { digest, .. } = &self.attest;
         let salt = b64u_decode(&body.salt).filter(|s| s.len() == 16).ok_or_else(|| anyhow!("invalid salt length"))?;
         if &post_digest_meta(&salt, &body.text, &body.files, &body.meta)? != digest {
             bail!("body does not match the sender's signed digest");
@@ -431,7 +425,7 @@ mod tests {
                 mode,
                 body: &body,
                 blobs: vec![],
-                attest: Attest::Agent { key: fmt_key(&signer.public()), sig, digest, cert: None },
+                attest: Attest { key: fmt_key(&signer.public()), sig, digest, cert: None },
                 recipients: &recipients,
             },
             &w.node,
@@ -457,7 +451,7 @@ mod tests {
             from, sub: &format!("agent:{from}@test"), to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
-        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert: None };
+        let attest = Attest { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert: None };
         let body = Body { text: text.into(), files: vec![], salt: b64u(&salt), meta: String::new() };
         Envelope::seal(
             Draft {
@@ -521,7 +515,7 @@ mod tests {
             from: "a.alice", sub: "agent:a.alice@test", to: "all", thread: "x|y", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
         }.signing_bytes(&w.members);
-        let attest = Attest::Agent { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
+        let attest = Attest { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
         let body = Body { text: "hi".into(), files: vec![], salt: b64u(&salt), meta: String::new() };
         let mk = |to: &str, thread: &str| {
             Envelope::seal(
@@ -660,7 +654,7 @@ mod tests {
             from, sub: &crate::cert::agent_sub(from), to, thread: "t", mode,
             ts: &ts, digest: &digest, blobs: &[], recipients: &recipients,
         }.signing_bytes(l);
-        let attest = Attest::Agent { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert };
+        let attest = Attest { key: fmt_key(&signer.public()), digest, sig: b64u(&signer.sign(&st)), cert };
         Envelope::seal(Draft { thread: "t", parents: vec![], ts, from, to, mode, body: &body, blobs: vec![], attest,
                                recipients: &recipients }, writer).unwrap()
     }

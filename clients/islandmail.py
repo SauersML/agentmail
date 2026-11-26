@@ -572,8 +572,7 @@ def certify_missing(ident, error):
 
 
 def _addr(s):
-    # The old inbox wrote sauersml/lead; the island writes sauersml.lead. Both name the same agent.
-    return s.strip().lower().replace("/", ".")
+    return s.strip().lower()
 
 
 def for_me(m, name):

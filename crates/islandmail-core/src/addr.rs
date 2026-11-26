@@ -1,8 +1,8 @@
 //! Addressing: `to` is names separated by commas or spaces, team prefixes ending in '.', or
-//! all / *. Case-insensitive; a slash counts as a dot.
+//! all / *. Case-insensitive.
 
 pub fn norm(s: &str) -> String {
-    s.trim().to_lowercase().replace('/', ".")
+    s.trim().to_lowercase()
 }
 
 pub fn same(a: &str, b: &str) -> bool {
@@ -28,9 +28,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn addressing_matches_old_server() {
+    fn addressing() {
         assert!(addressed_to("sauersml.lead", &["SauersML.Lead"]));
-        assert!(addressed_to("sauersml/lead", &["sauersml.lead"]));
+        assert!(!addressed_to("sauersml/lead", &["sauersml.lead"]));
         assert!(addressed_to("ops., hypha", &["ops.orchestrator"]));
         assert!(addressed_to("all", &["x"]));
         assert!(addressed_to("*", &["x"]));

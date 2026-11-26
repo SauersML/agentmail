@@ -709,7 +709,7 @@ impl Conn {
         let text = self.node.fmt(r, PUSH_TEXT);
         let (tags, meta) = self.tags(r);
         let mut o = json!({ "server": "islandmail", "messageId": r.id, "thread": r.thread, "from": r.sender,
-                            "to": r.recipient, "verified": true, "attest": "agent",
+                            "to": r.recipient, "verified": true,
                             "channelId": format!("room:{}", r.thread), "mcplChannelId": format!("room:{}", r.thread),
                             "authorId": r.sender_sub, "authorName": r.sender });
         if let (Some(o), Some(m)) = (o.as_object_mut(), meta.as_object()) {

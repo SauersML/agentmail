@@ -719,7 +719,7 @@ mod tests {
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Agent { key: fmt_key(&node.seed.public()), digest: String::new(), sig: i.to_string(), cert: None },
+                    attest: Attest { key: fmt_key(&node.seed.public()), digest: String::new(), sig: i.to_string(), cert: None },
                     recipients: &recipients,
                 },
                 &node.seed,

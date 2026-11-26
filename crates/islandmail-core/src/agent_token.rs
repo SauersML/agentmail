@@ -196,7 +196,7 @@ mod tests {
         let c = verify(&t, &l, &node.public(), NOW).unwrap();
         assert_eq!((c.name.as_str(), c.sub.as_str(), c.exp_ms), ("a.alice", "agent:a.alice@test", NOW + 3_600_000));
         assert!(valid_jti(&c.jti));
-        // Names compare like mail addresses (case, sauersml/lead form); the listed spelling is returned.
+        // Names compare case-insensitively; the listed spelling is returned.
         let t = mint_claims(&alice, &Claims { name: "A.Alice".into(), ..claims("a.alice", &node, NOW, NOW + 60_000) });
         assert_eq!(verify(&t, &l, &node.public(), NOW).unwrap().name, "a.alice");
         // Two mints differ (fresh jti each time).

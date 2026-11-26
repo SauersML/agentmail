@@ -41,8 +41,13 @@ CREATE TABLE IF NOT EXISTS messages (
   env TEXT NOT NULL,
   received INTEGER NOT NULL,
   agent_sig TEXT,
-  blobs TEXT NOT NULL DEFAULT '[]');
+  blobs TEXT NOT NULL DEFAULT '[]',
+  kind TEXT NOT NULL DEFAULT 'mail',
+  meta TEXT,
+  mentions TEXT,
+  reply_to TEXT);
 CREATE INDEX IF NOT EXISTS messages_thread ON messages (thread, id);
+CREATE INDEX IF NOT EXISTS messages_kind ON messages (kind, thread);
 CREATE UNIQUE INDEX IF NOT EXISTS messages_agent_sig ON messages(agent_sig) WHERE agent_sig IS NOT NULL;
 CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS uploads (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, type TEXT NOT NULL,
@@ -64,12 +69,18 @@ CREATE TABLE IF NOT EXISTS grants (env_id TEXT NOT NULL, key TEXT NOT NULL, ck T
   thread TEXT NOT NULL, PRIMARY KEY (env_id, key));
 CREATE TABLE IF NOT EXISTS room_reads (viewer TEXT NOT NULL, thread TEXT NOT NULL, last_id INTEGER NOT NULL,
   PRIMARY KEY (viewer, thread));
+CREATE TABLE IF NOT EXISTS pending_blobs (id TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS queue_missing_blobs AFTER INSERT ON messages WHEN NEW.blobs != '[]' BEGIN
+  INSERT OR IGNORE INTO pending_blobs SELECT value FROM json_each(NEW.blobs)
+    WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=value);
+END;
+CREATE TRIGGER IF NOT EXISTS finish_blob AFTER INSERT ON blobs BEGIN
+  DELETE FROM pending_blobs WHERE id=NEW.id;
+END;
 ";
 
-/// Room columns added to `messages` after the first release; added in place to an older store.
-const ROOM_COLUMNS: [(&str, &str); 4] = [
-    ("kind", "TEXT NOT NULL DEFAULT 'mail'"), ("meta", "TEXT"), ("mentions", "TEXT"), ("reply_to", "TEXT"),
-];
+/// The store format (SQLite `user_version`). A data directory in any other format is refused, not converted.
+const STORE_VERSION: i64 = 1;
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
 #[derive(Clone, Debug)]
@@ -152,7 +163,7 @@ impl Row {
             "id": self.id, "ts": self.ts, "from": self.sender, "to": self.recipient, "thread": self.thread,
             "text": text, "files": public_files(&self.files),
             "len": self.len, "sub": self.sender_sub, "verified": true,
-            "env": self.env_id, "mode": self.mode, "attest": "agent", "kind": self.kind,
+            "env": self.env_id, "mode": self.mode, "kind": self.kind,
         });
         if self.len > shown {
             m["truncated"] = json!(self.len);
@@ -206,7 +217,7 @@ const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode,
 /// A viewer sees a row its node can read, whose content key was wrapped to the viewer's key (in the envelope or
 /// in a key grant), private rows only when addressed to it; never a key grant itself.
 fn visible_sql() -> &'static str {
-    "(json_extract(env, '$.v') = 1 AND text IS NOT NULL AND kind != 'grant' \
+    "(text IS NOT NULL AND kind != 'grant' \
       AND (mode = 'members' OR (mode = 'private' AND instr(readers, ?) > 0)) \
       AND (EXISTS (SELECT 1 FROM json_each(env, '$.keys') WHERE rtrim(value->>'to', '=') = ?) \
            OR EXISTS (SELECT 1 FROM grants g WHERE g.env_id = messages.env_id AND g.key = ?)))"
@@ -284,31 +295,13 @@ impl Store {
         let full = std::path::absolute(path)?;
         let mut db = Connection::open_with_flags(full, flags)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF")?;
-        let old_store = db.prepare("SELECT 1 FROM sqlite_schema WHERE name='messages'")?.exists([])?
-            && !db.prepare("SELECT 1 FROM sqlite_schema WHERE name='local_trust'")?.exists([])?;
-        anyhow::ensure!(!old_store, "existing database predates local trust; use a new data directory");
+        let empty = !db.prepare("SELECT 1 FROM sqlite_schema")?.exists([])?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        anyhow::ensure!(empty || version == STORE_VERSION,
+                        "{} is not an Islandmail store of format {STORE_VERSION}; use a new data directory", path.display());
         let tx = db.transaction()?;
         tx.execute_batch(SCHEMA)?;
-        for (col, ty) in ROOM_COLUMNS {
-            if !tx.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?")?.exists([col])? {
-                tx.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {col} {ty}"))?;
-            }
-        }
-        tx.execute_batch("CREATE INDEX IF NOT EXISTS messages_kind ON messages (kind, thread)")?;
-        if !tx.prepare("SELECT 1 FROM sqlite_schema WHERE name='pending_blobs'")?.exists([])? {
-            tx.execute_batch("
-                CREATE TABLE pending_blobs (id TEXT PRIMARY KEY) WITHOUT ROWID;
-                INSERT OR IGNORE INTO pending_blobs SELECT b.value FROM messages m, json_each(m.blobs) b
-                    WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=b.value);
-                CREATE TRIGGER queue_missing_blobs AFTER INSERT ON messages WHEN NEW.blobs != '[]' BEGIN
-                    INSERT OR IGNORE INTO pending_blobs SELECT value FROM json_each(NEW.blobs)
-                        WHERE NOT EXISTS (SELECT 1 FROM blobs WHERE id=value);
-                END;
-                CREATE TRIGGER finish_blob AFTER INSERT ON blobs BEGIN
-                    DELETE FROM pending_blobs WHERE id=NEW.id;
-                END;
-            ")?;
-        }
+        tx.execute_batch(&format!("PRAGMA user_version = {STORE_VERSION}"))?;
         tx.commit()?;
         use rusqlite::functions::FunctionFlags;
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
@@ -384,7 +377,7 @@ impl Store {
         let db = self.db.lock().unwrap();
         let json = serde_json::to_string(env)?;
         let parents = serde_json::to_string(&env.parents)?;
-        let islandmail_core::Attest::Agent { sig, .. } = &env.attest;
+        let islandmail_core::Attest { sig, .. } = &env.attest;
         let replay = db.prepare("SELECT 1 FROM messages WHERE agent_sig = ?")?.exists([sig])?;
         let n = db.execute(
             "INSERT OR IGNORE INTO messages (env_id, day, ts, sender, sender_sub, recipient, thread, mode, text, \
@@ -567,7 +560,7 @@ impl Store {
     /// Anti-entropy: BLAKE3 over the sorted envelope ids of each day (the day is the envelope's ts date).
     pub fn day_hashes(&self) -> Result<BTreeMap<String, String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT day, env_id FROM messages WHERE json_extract(env, '$.v') = 1 ORDER BY day, env_id")?;
+        let mut st = db.prepare("SELECT day, env_id FROM messages ORDER BY day, env_id")?;
         let mut out = BTreeMap::new();
         let mut cur: Option<(String, blake3::Hasher, u64)> = None;
         let mut rows = st.query([])?;
@@ -593,14 +586,14 @@ impl Store {
 
     pub fn ids_for_day(&self, day: &str, after: &str, limit: usize) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND env_id > ? AND json_extract(env, '$.v') = 1 ORDER BY env_id LIMIT ?")?;
+        let mut st = db.prepare("SELECT env_id FROM messages WHERE day = ? AND env_id > ? ORDER BY env_id LIMIT ?")?;
         let ids = st.query_map(params![day, after, limit as i64], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
 
     pub fn envelopes(&self, ids: &[String]) -> Result<Vec<String>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ? AND json_extract(env, '$.v') = 1")?;
+        let mut st = db.prepare("SELECT env FROM messages WHERE env_id = ?")?;
         let mut out = Vec::new();
         for id in ids {
             if let Some(e) = st.query_row([id], |r| r.get::<_, String>(0)).optional()? {
@@ -1032,19 +1025,15 @@ mod tests {
     }
 
     #[test]
-    fn pending_attachments_survive_upgrade_and_page_past_missing_files() -> Result<()> {
+    fn pending_attachments_survive_reopen_and_page_past_missing_files() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("mail-blobs-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         std::fs::create_dir(&dir)?;
         let path = dir.join("mail.sqlite");
         let row = "INSERT INTO messages(env_id,day,ts,sender,sender_sub,recipient,thread,mode,parents,env,received,blobs)
                    VALUES (?,'','','','','','','members','[]','{}',0,?)";
-        let old = Connection::open(&path)?;
-        old.execute_batch(SCHEMA)?;
-        old.execute("INSERT INTO blobs VALUES ('b',x'00',1,0)", [])?;
-        old.execute(row, ["one", r#"["c","a","b","a"]"#])?;
-        drop(old);
-
         let store = Store::open(&path)?;
+        store.db.lock().unwrap().execute("INSERT INTO blobs VALUES ('b',x'00',1,0)", [])?;
+        store.db.lock().unwrap().execute(row, ["one", r#"["c","a","b","a"]"#])?;
         assert_eq!(store.missing_blobs("", 1)?, ["a"]);
         assert_eq!(store.missing_blobs("a", 10)?, ["c"]);
         store.db.lock().unwrap().execute(row, ["two", r#"["b","c","d"]"#])?;
@@ -1056,6 +1045,22 @@ mod tests {
         assert!(reopened.missing_blobs("d", 1)?.is_empty());
         assert_eq!(reopened.missing_blobs("", 1)?, ["a"]);
         drop(reopened);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_a_store_of_another_format() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("mail-format-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
+        std::fs::create_dir(&dir)?;
+        let path = dir.join("mail.sqlite");
+        Connection::open(&path)?.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY)")?;
+        let err = Store::open(&path).err().expect("a store without the format tag must be refused");
+        assert!(err.to_string().contains("not an Islandmail store"), "{err:#}");
+        std::fs::remove_dir_all(&dir)?;
+        std::fs::create_dir(&dir)?;
+        drop(Store::open(&path)?);
+        drop(Store::open(&path)?);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

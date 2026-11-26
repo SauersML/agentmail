@@ -581,7 +581,7 @@ impl Node {
                     let reaches = self.reaches(&row.recipient, &who.sub);
                     return Ok(Posted { row, reaches, repeated: true });
                 }
-                (ts, Attest::Agent { key: fmt_key(&key), digest, sig, cert: self.carried(&me_agent, t) }, islandmail_core::b64u(&salt))
+                (ts, Attest { key: fmt_key(&key), digest, sig, cert: self.carried(&me_agent, t) }, islandmail_core::b64u(&salt))
             }
             // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
             // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
@@ -605,7 +605,7 @@ impl Node {
                     ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
                 }.signing_bytes(&members);
                 let sig = islandmail_core::b64u(&seed.sign(&st));
-                (ts, Attest::Agent { key, digest, sig, cert: self.carried(&me_agent, t) }, islandmail_core::b64u(&salt))
+                (ts, Attest { key, digest, sig, cert: self.carried(&me_agent, t) }, islandmail_core::b64u(&salt))
             }
         };
         let parents = self.store.heads(&thread)?;
@@ -636,7 +636,7 @@ impl Node {
         let row = match self.store.insert_with(&env, &v, Some(&text), &files_json, readers.as_deref(), now_millis(), &extra)? {
             Some(row) => row,
             None => {
-                let Attest::Agent { sig, .. } = &env.attest;
+                let Attest { sig, .. } = &env.attest;
                 let row = self.store.by_agent_sig(sig)?.filter(|r| r.visible_to(who))
                     .ok_or_else(|| ApiError::new(409, "signed message already stored"))?;
                 let reaches = self.reaches(&to, &who.sub);
@@ -1242,7 +1242,7 @@ mod tests {
             from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
         }.signing_bytes(list);
-        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert: None };
+        let attest = Attest { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert: None };
         let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: String::new() };
         Envelope::seal(
             Draft {
@@ -1269,7 +1269,7 @@ mod tests {
         for wrap in &mut env.keys {
             wrap.to.push('=');
         }
-        let Attest::Agent { key, .. } = &mut env.attest;
+        let Attest { key, .. } = &mut env.attest;
         key.push('=');
         env.sig = islandmail_core::b64u(&writer.sign(&env.signing_bytes()));
         let row = node.ingest(env).unwrap().unwrap();
@@ -1348,7 +1348,7 @@ mod tests {
                     mode: Mode::Members,
                     body: &body,
                     blobs: vec![],
-                    attest: Attest::Agent { key: fmt_key(&alice.public()), digest: digest.clone(), sig, cert: None },
+                    attest: Attest { key: fmt_key(&alice.public()), digest: digest.clone(), sig, cert: None },
                     recipients: &list.all_keys(),
                 },
                 &node_b,
@@ -1466,7 +1466,6 @@ mod tests {
         assert!(!p.repeated);
         let out = rx.try_recv().expect("gossiped");
         assert_eq!(out.id, p.row.env_id);
-        assert_eq!(p.row.to_message()["attest"], "agent");
         let p2 = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
         for invalid in [json!({"to":"all","thread":"t","text":"hi","signed":null}),
@@ -1497,9 +1496,8 @@ mod tests {
         let p = node
             .post(&who, &json!({ "to": "all", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
             .unwrap();
-        assert_eq!(p.row.to_message()["attest"], "agent");
         let e = rx.try_recv().unwrap();
-        assert!(matches!(e.attest, Attest::Agent { .. }));
+        assert!(matches!(e.attest, Attest { .. }));
         assert_eq!(e.ts, ts);
         // A signature over other text, or by another key, is refused.
         let bad = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
@@ -1527,9 +1525,8 @@ mod tests {
         let (node, mut rx) = mk(vec![("a.alice".into(), Seed::from_bytes(*alice.bytes()))]);
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let p = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "no token inside" })).unwrap();
-        assert_eq!(p.row.to_message()["attest"], "agent");
         let e = rx.try_recv().unwrap();
-        assert!(matches!(e.attest, Attest::Agent { .. }));
+        assert!(matches!(e.attest, Attest { .. }));
         e.verify(&list, &list.agents(&[], &|_| None, 0), now_millis()).unwrap();
         e.check_body(&e.open(&node_b).unwrap().unwrap()).unwrap();
         let (node, _) = mk(vec![("a.alice".into(), Seed::generate())]);
@@ -1590,7 +1587,6 @@ mod tests {
         let e = node.post(&who, &json!({ "to": "all", "thread": "t", "text": "unsigned" })).err().unwrap();
         assert_eq!(e.status, 400, "{}", e.message);
         let p = node.post(&who, &json!({"to":"all", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
-        assert_eq!(p.row.to_message()["attest"], "agent");
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }
@@ -1780,7 +1776,7 @@ mod tests {
         let keys = list.all_keys();
         let st = PostStatement { from: name, sub: &format!("agent:{name}"), to: "all", thread: "t", mode: Mode::Members,
                                  ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&list);
-        let attest = Attest::Agent { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert };
+        let attest = Attest { key: fmt_key(&agent.public()), digest, sig: islandmail_core::b64u(&agent.sign(&st)), cert };
         let body = Body { text: text.into(), files: vec![], salt: islandmail_core::b64u(&salt), meta: String::new() };
         Envelope::seal(Draft { thread: "t", parents: vec![], ts, from: name, to: "all", mode: Mode::Members, body: &body,
                                blobs: vec![], attest, recipients: &keys }, &writer.seed).unwrap()

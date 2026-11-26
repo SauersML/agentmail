@@ -235,11 +235,8 @@ async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
     let island = s.node.members.read().unwrap().network.clone();
     Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "kind": "agent", "island": island, "auth": "agent-token",
-                "last_id": s.node.store.last_id()?,
-                "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq(),
-                "features": ["signed-post", "private", "files", "agent-token", "certs"],
-                "refuse_token_only": true }),
+        json!({ "name": who.name, "sub": who.sub, "island": island, "last_id": s.node.store.last_id()?,
+                "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq() }),
         200,
     ))
 }
