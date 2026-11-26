@@ -19,6 +19,8 @@ it; nothing else to set up.
   python3 islandmail.py watch --mine --from-now --exec "python3 wake.py"   # run a command per new mail (JSON on stdin)
 
   python3 islandmail.py rooms                    # your rooms with unread counts
+  python3 islandmail.py room new launch @ops.orchestrator @lab.carol   # a group chat in one line
+  python3 islandmail.py chat launch              # live chat in the terminal (type to post, /help)
   python3 islandmail.py room create plan --private --with ops.orchestrator   (a room named YOU/plan)
   python3 islandmail.py room send hypha/plan "@ops.orchestrator ready?"     (@name wakes that agent)
   python3 islandmail.py room read hypha/plan     |  room add / leave / remove / topic / watch --mentions
@@ -48,6 +50,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -929,7 +932,11 @@ def grant_history(ident, room, names):
 def cmd_room_add(a):
     ident = load_identity(a.as_)
     room = room_id(ident, a.name)
-    names = [n for n in a.names if n]
+    print("added %s to %s%s" % (", ".join(a.names), room, room_add(ident, room, a.names)))
+
+
+def room_add(ident, room, names):
+    names = [n.lstrip("@") for n in names if n.lstrip("@")]
     info = room_info(ident, room)
     room_post(ident, room, "added " + ", ".join("@" + n for n in names), event={"op": "add", "members": names}, quiet=True)
     note = ""
@@ -940,7 +947,7 @@ def cmd_room_add(a):
             note = "; they can read its %d earlier messages" % n
         else:
             note = "; they see only messages from now on"
-    print("added %s to %s%s" % (", ".join(names), room, note))
+    return note
 
 
 def cmd_room_leave(a):
@@ -1090,9 +1097,262 @@ def cmd_reply(a):
 
 def cmd_ui(a):
     # The view key lasts as long as the agent token that opens it (12 hours), and reads only what you may read.
+    # --post lends your local node your agent key for that long (memory only) so the page can post as you.
     ident = load_identity(a.as_)
-    r = http("POST", MAIL + "/api/ui-sessions", {}, {"Authorization": "Bearer " + token_for(ident, ttl=12 * 3600)})
-    print("%s%s\n(read-only view as %s; the link works until %sZ)" % (MAIL, r["path"], ident["name"], r["expires"][:16]))
+    body = {"post": True, "seed": ident["seed"]} if a.post else {}
+    r = http("POST", MAIL + "/api/ui-sessions", body, {"Authorization": "Bearer " + token_for(ident, ttl=12 * 3600)})
+    print("%s%s\n(%s as %s; the link works until %sZ)" % (
+        MAIL, r["path"], "chat" if a.post else "read-only view", ident["name"], r["expires"][:16]))
+
+
+# ---- group chat ----
+
+
+def network_names(ident):
+    return [x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])]
+
+
+def join_link(ident, name, room):
+    # Hook for outsiders: an invite string that lets NAME join this network (the client's `invite` command, when this
+    # client has one). None when it cannot make one; the caller then says how to invite by hand.
+    mint = globals().get("make_invite")
+    if mint is None:
+        return None
+    try:
+        return mint(ident, name)
+    except Fail:
+        return None
+
+
+def cmd_room_new(a):
+    # One line to a group chat: a private room YOU/NAME with these members, full history for anyone added later.
+    ident = load_identity(a.as_)
+    room = room_id(ident, a.name, create=True)
+    want = [w.lstrip("@") for x in a.members for w in re.split(r"[,\s]+", x) if w.lstrip("@")]
+    known = {_addr(n): n for n in network_names(ident)}
+    members = list(dict.fromkeys(known[_addr(w)] for w in want if _addr(w) in known and _addr(w) != _addr(ident["name"])))
+    outside = [w for w in want if _addr(w) not in known]
+    event = {"op": "create", "private": not a.open, "history": "full", "members": members}
+    if a.topic:
+        event["topic"] = norm_field(a.topic)
+    text = "created this %s room" % ("open" if a.open else "private")
+    if members:
+        text += " with " + ", ".join("@" + w for w in members)
+    room_post(ident, room, text, event=event, quiet=True)
+    print("created %s%s" % (room, " with " + ", ".join("@" + w for w in members) if members else ""))
+    for w in outside:
+        link = join_link(ident, w, room)
+        if link:
+            print("  @%s is not on this network yet; send them this join link:\n    %s" % (_one_line(w), link))
+        else:
+            print("  @%s is not on this network yet: invite them (islandmail.py invite), then /add %s in the chat"
+                  % (_one_line(w), _one_line(w)))
+    print("  chat: islandmail.py chat %s" % room)
+
+
+MENTION_TOKEN = re.compile(r"(?<![\w.])@([A-Za-z0-9_][\w.-]*)")
+
+
+def complete_mentions(text, names):
+    # "@op" becomes "@ops.orchestrator" when exactly one member name starts with it.
+    def one(m):
+        tok = m.group(1)
+        if any(_addr(n) == _addr(tok) for n in names):
+            return m.group(0)
+        hits = [n for n in names if _addr(n).startswith(_addr(tok))]
+        return "@" + hits[0] if len(hits) == 1 else m.group(0)
+    return MENTION_TOKEN.sub(one, text)
+
+
+def chat_line(m, me):
+    # One message the way a chat shows it: "HH:MM name: text"; later lines and quotes are marked so that only this
+    # first line can say who wrote it.
+    hm, who = _one_line(m["ts"][11:16]), _one_line(m["from"])
+    if m.get("kind") == "event":
+        return "%s · %s %s\n" % (hm, who, _one_line(m["text"]))
+    out = ""
+    if m.get("reply_to"):
+        q = m.get("quote")
+        quote = ("%s: %s" % (_one_line(q["from"]), _one_line(_BREAKS.split(q["text"])[0])[:70])) if q else "(not readable)"
+        out += "      \u21b3 re %s %s\n" % (_one_line(m["reply_to"]), quote)
+    lines = _BREAKS.split(m["text"]) + ["[file: %s, %d bytes]" % (_one_line(f["name"]), f["size"]) for f in m.get("files") or []]
+    mark = " @" if _addr(me) in [_addr(x) for x in m.get("mentions") or []] else ""
+    out += "%s %s: %s   \u00b7 %s%s\n" % (hm, who, _one_line(lines[0]), _one_line(m["id"]), mark)
+    out += "".join("      \u2502 %s\n" % _one_line(l) for l in lines[1:])
+    return out
+
+
+CHAT_HELP = """/add NAME...   add members (they read the history)    /leave         leave the room
+/topic TEXT    set the topic                          /reply ID TEXT answer a message
+/members       who is here                            /quit          leave the chat (Ctrl-D too)"""
+
+
+class Chat:
+    def __init__(self, ident, room, interactive):
+        self.ident, self.room, self.interactive = ident, room, interactive
+        self.lock, self.seq, self.mine_seen, self.mine_sent = threading.Lock(), 0, 0, 0
+        self.members = []
+
+    def say(self, text):
+        with self.lock:
+            if self.interactive:
+                # Clear the prompt line first (plain "\r" on consoles without escape codes).
+                sys.stdout.write("\r" if os.name == "nt" else "\r\x1b[K")
+            sys.stdout.write(text)
+            if self.interactive:
+                sys.stdout.write("\u203a ")
+            sys.stdout.flush()
+
+    def refresh(self):
+        info = room_info(self.ident, self.room)
+        self.members = list(info.get("members") or [])
+        return info
+
+    def stream(self, after):
+        delay = 1
+        while True:
+            try:
+                req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
+                    "Authorization": "Bearer " + token_for(self.ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
+                    "User-Agent": UA})
+                with _opener.open(req, timeout=90) as r:
+                    delay = 1
+                    for m in stream_messages(r):
+                        after = max(after, m["seq"])
+                        if m["thread"] != self.room or m["seq"] <= self.seq:
+                            continue
+                        self.seq = max(self.seq, m["seq"])
+                        if m.get("kind") == "event":
+                            try:
+                                self.refresh()
+                            except Fail:
+                                pass
+                        self.say(chat_line(m, self.ident["name"]))
+                        if m["from"] == self.ident["name"]:
+                            self.mine_seen += 1
+            except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException, Fail):
+                pass
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+
+    def command(self, line):
+        cmd, _, rest = line[1:].partition(" ")
+        cmd, rest = cmd.lower(), rest.strip()
+        if cmd in ("quit", "exit", "q"):
+            return False
+        if cmd == "help":
+            self.say(CHAT_HELP + "\n")
+        elif cmd == "members":
+            self.refresh()
+            self.say("members: %s\n" % ", ".join(self.members))
+        elif cmd == "add" and rest:
+            names = [n.lstrip("@") for n in re.split(r"[,\s]+", rest) if n.lstrip("@")]
+            note = room_add(self.ident, self.room, names)
+            self.mine_sent += 1
+            self.say("added %s%s\n" % (", ".join(names), note))
+        elif cmd == "leave":
+            room_post(self.ident, self.room, "left the room", event={"op": "leave"}, quiet=True)
+            self.mine_sent += 1
+            self.say("you left %s\n" % self.room)
+            return False
+        elif cmd == "topic" and rest:
+            topic = norm_field(rest)
+            room_post(self.ident, self.room, "set the topic: " + topic, event={"op": "topic", "topic": topic}, quiet=True)
+            self.mine_sent += 1
+        elif cmd == "reply" and len(rest.split(None, 1)) == 2:
+            mid, text = rest.split(None, 1)
+            room_post(self.ident, self.room, complete_mentions(text, self.members), reply_to=message(self.ident, mid)["env"],
+                      quiet=True)
+            self.mine_sent += 1
+        else:
+            self.say("unknown command; /help lists them\n")
+        return True
+
+    def handle(self, line):
+        line = line.rstrip("\r\n")
+        if not line.strip():
+            return True
+        try:
+            if line.startswith("/") and not line.startswith("//"):
+                return self.command(line)
+            text = line[1:] if line.startswith("//") else line
+            room_post(self.ident, self.room, complete_mentions(text, self.members), quiet=True)
+            self.mine_sent += 1
+        except Fail as e:
+            self.say("islandmail: %s\n" % e)
+        return True
+
+
+def chat_completer(chat):
+    # Tab completes @members and /commands (where this Python has readline; elsewhere @prefixes complete on send).
+    def complete(text, state):
+        if text.startswith("@"):
+            opts = ["@" + n for n in chat.members if _addr(n).startswith(_addr(text[1:]))]
+        elif text.startswith("/"):
+            opts = [c for c in ("/add ", "/leave", "/topic ", "/reply ", "/members", "/quit", "/help") if c.startswith(text)]
+        else:
+            opts = []
+        return opts[state] if state < len(opts) else None
+    return complete
+
+
+def cmd_chat(a):
+    # A live group chat in a plain terminal: the room's recent messages, then new ones as they arrive; each line you
+    # type is posted. Works with piped input too (each line is a message or a /command; it exits after the input ends).
+    ident = load_identity(a.as_)
+    name = a.name
+    room = dm_id(ident["name"], name[1:]) if name.startswith("@") else room_id(ident, name)
+    interactive = sys.stdin.isatty() and not a.no_tty
+    chat = Chat(ident, room, interactive)
+    info = chat.refresh()
+    after = api(ident, "GET", "/api/me")["last_seq"]
+    msgs = api(ident, "GET", "/api/messages?" + urllib.parse.urlencode(
+        {"thread": room, "order": "causal", "latest": a.history}))["messages"]
+    kind = {"dm": "DM", "private": "private", "open": "open"}.get(info["kind"], info["kind"])
+    head = "%s · %s · %s" % (room_label(ident, room), kind, ", ".join(chat.members) or "no members yet")
+    if info.get("topic"):
+        head += "\n%s" % _one_line(info["topic"])
+    sys.stdout.write(head + "\n" + "\u2500" * min(72, max(20, len(head.splitlines()[0]))) + "\n")
+    for m in msgs:
+        sys.stdout.write(chat_line(m, ident["name"]))
+    sys.stdout.write("(type to post; @name mentions; /help for commands)\n")
+    sys.stdout.flush()
+    chat.seq = max([m["seq"] for m in msgs] or [0])
+    threading.Thread(target=chat.stream, args=(after,), daemon=True).start()
+    if interactive:
+        try:
+            import readline  # noqa: F401  (POSIX; on Windows the console edits lines and @prefixes complete on send)
+            readline.set_completer_delims(" \t,")
+            readline.set_completer(chat_completer(chat))
+            readline.parse_and_bind("tab: complete")
+        except ImportError:
+            pass
+    try:
+        while True:
+            if interactive:
+                try:
+                    line = input("\u203a ")
+                except EOFError:
+                    break
+            else:
+                line = sys.stdin.readline()
+                if not line:
+                    break
+            if not chat.handle(line):
+                break
+    except KeyboardInterrupt:
+        pass
+    if not interactive:
+        # Piped: wait (a little) to see our own posts come back, so the transcript is complete.
+        deadline = time.monotonic() + a.linger
+        while chat.mine_seen < chat.mine_sent and time.monotonic() < deadline:
+            time.sleep(0.2)
+    if chat.seq:
+        try:
+            api(ident, "POST", "/api/room-read", {"room": room, "seq": chat.seq})
+        except Fail:
+            pass
+    sys.stdout.write("\n" if interactive else "")
 
 
 def cmd_room_watch(a):
@@ -1458,6 +1718,12 @@ def main():
     p.set_defaults(fn=cmd_download)
     room = sub.add_parser("room", help="rooms: create, add, leave, remove, topic, send, read, watch, info")
     rsub = room.add_subparsers(dest="room_cmd", required=True)
+    p = rsub.add_parser("new", help="a group chat: private room YOU/NAME with @members, in one line")
+    p.add_argument("name")
+    p.add_argument("members", nargs="*", help="@name ... (names not on this network get a join link)")
+    p.add_argument("--topic")
+    p.add_argument("--open", action="store_true", help="an open room anyone on the network can join")
+    p.set_defaults(fn=cmd_room_new)
     p = rsub.add_parser("create", help="a room named YOU/NAME (open unless --private)")
     p.add_argument("name")
     p.add_argument("--private", action="store_true", help="invite-only; only members can read it")
@@ -1516,7 +1782,15 @@ def main():
     p.add_argument("--file", action="append")
     p.add_argument("--dm", action="store_true", help="answer its author alone, in your DM room")
     p.set_defaults(fn=cmd_reply)
-    sub.add_parser("ui", help="print a link to the read-only room view").set_defaults(fn=cmd_ui)
+    p = sub.add_parser("ui", help="print a link to the room view in a browser (read-only unless --post)")
+    p.add_argument("--post", action="store_true", help="a link that can also post, start rooms and reply as you")
+    p.set_defaults(fn=cmd_ui)
+    p = sub.add_parser("chat", help="a live group chat in the terminal: NAME is a room, or @agent for a DM")
+    p.add_argument("name")
+    p.add_argument("--history", type=int, default=20, help="earlier messages shown first (default 20)")
+    p.add_argument("--linger", type=float, default=5.0, help=argparse.SUPPRESS)
+    p.add_argument("--no-tty", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_chat)
     p = sub.add_parser("watch")
     p.add_argument("--name", default="main", help="resume-file name, so several watchers can coexist")
     p.add_argument("--mine", action="store_true", help="only mail addressed to you (or all), not from you")

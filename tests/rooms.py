@@ -89,6 +89,21 @@ def main():
     def rooms(agent):
         return {r["id"]: r for r in js(agent, "rooms") or []}
 
+    def chat(agent, *args, stdin="", timeout=60):
+        h = home[agent]
+        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
+                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
+        p = subprocess.run([sys.executable, im, "chat", *args], input=stdin, env=env, capture_output=True, text=True,
+                           timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+
+    def chat_bg(agent, *args):
+        h = home[agent]
+        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
+                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
+        return subprocess.Popen([sys.executable, im, "chat", *args], env=env, stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
     try:
         for h in hosts:
             check("%s node starts" % h, nodes[h].start())
@@ -220,6 +235,7 @@ def main():
         check("reply to plain thread mail goes back to its sender in its thread", rc == 0 and got, out[-160:])
 
         issue12_checks(cl, js, req, api, token, bg, orig)
+        group_chat_checks(cl, js, req, api, chat, chat_bg)
         mcpl_checks(api, cl, token)
 
         # /ui: the page, a view key, JSON rooms and members.
@@ -262,6 +278,104 @@ def main():
 
 def b32(env):
     return base64.b32encode(bytes.fromhex(env)).decode().lower().rstrip("=")
+
+
+def group_chat_checks(cl, js, req, api, chat, chat_bg):
+    """Rooms as a group chat: room new in one line, chat in a terminal (piped here), and posting from /ui."""
+    rc, out = cl("hypha", "room", "new", "crew", "@ops.orchestrator", "lab.carol", "@nobody.here", "--topic", "ship it")
+    check("room new NAME @a @b makes the room with its members", rc == 0
+          and "created hypha/crew with @ops.orchestrator, @lab.carol" in out, out[-240:])
+    check("and says how to bring in a name not on the network", "@nobody.here is not on this network yet" in out
+          and "chat: islandmail.py chat hypha/crew" in out, out[-240:])
+    info = js("hypha", "room", "info", "hypha/crew") or {}
+    check("a group chat: private, full history, every member", info.get("kind") == "private" and info.get("history") == "full"
+          and info.get("members") == ["hypha", "lab.carol", "ops.orchestrator"] and info.get("topic") == "ship it", json.dumps(info)[:200])
+    wait_for(lambda: (js("ops.orchestrator", "room", "info", "hypha/crew") or {}).get("member"), timeout=20)
+
+    # A live chat that stays open while another member posts: the post scrolls in.
+    live = chat_bg("hypha", "hypha/crew", "--no-tty")
+    time.sleep(3)
+    cl("lab.carol", "room", "send", "hypha/crew", "carol here, posting from the CLI")
+    time.sleep(SYNC * 3)
+    try:
+        out, _ = live.communicate("/quit\n", timeout=30)
+    except subprocess.TimeoutExpired:
+        live.kill()
+        out, _ = live.communicate()
+    tail = out.split("/help for commands)", 1)[-1]
+    check("chat shows messages as they arrive", "lab.carol: carol here, posting from the CLI" in tail, out[-300:])
+    check("with the room, its members and topic on top", out.startswith("hypha/crew \u00b7 private \u00b7 hypha, lab.carol, ops.orchestrator")
+          and "ship it" in out.splitlines()[1], out[:200])
+
+    # Piped input: each line is a message or a /command; @prefixes complete to member names.
+    first = [m for m in js("ops.orchestrator", "room", "read", "hypha/crew")["messages"] if m["text"].startswith("carol here")][0]
+    rc, out = chat("ops.orchestrator", "hypha/crew", stdin="hello crew @lab, tests are green\n/topic ship friday\n"
+                   "/reply %s seen it\n/members\n" % first["id"][:5])
+    check("chat posts typed lines and echoes them", rc == 0 and "ops.orchestrator: hello crew @lab.carol, tests are green" in out, out[-400:])
+    check("/members lists the room", "members: hypha, lab.carol, ops.orchestrator" in out, out[-300:])
+    got, _ = wait_for(lambda: [m for m in js("hypha", "room", "read", "hypha/crew")["messages"] if m["from"] == "ops.orchestrator"],
+                      timeout=20)
+    texts = [m["text"] for m in got or []]
+    hello = [m for m in got or [] if m["text"].startswith("hello crew")]
+    check("@lab completed to a real mention", hello and hello[0].get("mentions") == ["lab.carol"], json.dumps(hello)[:200])
+    check("/topic sets the topic", (js("hypha", "room", "info", "hypha/crew") or {}).get("topic") == "ship friday")
+    reply = [m for m in got or [] if m["text"] == "seen it"]
+    check("/reply ID answers in place", reply and reply[0].get("reply_to") == first["id"], str(texts))
+    rc, out = chat("hypha", "hypha/crew", stdin="")
+    lines = out.splitlines()
+    i = next((k for k, l in enumerate(lines) if ": seen it" in l), 0)
+    check("chat shows a reply under a \u21b3 line", i and lines[i - 1].strip().startswith("\u21b3 re %s lab.carol: carol here" % first["id"]),
+          "\n".join(lines[max(0, i - 2):i + 1]))
+
+    # /add (with the history) and /leave from the chat; chat @NAME is the DM.
+    cl("hypha", "room", "new", "duo", "@ops.orchestrator")
+    cl("hypha", "room", "send", "hypha/duo", "before carol")
+    rc, out = chat("hypha", "hypha/duo", stdin="/add lab.carol\n")
+    check("/add adds a member", rc == 0 and "added lab.carol" in out and "earlier messages" in out, out[-200:])
+    got, _ = wait_for(lambda: "before carol" in [m["text"] for m in (js("lab.carol", "room", "read", "hypha/duo") or {}).get("messages", [])],
+                      timeout=30)
+    check("who then reads the history", got)
+    rc, out = chat("lab.carol", "hypha/duo", stdin="/leave\n")
+    got, _ = wait_for(lambda: "lab.carol" in (js("hypha", "room", "info", "hypha/duo") or {}).get("former", []), timeout=30)
+    check("/leave leaves", rc == 0 and "you left hypha/duo" in out and got, out[-200:])
+    rc, out = chat("lab.carol", "@hypha", stdin="hi from the chat\n")
+    got, _ = wait_for(lambda: "hi from the chat" in [m["text"] for m in (js("hypha", "room", "read", "dm:hypha+lab.carol") or {})
+                                                      .get("messages", [])], timeout=30)
+    check("chat @agent is the DM, a two-person room", rc == 0 and got, out[-200:])
+
+    # /ui with a posting key: post, reply, start a room, clear unread; a read-only key cannot post.
+    rc, out = cl("hypha", "ui", "--post")
+    key = out.split("#k=")[1].split()[0] if "#k=" in out else ""
+    rc2, out2 = cl("hypha", "ui")
+    ro = out2.split("#k=")[1].split()[0] if "#k=" in out2 else ""
+    st, me = req("GET", api["mac"], "/ui/api/me", "ui." + key)
+    check("ui --post gives a key that can post", rc == 0 and st == 200 and me.get("post") is True and "lab.carol" in me.get("agents", []),
+          out[-160:])
+    st, r = req("POST", api["mac"], "/ui/api/messages", "ui." + key, {"room": "hypha/crew", "text": "from the browser @ops.orchestrator"})
+    check("/ui posts into a room as the agent", st == 201 and r["message"]["from"] == "hypha" and r["message"]["mentions"] == ["ops.orchestrator"],
+          json.dumps(r)[:200])
+    got, _ = wait_for(lambda: "from the browser @ops.orchestrator" in [m["text"] for m in js("ops.orchestrator", "room", "read", "hypha/crew")
+                                                                        ["messages"]], timeout=30)
+    check("signed, so other nodes accept it", got)
+    st, r = req("POST", api["mac"], "/ui/api/messages", "ui." + key, {"room": "hypha/crew", "text": "agreed", "reply_to": first["id"][:6]})
+    check("/ui replies in place", st == 201 and r["message"].get("reply_to") == first["id"] and r["message"]["mode"] == "private",
+          json.dumps(r)[:200])
+    st, r = req("POST", api["mac"], "/ui/api/messages", "ui." + ro, {"room": "hypha/crew", "text": "nope"})
+    check("a read-only key cannot post", st == 403, str(st))
+    st, r = req("POST", api["mac"], "/ui/api/rooms/new", "ui." + key, {"name": "from-ui", "members": ["@ops.orchestrator", "ghost"]})
+    check("/ui starts a room (New room)", st == 201 and r.get("room") == "hypha/from-ui" and r.get("unknown") == ["ghost"], json.dumps(r))
+    got, _ = wait_for(lambda: "hypha/from-ui" in {x["id"] for x in js("ops.orchestrator", "rooms") or []}, timeout=30)
+    check("and its members see it", got)
+    st, r = req("POST", api["mac"], "/ui/api/rooms/new", "ui." + key, {"name": "bad/name", "members": []})
+    check("room names are checked", st == 400, str(st))
+    cl("ops.orchestrator", "room", "send", "hypha/crew", "unread for hypha")
+    wait_for(lambda: any(x["id"] == "hypha/crew" and x["unread"] for x in req("GET", api["mac"], "/ui/api/rooms", "ui." + key)[1]["rooms"]),
+             timeout=30)
+    seq = max(m["seq"] for m in req("GET", api["mac"], "/ui/api/messages?room=hypha/crew&limit=200", "ui." + key)[1]["messages"])
+    st, _ = req("POST", api["mac"], "/ui/api/read", "ui." + ro, {"room": "hypha/crew", "seq": seq})
+    rooms_now = {x["id"]: x for x in req("GET", api["mac"], "/ui/api/rooms", "ui." + key)[1]["rooms"]}
+    check("opening a room in /ui clears its unread dot", st == 200 and rooms_now["hypha/crew"]["unread"] == 0,
+          json.dumps(rooms_now.get("hypha/crew"))[:200])
 
 
 def issue12_checks(cl, js, req, api, token, bg, orig):
