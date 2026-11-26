@@ -136,6 +136,11 @@ def main():
         check("alice makes a private room alice/plan", rc == 0, (out + err)[-200:])
         rc, out, err = cl("a", "room", "send", "alice/plan", "before bob")
         check("and posts in it", rc == 0, err[-200:])
+        # An open room made before any other host is trusted: its create event is sealed to this host alone.
+        rc, out, err = cl("a", "room", "create", "town", "--open")
+        check("alice makes an open room alice/town", rc == 0, (out + err)[-200:])
+        rc, out, err = cl("a", "room", "send", "alice/town", "before anyone")
+        check("and posts in it", rc == 0, err[-200:])
 
         # Refused before anything is set up.
         rc, out, err = cl("a", "invite", "--name", "alice", "--config", a_cfg)
@@ -211,6 +216,22 @@ def main():
         check("alice reads bob's room post", bool(got), "%.1fs" % t)
         got = [m for m in (js("b", "room", "read", "alice/plan") or {}).get("messages", []) if m.get("text") == "before bob"]
         check("bob reads the room's earlier post (full history)", bool(got))
+
+        # The open room made before bob's host was trusted: the add grants him its membership events, so his node
+        # has the room (its create event) and he can post right away. Its earlier posts are not granted.
+        rc, out, err = cl("a", "room", "add", "alice/town", "bob")
+        check("alice adds bob to the open room alice/town", rc == 0, (out + err)[-200:])
+        got, t = wait_for(lambda: [r for r in js("b", "rooms") or [] if r.get("id") == "alice/town" and r.get("member")], timeout=60)
+        check("bob's host, trusted after the room was made, has alice/town with bob in it", bool(got), "%.1fs" % t)
+        posted = []
+        got, t = wait_for(lambda: posted.append(cl("b", "room", "send", "alice/town", "hello town")) or posted[-1][0] == 0,
+                          timeout=30, every=1)
+        check("bob posts there right after his add", got, "%.1fs %s" % (t, posted[-1][2][-200:]))
+        got, t = wait_for(lambda: [m for m in (js("a", "room", "read", "alice/town") or {}).get("messages", [])
+                                   if m.get("text") == "hello town"], timeout=30)
+        check("alice reads bob's post in the open room", bool(got), "%.1fs" % t)
+        got = [m for m in (js("b", "room", "read", "alice/town") or {}).get("messages", []) if m.get("text") == "before anyone"]
+        check("bob does not get the open room's earlier posts (only its membership events)", not got)
 
         # Refused by the inviting node; the joining node changes nothing.
         rc, out, err = join("c", inv)

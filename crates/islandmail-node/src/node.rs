@@ -1385,6 +1385,7 @@ impl Node {
         let keys: Vec<String> = gh.audience.clone();
         let names = names_with_keys(agents, &keys);
         let members = self.members.read().unwrap().clone();
+        let mut learned = false;
         for item in &meta.grant {
             let Some((raw, has_text, _)) = self.store.env_state(&item.env)? else {
                 self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
@@ -1394,7 +1395,13 @@ impl Node {
             let env: Envelope = serde_json::from_str(&raw)?;
             let Some(ck) = islandmail_core::b64u_decode(&item.ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
             let Ok(o) = env.open_with(&ck) else { continue };
-            if o.header.thread != gh.thread || o.header.mode != Mode::Private || env.check_body(&o.header, &o.body).is_err() {
+            // Besides private mail, a grant may carry a membership event of the same open room: its members-mode
+            // envelope was wrapped to the hosts its writer trusted then, so a host trusted later has no slot for it.
+            let private = o.header.mode == Mode::Private;
+            let open_event = o.header.mode == Mode::Members
+                && islandmail_core::room::Meta::parse(&o.body.meta)
+                    .is_ok_and(|m| m.event.is_some() && m.room.as_deref() == Some(gh.thread.as_str()));
+            if o.header.thread != gh.thread || !(private || open_event) || env.check_body(&o.header, &o.body).is_err() {
                 continue;
             }
             self.store.put_grant(&item.env, &keys, &item.ck, &grant.id, &gh.thread)?;
@@ -1403,22 +1410,37 @@ impl Node {
                 let meta = islandmail_core::room::Meta::parse(&o.body.meta).unwrap_or_default();
                 let raw_meta = if meta.is_empty() { String::new() } else { o.body.meta.clone() };
                 let files = serde_json::to_string(&o.body.files)?;
-                let readers = readers_of(agents, &o.header);
-                self.store.fill_opened(&item.env, Read { header: &o.header, v: &v, ck: &o.ck }, &readers, &o.body.text,
+                let readers = private.then(|| readers_of(agents, &o.header));
+                self.store.fill_opened(&item.env, Read { header: &o.header, v: &v, ck: &o.ck }, readers.as_deref(), &o.body.text,
                                        &files, &crate::store::Extra::of(&raw_meta, &meta))?;
+                if meta.event.is_some() {
+                    // Membership and vouches decide which refused envelopes may now be taken.
+                    learned = true;
+                }
             }
-            self.store.add_readers(&item.env, &names)?;
+            if private {
+                self.store.add_readers(&item.env, &names)?;
+            }
+        }
+        if learned {
+            self.trust.send_modify(|g| *g += 1);
         }
         Ok(())
     }
 
     /// Content keys of a private room's messages the caller can read, to re-wrap for a new member (key grants).
     /// A since-join room grants only its membership events, so the new member's node knows the room.
+    /// An open CREATOR/NAME room grants its membership events too (they are readable by every trusted host already).
     pub fn room_keys(&self, who: &Caller, room: &str) -> Result<Vec<Value>, ApiError> {
         if !self.active(who) {
             return Err(ApiError::new(401, "session expired or membership changed"));
         }
         let state = self.room_state(room)?.ok_or_else(|| ApiError::new(404, format!("no room {room} here")))?;
+        if !state.private() && state.created && islandmail_core::room::creator_of(room).is_some() {
+            // An open CREATOR/NAME room: the keys of its membership events only, for a member whose host was not
+            // trusted yet when they were sent. Without the create event that host has no room at all.
+            return Ok(self.store.room_event_keys(room)?.into_iter().map(|(env, ck)| json!({ "env": env, "ck": ck })).collect());
+        }
         if !state.private() || !state.is_member(&who.name) {
             return Err(ApiError::new(403, "key grants are for members of a private room"));
         }
