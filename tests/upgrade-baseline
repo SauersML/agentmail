@@ -1,2 +1,2 @@
-# The build tests/upgrade.py upgrades from while no earlier v* release tag exists (then the newest one does).
+# The build tests/upgrade.py upgrades from until a v* release tag descends from it (then the newest such tag).
 bac178d31592c6747c1ec16e9bd25e9444de244e

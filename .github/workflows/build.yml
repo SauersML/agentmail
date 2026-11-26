@@ -121,7 +121,8 @@ jobs:
           path: out/
           if-no-files-found: error
 
-  # Upgrade without rejoin: nodes on the previous release (the newest earlier v* tag, else tests/upgrade-baseline)
+  # Upgrade without rejoin: nodes on the previous release (the newest earlier v* tag after tests/upgrade-baseline, else that
+  # baseline)
   # with mail, a room, a joined outsider and a pending invite, swapped one by one to this build.
   upgrade:
     runs-on: ubuntu-22.04
@@ -141,8 +142,10 @@ jobs:
             ../previous -> target
       - name: Build the previous release and this one
         run: |
-          base=$(git tag -l 'v*' --sort=-v:refname --no-contains HEAD | head -n 1)
-          [ -n "$base" ] || base=$(grep -v '^#' tests/upgrade-baseline | head -n 1)
+          # Release tags after the pinned baseline (older tags are the pre-Islandmail line), else the baseline.
+          pinned=$(grep -v '^#' tests/upgrade-baseline | head -n 1)
+          base=$(git tag -l 'v*' --sort=-v:refname --contains "$pinned" --no-contains HEAD | head -n 1)
+          [ -n "$base" ] || base=$pinned
           echo "upgrading from $base"
           git worktree add ../previous "$base"
           (cd ../previous && cargo build --locked --release -p islandmail-node)
