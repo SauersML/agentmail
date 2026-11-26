@@ -29,11 +29,23 @@ pub struct Config {
     /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
     #[serde(default)]
     pub identities_dir: Option<PathBuf>,
+    /// Who may get a certificate here: "open" (default: any local user or process, through POST /api/agents) or
+    /// "identities_dir" (only the identity files the operator put in identities_dir; POST /api/agents is refused).
+    #[serde(default)]
+    pub certify: Certify,
     #[serde(default = "default_sync")]
     pub sync_secs: u64,
     /// Base URL for attachment links in formatted mail (default http://<api_listen>).
     #[serde(default)]
     pub public_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Certify {
+    #[default]
+    Open,
+    IdentitiesDir,
 }
 
 fn default_api() -> String {

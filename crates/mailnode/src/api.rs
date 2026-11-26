@@ -205,7 +205,7 @@ fn local_json(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
 async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
     let node = s.node.clone();
-    let (status, out) = tokio::task::spawn_blocking(move || node.certify(&v))
+    let (status, out) = tokio::task::spawn_blocking(move || node.certify_request(&v))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(out, status))

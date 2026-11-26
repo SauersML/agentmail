@@ -388,7 +388,11 @@ pub async fn watch_trust_file(cfg: Config, node: Arc<Node>, adopted: impl Fn()) 
             continue;
         }
         match Config::parse_members(&raw).and_then(|list| node.reload_members(&list)) {
-            Ok(true) => adopted(),
+            Ok(true) => {
+                // Held identities newly inside this node's names get their certificates now.
+                node.certify_identities();
+                adopted()
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!("local trust file refused: {e:#}");

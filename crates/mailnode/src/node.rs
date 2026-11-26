@@ -67,6 +67,8 @@ pub struct Posted {
 #[derive(Default)]
 pub struct Opts {
     pub identities: Vec<(String, Seed)>,
+    /// Certify only the held identities: refuse certificate requests over the API (config "certify": "identities_dir").
+    pub held_only: bool,
     /// Base URL written into attachment links.
     pub public_url: String,
 }
@@ -241,6 +243,16 @@ impl Node {
     }
 
     /* Certificates */
+
+    /// POST /api/agents: a certificate request from whoever can reach the loopback API. Refused when this node
+    /// certifies only the identity files its operator put in identities_dir.
+    pub fn certify_request(&self, body: &Value) -> Result<(u16, Value), ApiError> {
+        if self.opts.held_only {
+            return Err(ApiError::new(403, "this node certifies only the identities its operator placed in its identities_dir \
+                (config \"certify\": \"identities_dir\"); ask the operator for an identity file"));
+        }
+        self.certify(body)
+    }
 
     /// POST /api/agents (loopback API): certify an agent of this host. Ok((status, {"cert": …})).
     pub fn certify(&self, body: &Value) -> Result<(u16, Value), ApiError> {
@@ -1507,7 +1519,7 @@ mod tests {
         let mk = |ids: Vec<(String, Seed)>| {
             let path = std::env::temp_dir().join(format!("mailnode-test-{}.sqlite", mailcore::b64u(&mailcore::random_bytes::<9>())));
             let (tx, rx) = mpsc::channel(32);
-            let opts = Opts { public_url: "http://x".into(), identities: ids };
+            let opts = Opts { public_url: "http://x".into(), identities: ids, ..Default::default() };
             let node_seed = Seed::from_bytes(*node_b.bytes());
             (Node::new(Store::open(&path).unwrap(), list.clone(), node_seed, opts, tx), rx)
         };
@@ -1648,6 +1660,21 @@ mod tests {
         codes.sort();
         assert_eq!(codes, [201, 409]);
         assert_eq!(node.store.certs_at(Some("hypha"), i64::MAX).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn held_only_refuses_requests_but_certifies_held_identities() {
+        let (mut mac, _, _, _) = homes();
+        let held = Seed::generate();
+        mac.opts.held_only = true;
+        mac.opts.identities.push(("h.held".into(), held.clone()));
+        let e = mac.certify_request(&proof(&Seed::generate(), "h.walkin", &mac)).unwrap_err();
+        assert_eq!(e.status, 403);
+        assert!(e.message.contains("identities_dir"), "{}", e.message);
+        assert_eq!(status(mac.certify_request(&proof(&held, "h.held", &mac))), 403, "requests are refused for any key");
+        mac.certify_identities();
+        assert_eq!(mac.verify(&token(&held, "h.held", &mac)).unwrap().sub, "agent:h.held");
+        assert!(mac.verify(&token(&Seed::generate(), "h.walkin", &mac)).is_err());
     }
 
     #[test]

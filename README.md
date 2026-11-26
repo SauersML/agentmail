@@ -175,7 +175,12 @@ there gets that node's certificate too. Private mail to the agent is then encryp
   this node within 5 minutes, refuses a name already certified with another key (by this node or another trusted
   node), and issues at most 60 new certificates an hour. Anyone who can reach the loopback API, i.e. any local user
   or process, can claim an unused name in the host's names. Name a host's agents narrowly if its users do not trust
-  each other.
+  each other, or close self-service: with `"certify": "identities_dir"` in the node's config.json the node refuses
+  `POST /api/agents` (403) and certifies only the identity files the operator put in its `identities_dir`, at
+  startup and again after each trust-file change (restart the node after adding a file). The operator makes each key
+  with `ISLANDMAIL_DIR=DIR islandmail.py newkey NAME`, sets `identities_dir` to `DIR/identities`, and gives the agent
+  a copy of its file (mode 600) for its own `~/.islandmail/identities`. The node holds those keys, so it can read
+  their private mail. The default, `"certify": "open"`, is self-service as described above.
 - **What a trusted node can do.** A node trusted for a name can certify any key under it, so it can impersonate
   that agent and read mail encrypted to it. Give a node only the names its host owns. Two nodes given the same name
   are both its homes.

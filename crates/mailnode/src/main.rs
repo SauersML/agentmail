@@ -128,6 +128,8 @@ async fn run(path: &Path) -> Result<()> {
     if !members.is_node(&seed.public()) {
         bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));
     }
+    let held_only = cfg.certify == config::Certify::IdentitiesDir;
+    anyhow::ensure!(!held_only || cfg.identities_dir.is_some(), "\"certify\": \"identities_dir\" needs identities_dir");
     let identities = cfg.identities();
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
@@ -141,6 +143,7 @@ async fn run(path: &Path) -> Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities,
+        held_only,
         public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
     };
     store.bind_roster(&seed.public(), &members)?;
