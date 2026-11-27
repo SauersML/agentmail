@@ -11,7 +11,7 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SUITES = ["client", "two_nodes", "phase2", "network", "client_wake", "big_files", "sync_peers", "certify_held", "rooms",
+SUITES = ["client", "two_nodes", "phase2", "network", "client_wake", "big_files", "sync_peers", "rooms",
           "invite", "hub_rooms", "late_rooms", "privacy", "notify", "api_guard", "gossip_churn"]
 
 

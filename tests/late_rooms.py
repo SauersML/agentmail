@@ -66,9 +66,8 @@ def main():
     def cl(agent, *args, timeout=60):
         h = home[agent]
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=agent.split(".")[-1],
-                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
-        env.pop("ISLANDMAIL_NODE_KEY", None)
-        p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
+                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h])
+        p = subprocess.run([sys.executable, im, "--as", agent, *args], env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout + p.stderr).strip()
 
     def info(agent):

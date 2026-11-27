@@ -68,16 +68,12 @@ pub struct Posted {
 pub struct Opts {
     /// Held identities (identities_dir), re-read while the node runs (Node::set_identities).
     pub identities: RwLock<Vec<(String, Seed)>>,
-    /// Certify only the held identities: refuse certificate requests over the API (config "certify": "identities_dir").
-    pub held_only: bool,
     /// Base URL written into attachment links.
     pub public_url: String,
     /// The trust file this node may edit for invite, join and accept (none in unit tests).
     pub members_file: Option<std::path::PathBuf>,
     /// Config "relay", told to invited nodes.
     pub relay: Vec<String>,
-    /// Config "mcpl_push_off", lowercased: names whose MCPL sessions get no pushes.
-    pub push_off: Vec<String>,
 }
 
 /// A file reference {id, name, type, size, key} and the plaintext, when the blob is on this node.
@@ -370,16 +366,6 @@ impl Node {
     }
 
     /* Certificates */
-
-    /// POST /api/agents: a certificate request from whoever can reach the loopback API. Refused when this node
-    /// certifies only the identity files its operator put in identities_dir.
-    pub fn certify_request(&self, body: &Value) -> Result<(u16, Value), ApiError> {
-        if self.opts.held_only {
-            return Err(ApiError::new(403, "this node certifies only the identities its operator placed in its identities_dir \
-                (config \"certify\": \"identities_dir\"); ask the operator for an identity file"));
-        }
-        self.certify(body)
-    }
 
     /// POST /api/agents (loopback API): certify an agent of this host. Ok((status, {"cert": …})).
     pub fn certify(&self, body: &Value) -> Result<(u16, Value), ApiError> {
@@ -1332,7 +1318,14 @@ impl Node {
         }
         let names = names.unwrap_or_default();
         let to = match islandmail_core::room::dm_pair(room) {
-            Some((a, b)) => if norm(from) == a { b } else { a },
+            Some((a, b)) => {
+                let other = if norm(from) == a { b } else { a };
+                // Sealed without the other agent's key, a DM would never open for them.
+                if !agents.iter().chain(vouched.iter()).any(|x| islandmail_core::addr::same(&x.name, &other)) {
+                    return Err(ApiError::new(409, format!("{other}'s key has not reached this node yet; try again soon")));
+                }
+                other
+            }
             None => islandmail_core::room::room_to(room),
         };
         let mut keys = Vec::new();
@@ -2097,21 +2090,6 @@ mod tests {
         codes.sort();
         assert_eq!(codes, [201, 409]);
         assert_eq!(node.store.certs_at(Some("dana"), i64::MAX).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn held_only_refuses_requests_but_certifies_held_identities() {
-        let (mut mac, _, _, _) = homes();
-        let held = Seed::generate();
-        mac.opts.held_only = true;
-        mac.opts.identities.get_mut().unwrap().push(("h.held".into(), held.clone()));
-        let e = mac.certify_request(&proof(&Seed::generate(), "h.walkin", &mac)).unwrap_err();
-        assert_eq!(e.status, 403);
-        assert!(e.message.contains("identities_dir"), "{}", e.message);
-        assert_eq!(status(mac.certify_request(&proof(&held, "h.held", &mac))), 403, "requests are refused for any key");
-        mac.certify_identities();
-        assert_eq!(mac.verify(&token(&held, "h.held", &mac)).unwrap().sub, "agent:h.held");
-        assert!(mac.verify(&token(&Seed::generate(), "h.walkin", &mac)).is_err());
     }
 
     #[test]

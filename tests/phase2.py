@@ -72,9 +72,8 @@ def main():
         # the client refuses identity files other users can read
         write_private_json(path, {"name": agents[n], "sub": "agent:%s@test" % n, "id": pub[n], "seed": open(k(n)).read().strip()})
     def im(port, who, *args, timeout=60):
-        env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir,
-                   ISLANDMAIL_AS=agents[who])
-        p = subprocess.run([sys.executable, client, *args], capture_output=True, text=True, env=env, timeout=timeout, cwd=work)
+        env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir)
+        p = subprocess.run([sys.executable, client, "--as", agents[who], *args], capture_output=True, text=True, env=env, timeout=timeout, cwd=work)
         return p.returncode, (p.stdout + p.stderr).strip()
 
     # Agent tokens minted the way the client mints them (single-use, for one node's key).

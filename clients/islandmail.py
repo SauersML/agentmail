@@ -9,9 +9,9 @@
   python3 islandmail.py room new launch @ops.bob     # a private group chat; room send/read/add/leave
   python3 islandmail.py ui                           # a link to the room view in a browser
 
-Several identities on one machine: --as NAME (or ISLANDMAIL_AS). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
-readable only by you. Node: ISLANDMAIL_URL (default http://127.0.0.1:8787); ISLANDMAIL_NODE_KEY pins its key,
-otherwise the first key seen at the URL is kept in nodes.json.
+Several identities on one machine: --as NAME. Keys live in ~/.islandmail (ISLANDMAIL_DIR), readable only by you.
+Node: ISLANDMAIL_URL (default http://127.0.0.1:8787); the first key seen at that URL is kept in nodes.json and checked
+on every later use.
 """
 import argparse
 import base64
@@ -296,9 +296,8 @@ _joins_checked = []
 
 
 def _load_identity(name, create=True):
-    # Your identity: --as NAME / ISLANDMAIL_AS, else the only one here. None yet (first use): make a key and have the
+    # Your identity: --as NAME, else the only one here. None yet (first use): make a key and have the
     # local node certify it, under a name in this host's names.
-    name = name or os.environ.get("ISLANDMAIL_AS")
     folder = os.path.join(DIR, "identities")
     have = sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
     if not name:
@@ -509,7 +508,7 @@ def known_nodes_path():
 
 def node_info():
     # Before any token, seed or message goes out: the node signs a fresh nonce with the key we expect it to have
-    # (ISLANDMAIL_NODE_KEY, else the key this client saw at this URL first, kept in nodes.json). Whoever binds the port
+    # (the key this client saw at this URL first, kept in nodes.json). Whoever binds the port
     # while the node is down cannot sign, so the client stops. Checked once per process.
     if MAIL not in _node_info:
         nonce = b64u(os.urandom(24))
@@ -517,19 +516,17 @@ def node_info():
         if info.get("envelope_version") != 1 or "agent-token" not in info.get("auth", []):
             raise Fail("node must support envelope version 1 and agent tokens")
         key, proof = info.get("node"), info.get("proof") or {}
-        pin = os.environ.get("ISLANDMAIL_NODE_KEY", "").strip()
         known = {}
-        if not pin and os.path.exists(known_nodes_path()):
+        if os.path.exists(known_nodes_path()):
             try:
                 with open(known_nodes_path()) as f:
                     known = json.load(f)
             except ValueError:
                 raise Fail("%s is not JSON; fix or remove it" % known_nodes_path())
-        expected = pin or known.get(MAIL)
+        expected = known.get(MAIL)
         if expected and key != expected:
             raise Fail("the node at %s says its key is %s, not %s (%s). Another process may hold its port; if the "
-                       "node's key really changed, remove that entry from %s" % (
-                           MAIL, key, expected, "ISLANDMAIL_NODE_KEY" if pin else "seen here before", known_nodes_path()))
+                       "node's key really changed, remove that entry from %s" % (MAIL, key, expected, "seen here before", known_nodes_path()))
         if not (isinstance(key, str) and isinstance(proof.get("ts"), str) and isinstance(proof.get("sig"), str)
                 and ed25519_verify(key, proof["sig"], ("islandmail-node-proof|v1|%s|%s" % (nonce, proof["ts"])).encode())):
             raise Fail("the server at %s does not prove it holds the node key %s; not sending anything to it" % (MAIL, key))
@@ -674,7 +671,7 @@ def cmd_selftoken(a):
     if not 1 <= a.ttl <= MAX_TTL:
         raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
     ident = load_identity(a.as_)
-    key = a.node_key or os.environ.get("ISLANDMAIL_NODE_KEY", "").strip() or node_key()
+    key = a.node_key or node_key()
     print(agent_token(ident, key, a.ttl))
 
 
@@ -1696,7 +1693,7 @@ def hook_payload(ident, m):
 
 def arrival_hooks(a):
     # --exec CMD: CMD runs once per new message shown, as an argument list (never through a shell), with the event as
-    # JSON on stdin and its fields in ISLANDMAIL_* variables.
+    # JSON on stdin.
     hooks = []
     if a.exec_:
         argv = shlex.split(a.exec_, posix=os.name != "nt")
@@ -1707,15 +1704,8 @@ def arrival_hooks(a):
 
         def run_exec(ident, m):
             p = hook_payload(ident, m)
-            env = dict(os.environ, ISLANDMAIL_ID=str(m["id"]), ISLANDMAIL_FROM=_one_line(m["from"]),
-                       ISLANDMAIL_THREAD=_one_line(m.get("thread", "")), ISLANDMAIL_ROOM=_one_line(m.get("room") or ""),
-                       ISLANDMAIL_TO=_one_line(m["to"]), ISLANDMAIL_ME=ident["name"],
-                       ISLANDMAIL_SUB=_one_line(m.get("sub", "")), ISLANDMAIL_HOST=_one_line(m.get("host", "")),
-                       ISLANDMAIL_UNTRUSTED="1",
-                       ISLANDMAIL_PRIVATE="1" if p["private"] else "0", ISLANDMAIL_TO_ME="1" if p["to_me"] else "0",
-                       ISLANDMAIL_MENTION="1" if p["mention"] else "0")
             try:
-                r = subprocess.run(argv, input=json.dumps(p).encode(), env=env, timeout=HOOK_TIMEOUT)
+                r = subprocess.run(argv, input=json.dumps(p).encode(), timeout=HOOK_TIMEOUT)
                 if r.returncode == 0:
                     return True
                 sys.stderr.write("watch: --exec exited %d for %s\n" % (r.returncode, m["id"]))
@@ -2059,7 +2049,6 @@ def cmd_notify_off(a):
         if note:
             print(note)
     print("notifications off for %s (join and the hooks respect it; notify install turns them on again)" % name)
-    print("MCPL (Connectome) sessions: add %s to \"mcpl_push_off\" in the node's config and restart it" % json.dumps(name))
 
 
 def waiter_files(name):
@@ -2117,7 +2106,7 @@ def cmd_notify_status(a):
             pass
         except (Fail, OSError, KeyError) as x:
             print("  node: %s" % x)
-    print("MCPL (Connectome): the node pushes mail to every identity unless its config's \"mcpl_push_off\" lists it")
+    print("MCPL (Connectome): the node pushes mail to every identity")
     print("other harnesses: islandmail.py watch --mine --exec CMD")
 
 
@@ -2332,11 +2321,11 @@ def main():
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one; on first use, a name in this host's names)")
+    ap.add_argument("--as", dest="as_", help="which identity to use (default: the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("selftoken", help="print one single-use agent token for the node (signed by your own key)")
     p.add_argument("--ttl", type=int, default=STREAM_TTL, help="seconds it stays valid, at most 86400 (default 3600)")
-    p.add_argument("--node-key", help="the node's key (default: ISLANDMAIL_NODE_KEY, or ask the node)")
+    p.add_argument("--node-key", help="the node's key (default: ask the node)")
     p.set_defaults(fn=cmd_selftoken)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     p = sub.add_parser("join", help="join a network with an invite: sets up this host's node if there is none")
@@ -2468,7 +2457,7 @@ def main():
     p.add_argument("--until", action="store_true", help="exit after the first message printed")
     p.add_argument("--from-now", action="store_true", help="skip mail that is already here; only what arrives from now on")
     p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
-    p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin, ISLANDMAIL_* env; no shell)")
+    p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin; no shell)")
     p.set_defaults(fn=cmd_watch)
     note = sub.add_parser("notify", help="new mail wakes your agent in its harness: install (Claude Code), off, status")
     nsub = note.add_subparsers(dest="notify_cmd", required=True)

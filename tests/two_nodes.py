@@ -293,25 +293,19 @@ def main():
 
         # islandmail.py against node A, unchanged, only ISLANDMAIL_URL/ISLANDMAIL_DIR set.
         def im(port, who, *args, timeout=30):
-            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=os.path.join(work, "idsA" if who == "alice" else "idsB"), ISLANDMAIL_AS=agents[who])
-            p = subprocess.run([sys.executable, a.islandmail, *args], capture_output=True, text=True, env=env, timeout=timeout)
+            env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=os.path.join(work, "idsA" if who == "alice" else "idsB"))
+            p = subprocess.run([sys.executable, a.islandmail, "--as", agents[who], *args], capture_output=True, text=True, env=env, timeout=timeout)
             return p.returncode, (p.stdout + p.stderr).strip()
 
         rc, out = im(pa, "alice", "whoami")
         check("islandmail.py whoami (A)", rc == 0 and "t.alice" in out, out)
         # bob waits on B for his next mail; alice sends it with islandmail.py on A.
-        envb = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % pb, ISLANDMAIL_DIR=os.path.join(work, "idsB"), ISLANDMAIL_AS="t.bob")
-        wrong_pin = dict(envb, ISLANDMAIL_NODE_KEY=pub["nodeA"])
-        offline = subprocess.run([sys.executable, a.islandmail, "selftoken"],
-                                 env=dict(wrong_pin, ISLANDMAIL_URL="http://127.0.0.1:1"),
-                                 capture_output=True, timeout=10)
+        envb = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % pb, ISLANDMAIL_DIR=os.path.join(work, "idsB"))
+        offline = subprocess.run([sys.executable, a.islandmail, "--as", "t.bob", "selftoken", "--node-key", pub["nodeA"]],
+                                 env=dict(envb, ISLANDMAIL_URL="http://127.0.0.1:1"), capture_output=True, timeout=10)
         check("selftoken with an explicit audience works offline", offline.returncode == 0 and offline.stdout.startswith(b"v4.public."))
-        mismatch = subprocess.run([sys.executable, a.islandmail, "whoami"], env=wrong_pin,
-                                  capture_output=True, text=True, timeout=10)
-        check("an online command detects a mismatched public key before sign-in",
-              mismatch.returncode == 1 and "(ISLANDMAIL_NODE_KEY)" in mismatch.stderr, mismatch.stderr[-200:])
         def watch():
-            return subprocess.Popen([sys.executable, a.islandmail, "watch", "--mine", "--until", "--name", "it"],
+            return subprocess.Popen([sys.executable, a.islandmail, "--as", "t.bob", "watch", "--mine", "--until", "--name", "it"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)
         watcher = watch()
         try:

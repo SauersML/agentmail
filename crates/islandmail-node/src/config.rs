@@ -8,11 +8,7 @@ use islandmail_core::MemberList;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Config format version (islandmail_core::versions::CONFIG).
-    #[serde(default = "one")]
-    pub v: u32,
     pub data_dir: PathBuf,
     /// Loopback HTTP API, e.g. "127.0.0.1:8787"
     #[serde(default = "default_api")]
@@ -23,8 +19,6 @@ pub struct Config {
     /// Relay origins shared by peers, or "n0" for iroh's public relay set. Empty means direct only.
     #[serde(default)]
     pub relay: Vec<String>,
-    #[serde(default = "default_key_retention")]
-    pub encryption_key_retention_days: u32,
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
     pub members_file: PathBuf,
@@ -32,35 +26,15 @@ pub struct Config {
     /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
     #[serde(default)]
     pub identities_dir: Option<PathBuf>,
-    /// Who may get a certificate here: "open" (default: any local user or process, through POST /api/agents) or
-    /// "identities_dir" (only the identity files the operator put in identities_dir; POST /api/agents is refused).
-    #[serde(default)]
-    pub certify: Certify,
+    /// Seconds between anti-entropy rounds with every peer.
     #[serde(default = "default_sync")]
     pub sync_secs: u64,
-    /// Base URL for attachment links in formatted mail (default http://<api_listen>).
-    #[serde(default)]
-    pub public_url: Option<String>,
-    /// Agent names (exact, any case) that opted out of MCPL notifications: their MCPL sessions get the tools but no
-    /// push/event and no channel deliveries. Everyone else is pushed to by default.
-    #[serde(default)]
-    pub mcpl_push_off: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Certify {
-    #[default]
-    Open,
-    IdentitiesDir,
-}
+const KEYS: [&str; 8] = ["data_dir", "api_listen", "iroh_port", "relay", "node_key_file", "members_file", "identities_dir", "sync_secs"];
 
 fn default_api() -> String {
     "127.0.0.1:8787".into()
-}
-fn default_key_retention() -> u32 { 14 }
-fn one() -> u32 {
-    1
 }
 
 fn default_sync() -> u64 {
@@ -72,8 +46,12 @@ impl Config {
         // Whoever can change the config or the trust file decides what this node trusts: only this user (or root).
         crate::private_fs::check_writers(path).context("refusing the config")?;
         let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let mut c: Config = serde_json::from_slice(&raw).context("config is not valid")?;
-        anyhow::ensure!(c.v == islandmail_core::versions::CONFIG, "unsupported config version {}", c.v);
+        let v: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&raw).context("config is not valid")?;
+        let unknown: Vec<&str> = v.keys().map(String::as_str).filter(|k| !KEYS.contains(k)).collect();
+        if !unknown.is_empty() {
+            tracing::warn!("config {}: ignoring unknown keys {}", path.display(), unknown.join(", "));
+        }
+        let mut c: Config = serde_json::from_value(v.into()).context("config is not valid")?;
         let base = path.parent().unwrap_or(Path::new("."));
         let fix = |p: &mut PathBuf| {
             if p.is_relative() {
@@ -218,6 +196,17 @@ pub fn read_or_create_seed(path: &Path) -> Result<Seed> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_config_keys_are_ignored() {
+        let dir = std::env::temp_dir().join(format!("islandmail-config-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
+        crate::private_fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m", "certify": "open"}"#).unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!((c.data_dir, c.sync_secs), (dir.join("d"), 30));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_first_starts_share_one_complete_private_seed() {

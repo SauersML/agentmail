@@ -88,26 +88,14 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// The Host header values this node answers to: the loopback names with the API's port (and the listen address as
-/// written), plus config "public_url"'s host and port when set (a tunnel or proxy on another port). A page whose
+/// written). A page whose
 /// own name a DNS rebinding pointed at 127.0.0.1 sends that name, so it reads nothing, GETs included.
-pub fn allowed_hosts(listen: std::net::SocketAddr, public_url: Option<&str>) -> Vec<String> {
+pub fn allowed_hosts(listen: std::net::SocketAddr) -> Vec<String> {
     let port = listen.port();
     let mut out: Vec<String> = ["127.0.0.1", "localhost", "[::1]"].iter().map(|h| format!("{h}:{port}")).collect();
     out.push(listen.to_string());
     if port == 80 {
         out.extend(["127.0.0.1", "localhost", "[::1]"].map(String::from));
-    }
-    if let Some(u) = public_url.and_then(|u| url::Url::parse(u).ok()) {
-        if let Some(h) = u.host_str() {
-            let h = h.to_ascii_lowercase();
-            match u.port() {
-                Some(p) => out.push(format!("{h}:{p}")),
-                None => {
-                    out.push(h.clone());
-                    if let Some(p) = u.port_or_known_default() { out.push(format!("{h}:{p}")); }
-                }
-            }
-        }
     }
     out.sort();
     out.dedup();
@@ -129,7 +117,7 @@ pub fn guarded(app: Router, allowed: Vec<String>) -> Router {
             if host_allowed(req.headers(), &allowed) {
                 next.run(req).await
             } else {
-                ApiError::new(403, format!("this node answers requests for Host {} only (config public_url adds one)",
+                ApiError::new(403, format!("this node answers requests for Host {} only",
                                            allowed.join(", "))).into_response()
             }
         }
@@ -361,7 +349,7 @@ fn local_json(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
 async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
     let node = s.node.clone();
-    let (status, out) = tokio::task::spawn_blocking(move || node.certify_request(&v))
+    let (status, out) = tokio::task::spawn_blocking(move || node.certify(&v))
         .await
         .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
     Ok(json_resp(out, status))
@@ -748,7 +736,7 @@ mod tests {
 
     #[test]
     fn only_loopback_hosts_with_the_api_port_pass() {
-        let allowed = allowed_hosts("127.0.0.1:8787".parse().unwrap(), None);
+        let allowed = allowed_hosts("127.0.0.1:8787".parse().unwrap());
         for ok in ["127.0.0.1:8787", "localhost:8787", "LOCALHOST:8787", "[::1]:8787"] {
             assert!(host_allowed(&host(ok), &allowed), "{ok}");
         }
@@ -758,13 +746,9 @@ mod tests {
             assert!(!host_allowed(&host(bad), &allowed), "{bad}");
         }
         assert!(!host_allowed(&HeaderMap::new(), &allowed), "no Host at all");
-        // Another loopback address as listened on, and config public_url (a tunnel on another port, or a proxy).
-        let allowed = allowed_hosts("127.0.0.2:9000".parse().unwrap(), Some("http://127.0.0.1:18787/"));
-        assert!(host_allowed(&host("127.0.0.2:9000"), &allowed) && host_allowed(&host("127.0.0.1:18787"), &allowed));
-        assert!(!host_allowed(&host("127.0.0.1:8787"), &allowed));
-        let allowed = allowed_hosts("[::1]:8787".parse().unwrap(), Some("https://mail.example.org"));
-        assert!(host_allowed(&host("mail.example.org"), &allowed) && host_allowed(&host("mail.example.org:443"), &allowed));
-        assert!(!host_allowed(&host("other.example.org"), &allowed));
+        // Another loopback address as listened on.
+        let allowed = allowed_hosts("127.0.0.2:9000".parse().unwrap());
+        assert!(host_allowed(&host("127.0.0.2:9000"), &allowed) && !host_allowed(&host("127.0.0.1:8787"), &allowed));
     }
 
     #[test]

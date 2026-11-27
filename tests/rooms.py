@@ -61,16 +61,15 @@ def main():
     def cl(agent, *args, timeout=60):
         h = home[agent]
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
-                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
-        env.pop("ISLANDMAIL_NODE_KEY", None)
-        p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
+                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h])
+        p = subprocess.run([sys.executable, im, "--as", agent, *args], env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout + p.stderr).strip()
 
     def bg(agent, *args):
         h = home[agent]
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
-                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
-        return subprocess.Popen([sys.executable, im, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h])
+        return subprocess.Popen([sys.executable, im, "--as", agent, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     def js(agent, *args):
         rc, out = cl(agent, *args, "--json")
@@ -227,8 +226,8 @@ def main():
                        "members_file": os.path.join(work, "trust.json")}, f)
         group_chat_checks(cl, js, req, api, owner_cfg, bin_)
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-mac"), USER="agent",
-                   ISLANDMAIL_URL="https://mail.example.invalid", ISLANDMAIL_AS="alice")
-        p = subprocess.run([sys.executable, im, "ui", "--post"], env=env, capture_output=True, text=True, timeout=60)
+                   ISLANDMAIL_URL="https://mail.example.invalid")
+        p = subprocess.run([sys.executable, im, "--as", "alice", "ui", "--post"], env=env, capture_output=True, text=True, timeout=60)
         check("ui --post never sends the agent key to a node off this machine", p.returncode != 0
               and "loopback" in p.stderr, (p.stdout + p.stderr)[-160:])
         mcpl_checks(api, cl, token)

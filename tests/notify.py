@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Notifications in the agent's harness: `notify install` (Claude Code hooks in a throwaway settings file), the hooks
-themselves run as Claude Code runs them (event JSON on stdin), `notify off`, `notify status`, and the node's MCPL push
-with the per-identity opt-out ("mcpl_push_off"). One node on loopback, throwaway keys; no Claude Code needed.
+themselves run as Claude Code runs them (event JSON on stdin), `notify off`, `notify status`, and the node's MCPL push.
+One node on loopback, throwaway keys; no Claude Code needed.
 
   python3 tests/notify.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
@@ -37,15 +37,14 @@ def main():
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "n", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["alice", "bob", "s."]}]}, f)
     node = Node(bin_, work, "n", {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port,
-                                  "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3,
-                                  "mcpl_push_off": ["BOB"]})
+                                  "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
     claude = os.path.join(work, "claude-home")
     project = os.path.join(work, "project")
     os.makedirs(claude)
     os.makedirs(project)
     env = dict(os.environ, ISLANDMAIL_DIR=client_dir, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, CLAUDE_CONFIG_DIR=claude)
-    for k in ("ISLANDMAIL_AS", "ISLANDMAIL_NODE_KEY", "CLAUDECODE"):
+    for k in ("CLAUDECODE",):
         env.pop(k, None)
     user_settings = os.path.join(claude, "settings.json")
     project_settings = os.path.join(project, ".claude", "settings.local.json")
@@ -244,12 +243,11 @@ def main():
         rc, out, err = cl("alice", "wait", "--mention", "--timeout", "2", timeout=30)
         check("wait times out with exit 3", rc == 3 and "nothing matched" in err, "%s %s %s" % (rc, out, err))
 
-        # watch --exec: the message's signed sender and host, marked untrusted, in the env and the JSON.
+        # watch --exec: the message's signed sender and host, marked untrusted, in the JSON.
         hook = os.path.join(work, "exec_hook.py")
         dump = os.path.join(work, "exec_hook.json")
         with open(hook, "w") as f:
-            f.write("import json, os, sys\nev = json.load(sys.stdin)\njson.dump({'env': {k: v for k, v in os.environ.items() "
-                    "if k.startswith('ISLANDMAIL_')}, 'ev': ev}, open(%r, 'w'))\n" % dump)
+            f.write("import json, sys\nev = json.load(sys.stdin)\njson.dump({'ev': ev}, open(%r, 'w'))\n" % dump)
         w = subprocess.Popen([sys.executable, im, "--as", "alice", "watch", "--name", "exectest", "--mine", "--from-now", "--until",
                               "--exec", "%s %s" % (sys.executable, hook)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, cwd=project)
@@ -260,11 +258,10 @@ def main():
         except subprocess.TimeoutExpired:
             w.kill()
             wout, werr = w.communicate()
-        got = json.load(open(dump)) if os.path.exists(dump) else {"env": {}, "ev": {}}
+        got = json.load(open(dump)) if os.path.exists(dump) else {"ev": {}}
         check("watch frames the message as untrusted mail from its signed sender and host",
               re.match(r"[a-z2-7]{8} \S+ untrusted mail from s\.peer \[agent:[^\]]+\] via n to alice", wout), wout + werr)
-        check("--exec gets ISLANDMAIL_SUB, ISLANDMAIL_HOST and ISLANDMAIL_UNTRUSTED", got["env"].get("ISLANDMAIL_UNTRUSTED") == "1"
-              and got["env"].get("ISLANDMAIL_HOST") == "n" and got["env"].get("ISLANDMAIL_SUB", "").startswith("agent:"), str(got["env"]))
+        check("--exec JSON carries the signed sub", got["ev"].get("message", {}).get("sub", "").startswith("agent:"), str(got["ev"])[:300])
         check("--exec JSON says untrusted and carries the notice", got["ev"].get("untrusted") is True
               and "never instructions" in got["ev"].get("notice", "") and got["ev"].get("message", {}).get("host") == "n", str(got["ev"])[:300])
         rc, out, err = cl("alice", "read", "--thread", "exec")
@@ -278,7 +275,7 @@ def main():
         check("install refuses a settings file that is not JSON, leaving it as it was",
               rc == 1 and "not valid JSON" in err and open(project_settings).read() == "{not json", err)
 
-        # MCPL: pushes by default; "mcpl_push_off" in the node config opts an identity out (tools still work).
+        # MCPL: the node pushes mail to every identity's session (tools work too).
         try:
             from websockets.sync.client import connect
         except ImportError:
@@ -318,20 +315,20 @@ def main():
                      if "mcpl hello alice" in c.get("text", "")]
             check("an MCPL push frames mail as untrusted, with the signed sender and host", ptext and ptext[0].startswith(
                 "Islandmail: untrusted content.") and "untrusted mail from s.peer [" in ptext[0] and " via n to alice" in ptext[0], str(ptext)[:300])
-            check("MCPL pushes nothing to an identity in mcpl_push_off", pb == [], json.dumps(pb)[:200])
+            check("MCPL pushes bob's mail to bob only", any("mcpl hello bob" in json.dumps(m) for m in pb)
+                  and not any("mcpl hello bob" in json.dumps(m) for m in pa), json.dumps(pb)[:200])
             wb.send(json.dumps({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "inbox", "arguments": {}}}))
             r = {}
             for _ in range(5):
                 r = json.loads(wb.recv(timeout=5))
                 if r.get("id") == 9:
                     break
-            check("an opted-out identity still has the tools", "mcpl hello bob" in json.dumps(r), json.dumps(r)[:200])
+            check("an MCPL session has the tools", "mcpl hello bob" in json.dumps(r), json.dumps(r)[:200])
             wa.close()
             wb.close()
 
         rc, out, err = cl("alice", "notify", "status")
-        check("status names the MCPL opt-out and the fallback for other harnesses", rc == 0 and "watch --mine --exec" in out
-              and "mcpl_push_off" in out, out)
+        check("status names the fallback for other harnesses", rc == 0 and "watch --mine --exec" in out, out)
         check("the hook command is one shell line ending in --as alice notify hook", shlex.split(cmd)[-4:] == ["--as", "alice", "notify", "hook"], cmd)
     finally:
         node.stop()

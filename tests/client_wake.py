@@ -23,9 +23,8 @@ if os.environ.get("FAILS_FILE"):  # a hook that is down: exits 75 while FAILS_FI
     if fails:
         open(os.environ["FAILS_FILE"], "w").write(str(fails - 1))
         sys.exit(75)
-env = {k: v for k, v in os.environ.items() if k.startswith("ISLANDMAIL_")}
 with open(sys.argv[1], "a") as f:
-    f.write(json.dumps({"argv": sys.argv[2:], "event": event, "env": env}) + "\n")
+    f.write(json.dumps({"argv": sys.argv[2:], "event": event}) + "\n")
 '''
 
 
@@ -50,8 +49,6 @@ def main():
                                     "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
     env = dict(os.environ, ISLANDMAIL_DIR=client_dir, ISLANDMAIL_URL="http://127.0.0.1:%d" % port)
-    env.pop("ISLANDMAIL_AS", None)
-    env.pop("ISLANDMAIL_NODE_KEY", None)
 
     def cl(who, *args, timeout=60):
         p = subprocess.run([sys.executable, im, "--as", who, *args], env=env, capture_output=True, text=True,
@@ -127,7 +124,7 @@ def main():
         rc, out, _ = finish(p)
         check("watch --from-now skips the backlog and wakes for new mail", rc == 0 and "> fresh" in out and "> backlog" not in out, out[-200:])
 
-        # --exec: argv list, never a shell; JSON on stdin; ISLANDMAIL_* variables.
+        # --exec: argv list, never a shell; JSON on stdin.
         hook = os.path.join(work, "hook.py")
         with open(hook, "w") as f:
             f.write(HOOK)
@@ -143,17 +140,16 @@ def main():
         check("the hook got the message as JSON on stdin", ev.get("event", {}).get("message", {}).get("text") == nasty
               and ev["event"]["me"] == "alice" and ev["event"]["to_me"] is True and ev["event"]["private"] is False)
         check("arguments are split like a shell would, but nothing is expanded", ev.get("argv") == ["two words", "$HOME"], str(ev.get("argv")))
-        e = ev.get("env", {})
-        check("ISLANDMAIL_* variables", e.get("ISLANDMAIL_ID") == str(mid) and e.get("ISLANDMAIL_FROM") == "s.peer"
-              and e.get("ISLANDMAIL_THREAD") == "wake" and e.get("ISLANDMAIL_PRIVATE") == "0"
-              and e.get("ISLANDMAIL_TO_ME") == "1" and e.get("ISLANDMAIL_MENTION") == "0", str(e))
+        m = ev.get("event", {}).get("message", {})
+        check("the JSON names the message, sender and thread", str(m.get("id")) == str(mid) and m.get("from") == "s.peer"
+              and m.get("thread") == "wake" and ev["event"]["mention"] is False, str(ev)[:300])
         check("no shell ran the sender's text", not os.path.exists(pwned))
         p = background_watch("--exec", "%s %s %s" % (sys.executable, hook, got))
         rc_s, _, _ = cl("s.peer", "send", "--to", "alice", "secret")
         rc, out, err = finish(p)
         events = [json.loads(line) for line in open(got)]
         check("private mail is flagged", rc_s == 0 and rc == 0 and len(events) == 2
-              and events[1]["env"].get("ISLANDMAIL_PRIVATE") == "1" and events[1]["event"]["private"] is True, err[-200:])
+              and events[1]["event"]["private"] is True, err[-200:])
 
         # A failed hook does not lose the wake (issue #23): it is retried, and if it stays down watch exits non-zero
         # with the cursor before the message, so the next watch with that --name delivers it again.
@@ -166,7 +162,7 @@ def main():
         rc, out, err = finish(p, timeout=40)
         events = [json.loads(line) for line in open(got2)] if os.path.exists(got2) else []
         check("a hook that fails once is retried and gets the mail once", rc == 0 and len(events) == 1
-              and events[0]["env"].get("ISLANDMAIL_ID") == str(m_flaky) and "exited 75" in err, err[-300:])
+              and str(events[0]["event"]["message"]["id"]) == str(m_flaky) and "exited 75" in err, err[-300:])
         check("and the cursor moves past it", open(cursor("hooks")).read().strip() == str(seq(m_flaky)))
         open(fails, "w").write("100")
         p = background_watch("--name", "hooks", "--exec", "%s %s %s" % (sys.executable, hook, got2))
@@ -180,7 +176,7 @@ def main():
                           "%s %s %s" % (sys.executable, hook, got2), timeout=30)
         events = [json.loads(line) for line in open(got2)]
         check("re-armed without --from-now, the working hook gets the mail it missed", rc == 0 and len(events) == 2
-              and events[1]["env"].get("ISLANDMAIL_ID") == str(m_down), err[-300:])
+              and str(events[1]["event"]["message"]["id"]) == str(m_down), err[-300:])
         check("and now the cursor moves past it", open(cursor("hooks")).read().strip() == str(seq(m_down)))
         with open(cursor("main"), "w") as f:
             f.write(str(seq(m_down)))  # the default watcher below starts after these

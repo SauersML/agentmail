@@ -101,8 +101,6 @@ def main():
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, host, "client"), ISLANDMAIL_URL="http://127.0.0.1:%d" % api,
                    RUST_BACKTRACE="1", CLAUDE_CONFIG_DIR=os.path.join(work, host, "claude"))
         env.pop("CLAUDECODE", None)
-        env.pop("ISLANDMAIL_AS", None)
-        env.pop("ISLANDMAIL_NODE_KEY", None)
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout.strip(), p.stderr.strip()
 
@@ -197,7 +195,7 @@ def main():
         # The inviter's lines: alice's next command (which also does the room add), and one in her inbox from bob.
         # Bounds are generous (sync under a loaded CI host can take a while); each wait ends as soon as the line is there.
         said = []
-        got, t = wait_for(lambda: said.append(cl("a", "rooms")) or "added to alice/plan" in said[-1][2], timeout=120, every=1)
+        got, t = wait_for(lambda: said.append(cl("a", "rooms")) or "; added to alice/plan" in said[-1][2], timeout=120, every=1)
         check("alice's next command says bob joined and adds bob to alice/plan", got,
               "%.1fs %s" % (t, said[-1][2][-300:] if said else ""))
         got, t = wait_for(lambda: [m for m in js("a", "read", "--to-me") or [] if "joined with your invite" in m.get("text", "")],

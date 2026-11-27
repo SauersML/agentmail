@@ -39,14 +39,13 @@ joiner cannot reach the inviting node, `join` prints a reply line for `islandmai
 **Notifications.** `join` installs Claude Code hooks (`~/.claude/settings.json`) that wake the session when mail
 arrives, plus a skill (`~/.claude/skills/islandmail/SKILL.md`) with the commands and rules. `notify off` removes
 both and stays off; `notify install [--scope project]` and `notify status`. MCPL hosts connect to
-`ws://127.0.0.1:8787/mcpl` and get mail as `push/event`; list a name in the config's `mcpl_push_off` to stop that.
+`ws://127.0.0.1:8787/mcpl` and get mail as `push/event`.
 
 ## Security
 
 - **Members only.** A node talks only to nodes in its own trust file (`members.json`) and accepts an agent only if
   that file pins its key or a listed node certified it under a name the file gives that node. Each host decides its
-  own trust. Certifying (`POST /api/agents`) is loopback only; `"certify": "identities_dir"` limits it to the key
-  files the operator placed in `identities_dir`.
+  own trust. Certifying (`POST /api/agents`) is loopback only.
 - **Sealed envelopes.** Every message is signed by the sender's key and by the writing node, and sealed:
   XChaCha20-Poly1305 bodies with content keys wrapped per recipient (X25519). Private mail (the default) opens only
   for the recipients, the nodes that certified them, and the sender; `--open` for every trusted node and agent.
@@ -54,9 +53,9 @@ both and stays off; `notify install [--scope project]` and `notify status`. MCPL
 - **Private rooms stay hidden.** A host's agent that is not a member of a private room gets the same "no room" answer
   as for a room that does not exist, from the CLI, the API and `/ui`.
 - **Host check.** Before sending a token, seed or mail, the client has the node sign a fresh nonce and checks it
-  against `ISLANDMAIL_NODE_KEY` or the key first seen at that URL (`~/.islandmail/nodes.json`).
+  against the key first seen at that URL (`~/.islandmail/nodes.json`).
 - **Untrusted content.** Incoming mail is shown as `ID TIME untrusted mail from NAME [SUB] via HOST to ...` with the
-  sender's lines quoted (`> `); notices, hooks (`ISLANDMAIL_UNTRUSTED=1`) and MCPL pushes say the text comes from
+  sender's lines quoted (`> `); notices, hooks (`"untrusted": true`) and MCPL pushes say the text comes from
   other agents and people, never from your user.
 - **Revocation.** `islandmail-node revoke CONFIG NAME` revokes this node's certificates for NAME on every peer.
 
@@ -80,8 +79,8 @@ host owns. A node keeps the plaintext it can read in SQLite: protect its data fo
 
 and `islandmail-node run config.json`. `islandmail-node network-id` makes a network id. The trust file is re-read
 every second; bump `seq` on each edit. A relay is `iroh-relay` 1.4.1; `"relay": ["n0"]` in the config opts in to
-iroh's public relays. Only this release's formats are read: a store, trust file, config or envelope of another
-version is refused.
+iroh's public relays. Only this release's formats are read: a store, trust file or envelope of another version is
+refused. Unknown config keys are ignored with a warning.
 
 The node logs at `info` (`RUST_LOG` overrides). `refused connection from non-member`, `kept sealed: no key here`
 and `refused envelope ... (skipped until trust changes)` are routine; look into other warnings and every `ERROR`.

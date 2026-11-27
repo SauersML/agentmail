@@ -312,30 +312,6 @@ async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-/// Mean seconds between cover messages.
-const COVER_MEAN_SECS: f64 = 120.0;
-
-/// An exponential wait (a Poisson process), capped at ten means.
-fn cover_delay() -> Duration {
-    let u = (u64::from_le_bytes(islandmail_core::random_bytes::<8>()) >> 11) as f64 / (1u64 << 53) as f64;
-    Duration::from_secs_f64((-(1.0 - u).ln() * COVER_MEAN_SECS).min(10.0 * COVER_MEAN_SECS))
-}
-
-/// `{"cover":"…"}` with random content of a 1 or 4 KiB envelope's size (ciphertext, slots and signature).
-fn cover_message() -> Vec<u8> {
-    let bucket = if islandmail_core::random_bytes::<1>()[0] < 192 { 1 << 10 } else { 4 << 10 };
-    let mut filled = vec![0u8; bucket + 40 + 4 * 64 + 220];
-    for chunk in filled.chunks_mut(32) {
-        let r = islandmail_core::random_bytes::<32>();
-        chunk.copy_from_slice(&r[..chunk.len()]);
-    }
-    serde_json::to_vec(&serde_json::json!({ "cover": islandmail_core::b64u(&filled) })).expect("json")
-}
-
-fn is_cover(msg: &[u8]) -> bool {
-    msg.starts_with(br#"{"cover":"#)
-}
-
 async fn connect_sync(endpoint: &Endpoint, peer: EndpointId) -> Result<Connection> {
     Ok(endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?)
 }
@@ -643,7 +619,7 @@ pub async fn start(cfg: &Config, node: Arc<Node>, outbound: mpsc::Receiver<Envel
 }
 
 async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<Node>, mut outbound: mpsc::Receiver<Envelope>) -> Result<Net> {
-    let keys = crate::encryption_keys::EncryptionKeys::new(&cfg.data_dir, cfg.encryption_key_retention_days)?;
+    let keys = crate::encryption_keys::EncryptionKeys::new(&cfg.data_dir)?;
     let network = node.members.read().unwrap().network.clone();
     *node.encryption_key.write().unwrap() = Some(keys.rotate(&node.seed, &network, islandmail_core::now_millis())?);
     *node.epoch_keys.write().unwrap() = keys.retained()?;
@@ -689,9 +665,6 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         while let Some(ev) = receiver.next().await {
             match ev {
                 Ok(Event::Received(msg)) => {
-                    if is_cover(&msg.content) {
-                        continue;
-                    }
                     if let Some(r) = trust_message(&c.node, &msg.content) {
                         match r {
                             Ok(true) => tracing::info!("gossip: new certificate or revocation"),
@@ -738,18 +711,6 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             }
             if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
                 tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
-            }
-        }
-    }));
-
-    // Cover traffic: at random times (on average every COVER_MEAN_SECS) a dummy the size of a small envelope, so
-    // an observer of one link cannot tell from activity alone when this node wrote mail. Receivers drop it.
-    let c = ctx.clone();
-    tasks.push(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(cover_delay()).await;
-            if let Err(e) = c.sender.broadcast(Bytes::from(cover_message())).await {
-                tracing::debug!("cover traffic: {e}");
             }
         }
     }));
@@ -859,18 +820,6 @@ mod tests {
     use islandmail_core::envelope::Draft;
     use islandmail_core::keys::{fmt_key, Seed};
     use islandmail_core::{Attest, Body, Mode, NodeEntry, Verified};
-
-
-    #[test]
-    fn cover_messages_look_like_small_envelopes_and_are_dropped() {
-        let sizes: std::collections::HashSet<usize> = (0..200).map(|_| cover_message().len()).collect();
-        assert!(sizes.len() <= 2 && sizes.iter().all(|&n| (1500..7000).contains(&n)), "{sizes:?}");
-        let m = cover_message();
-        assert!(is_cover(&m));
-        assert!(serde_json::from_slice::<Envelope>(&m).is_err(), "never taken for mail");
-        let mean = (0..2000).map(|_| cover_delay().as_secs_f64()).sum::<f64>() / 2000.0;
-        assert!((80.0..160.0).contains(&mean), "mean wait {mean}");
-    }
 
     #[tokio::test]
     async fn join_connections_beyond_the_cap_are_closed_at_once() -> Result<()> {

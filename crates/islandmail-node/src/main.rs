@@ -148,8 +148,6 @@ async fn run(path: &Path) -> Result<()> {
     if !members.is_node(&seed.public()) {
         bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));
     }
-    let held_only = cfg.certify == config::Certify::IdentitiesDir;
-    anyhow::ensure!(!held_only || cfg.identities_dir.is_some(), "\"certify\": \"identities_dir\" needs identities_dir");
     let mut stamp = cfg.identities_stamp();
     let identities = cfg.held(&members);
     tracing::info!(
@@ -164,11 +162,9 @@ async fn run(path: &Path) -> Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities: std::sync::RwLock::new(identities),
-        held_only,
-        public_url: cfg.public_url.clone().unwrap_or_else(|| format!("http://{}", cfg.api_listen)),
+        public_url: format!("http://{}", cfg.api_listen),
         members_file: Some(cfg.members_file.clone()),
         relay: cfg.relay.clone(),
-        push_off: cfg.mcpl_push_off.iter().map(|n| n.trim().to_lowercase()).collect(),
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
@@ -202,7 +198,7 @@ async fn run(path: &Path) -> Result<()> {
     };
     tracing::info!("HTTP API on http://{} ({} envelopes stored)", cfg.api_listen, node.store.count()?);
     let cap = api::max_connections(open_files);
-    let hosts = api::allowed_hosts(listen, cfg.public_url.as_deref());
+    let hosts = api::allowed_hosts(listen);
     tracing::info!("API: at most {cap} connections at once ({open_files} open files allowed); Host {}", hosts.join(", "));
     api::serve(listener, api::guarded(api::router(state), hosts), cap, async {
         let _ = tokio::signal::ctrl_c().await;

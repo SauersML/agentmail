@@ -54,8 +54,6 @@ def main():
 
     def cl(h, *args):
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h])
-        env.pop("ISLANDMAIL_AS", None)
-        env.pop("ISLANDMAIL_NODE_KEY", None)
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=120, cwd=work)
         return p.returncode, (p.stdout + p.stderr).strip()
 

@@ -141,7 +141,6 @@ def local():
 
     with tempfile.TemporaryDirectory() as d:
         im.DIR, im.MAIL = os.path.join(d, "keys"), "http://127.0.0.1:%d" % srv.server_address[1]
-        os.environ.pop("ISLANDMAIL_NODE_KEY", None)
         assert info_fails() is None and im.node_key() == REAL
         with open(im.known_nodes_path()) as f:
             assert json.load(f) == {im.MAIL: REAL}
@@ -154,10 +153,6 @@ def local():
         # A server with a key of its own (and a good proof for it) at a URL this client knows.
         e = info_fails(seed=other_seed, claim=key_of(other_seed), proof="good")
         assert e and "not %s" % REAL in e and "nodes.json" in e, e
-        os.environ["ISLANDMAIL_NODE_KEY"] = key_of(os.urandom(32))
-        e = info_fails(seed=real_seed, claim=REAL, proof="good")
-        assert e and "ISLANDMAIL_NODE_KEY" in e, e
-        os.environ.pop("ISLANDMAIL_NODE_KEY")
     srv.shutdown()
     print("ok: the node signs a fresh nonce with the expected key before anything is sent")
 
