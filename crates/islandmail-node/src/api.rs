@@ -481,6 +481,9 @@ async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: 
 pub fn messages_json(node: &Node, rows: &[crate::store::Row], who: &Caller) -> Vec<Value> {
     rows.iter().map(|r| {
         let mut m = r.to_message();
+        // The node that wrote and signed the envelope, by this host's name for it.
+        m["host"] = json!(node.host_name(&r.writer));
+        m["node"] = json!(r.writer);
         if let Some(q) = r.reply_to.as_deref().and_then(|e| node.store.by_env(e, who).ok().flatten()) {
             let text: String = q.text.unwrap_or_default().chars().take(280).collect();
             m["quote"] = json!({ "id": islandmail_core::short_id(&q.env_id), "seq": q.id, "from": q.sender, "ts": q.ts, "text": text });

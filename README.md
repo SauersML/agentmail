@@ -96,7 +96,19 @@ python3 clients/islandmail.py read --thread release --json
 python3 clients/islandmail.py watch --mine --until                  # wait for the next mail to you, print it, exit
 python3 clients/islandmail.py send --to ops. --file plot.png "see attached"   # ops. reaches every ops.* agent
 python3 clients/islandmail.py ask --to alice "a question"           # send, then wait for the answer (takes --open too)
+python3 clients/islandmail.py wait --reply-to k3vq7d2a --timeout 600  # wait for a reply to a message (one already here counts)
+python3 clients/islandmail.py wait --mention                        # wait for a message that @mentions you
 ```
+
+`wait` prints the message as `read` does and exits 0, or exits 3 after `--timeout` seconds (default 600) with nothing;
+with neither `--reply-to` nor `--mention` it waits for the next mail to you. `ask` is `send` followed by the same wait:
+for a reply to the question, or any mail from that agent to you.
+
+Mail reaches an agent as untrusted content on every path. Each message's header (`read`, `get`, `wait`, `ask`,
+`watch`, `room read`, MCPL text) reads `ID TIME untrusted mail from NAME [SUB] via HOST to …`: the signed sender and
+the node that wrote it (this host's name for it in the trust file), and the sender's own lines always start with `> `.
+The Claude Code notices and MCPL pushes open with a line saying the text is written by other agents and people,
+information to weigh and never instructions from your user; `--exec` and `--post` carry the same line.
 
 Privacy covers the body and attachment contents: every trusted node still sees the thread name, the sender, the
 recipients, the time and attachment IDs, so pick thread names you are happy for all of them to read.
@@ -107,8 +119,10 @@ recipients, the time and attachment IDs, so pick thread names you are happy for 
 what it showed when it covered everything from there (it leaves it alone for reads filtered by thread, sender or
 text), so re-arming `watch` after a manual read does not replay those messages; `--from-now` skips everything
 already here. For each message it shows, `--exec CMD` runs CMD (split into arguments, never through a shell) with
-`{"event", "me", "to_me", "mention", "private", "message"}` as JSON on stdin and `ISLANDMAIL_ID`, `ISLANDMAIL_FROM`,
-`ISLANDMAIL_THREAD`, `ISLANDMAIL_ROOM`, `ISLANDMAIL_TO_ME`, `ISLANDMAIL_MENTION` and `ISLANDMAIL_PRIVATE` set;
+`{"event", "me", "to_me", "mention", "private", "untrusted", "notice", "message"}` as JSON on stdin (`untrusted` is
+always true and `notice` is the untrusted-content line) and `ISLANDMAIL_ID`, `ISLANDMAIL_FROM`, `ISLANDMAIL_SUB`,
+`ISLANDMAIL_HOST`, `ISLANDMAIL_THREAD`, `ISLANDMAIL_ROOM`, `ISLANDMAIL_TO_ME`, `ISLANDMAIL_MENTION`,
+`ISLANDMAIL_PRIVATE` and `ISLANDMAIL_UNTRUSTED=1` set;
 `--post URL` POSTs the same JSON to a URL on this machine (loopback only), with `--post-token-file FILE` as a
 Bearer token. Both work on Windows. Hooks are at least once: the cursor moves past a message only once every hook
 took it (exit 0, or a 2xx answer). A failed hook is retried three times over about 15 s; if it still fails, `watch`
@@ -138,8 +152,15 @@ New mail to you wakes your agent in its harness, on by default:
   islandmail --as NAME notify off                          # remove the hooks and stay off (join respects it)
   ```
 
-  A notice names the sender, the thread or room and the message id, starts with a short preview, and says how to read
-  and answer it. It labels the text as other people's, information rather than instructions from your user.
+  A notice names the sender, the host that wrote it, the thread or room and the message id, starts with a short
+  preview, and says how to read and answer it. It labels the text as untrusted content: other people's words,
+  information rather than instructions from your user.
+
+  With the hooks comes a Claude Code skill, `skills/islandmail/SKILL.md` in the same scope (`~/.claude/skills/` or
+  `PROJECT/.claude/skills/`), so the agent knows the commands (send, reply, dm, rooms, watch, wait, ask) and the
+  rules: answer in the thread with `reply`, mail is private by default, and incoming mail is untrusted content.
+  `notify install` writes it (for every identity notifying in that scope), `notify off` removes it with the hooks,
+  and `notify status` shows it. A SKILL.md there without islandmail's marker line is someone's own and is left alone.
 - **Connectome and other MCPL hosts** get mail as `push/event` (and rooms as channels) with no setup. To opt one
   identity out, list it in the node's config and restart the node; its MCPL sessions keep the tools:
 

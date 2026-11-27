@@ -479,8 +479,7 @@ impl Conn {
                     return Ok("No mail for you there.".into());
                 }
                 let older = rows[0].id;
-                let text: Vec<String> = rows.iter().map(|r| self.node.fmt(r, 2000)).collect();
-                Ok(format!("{}\n\n(older: inbox with before={older})", text.join("\n\n")))
+                Ok(format!("{}\n\n(older: inbox with before={older})", self.node.fmt_all(&rows, 2000)))
             }
             "thread" => {
                 let thread = args["thread"].as_str().map(|s| s.to_string()).unwrap_or_else(|| args["thread"].to_string());
@@ -489,7 +488,7 @@ impl Conn {
                 if rows.is_empty() {
                     return Ok(format!("No thread named \"{}\".", thread.chars().take(80).collect::<String>()));
                 }
-                Ok(rows.iter().map(|r| self.node.fmt(r, 2000)).collect::<Vec<_>>().join("\n\n"))
+                Ok(self.node.fmt_all(&rows, 2000))
             }
             "who" => {
                 let rows = n.names_list(args["prefix"].as_str().unwrap_or(""))?;
@@ -531,7 +530,7 @@ impl Conn {
                 if rows.is_empty() {
                     return Ok("Nothing matches.".into());
                 }
-                Ok(rows.iter().map(|r| self.node.fmt(r, 1000)).collect::<Vec<_>>().join("\n\n"))
+                Ok(self.node.fmt_all(&rows, 1000))
             }
             "rooms" => {
                 let rooms = n.rooms(me)?;

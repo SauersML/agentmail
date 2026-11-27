@@ -111,6 +111,8 @@ pub struct Row {
     pub reply_to: Option<String>,
     /// When this node received the envelope (ms).
     pub received: i64,
+    /// The key of the node that wrote (and signed) the envelope.
+    pub writer: String,
 }
 
 /// What a node that opened an envelope knows of it.
@@ -231,7 +233,7 @@ const COLS: &str = "id, env_id, ts, sender, sender_sub, recipient, thread, mode,
                     length(text) AS len, files, readers, \
                     (SELECT group_concat(k) FROM (SELECT value AS k FROM json_each(messages.audience) \
                      UNION SELECT key FROM grants WHERE grants.env_id = messages.env_id)), \
-                    kind, meta, mentions, reply_to, received";
+                    kind, meta, mentions, reply_to, received, json_extract(env, '$.node')";
 
 /// A viewer sees a row its node can read, whose content key was wrapped to the viewer's key (in the envelope or
 /// in a key grant), private rows only when addressed to it; never a key grant itself.
@@ -262,6 +264,7 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
         mentions: r.get(15)?,
         reply_to: r.get(16)?,
         received: r.get(17)?,
+        writer: r.get::<_, Option<String>>(18)?.unwrap_or_default(),
     })
 }
 
