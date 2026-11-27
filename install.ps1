@@ -7,7 +7,7 @@
 #              full release has them)
 #   -From DIR  install from a directory holding the release files (CI's own build); no GitHub lookups
 # Re-running upgrades in place. macOS and Linux: install.sh.
-param([string]$Tag = "", [string]$From = "", [string]$PinnedSha = "")
+param([string]$Tag = "", [string]$From = "")
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"  # Windows PowerShell's progress bar slows downloads many times over
@@ -31,19 +31,6 @@ function Quiet([string]$exe, [string[]]$rest) {
 $headers = @{ "Accept" = "application/vnd.github+json"; "User-Agent" = "islandmail-install" }
 $token = if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }
 if ($token) { $headers["Authorization"] = "Bearer $token" }
-
-# raw.githubusercontent.com caches main for minutes, so a piped body can be stale. Run the body at main's current
-# commit instead (once: the pinned copy gets -PinnedSha). Any failure keeps the body we have.
-if (-not $From -and -not $PinnedSha) {
-    try {
-        $sha = (Invoke-RestMethod -Headers $headers -TimeoutSec 10 "https://api.github.com/repos/$Repo/commits/main").sha
-        $body = Invoke-RestMethod -TimeoutSec 20 "https://raw.githubusercontent.com/$Repo/$sha/install.ps1"
-    } catch { $sha = $null }
-    if ($sha -and $body -match "islandmail") {
-        & ([scriptblock]::Create($body)) -Tag $Tag -PinnedSha $sha
-        return
-    }
-}
 
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("islandmail-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
@@ -85,19 +72,6 @@ try {
         if ($got -ne $sums[$f]) { Die "checksum mismatch for ${f}: refusing to install" }
     }
     Write-Host "  checksums match SHA256SUMS"
-
-    # SHA256SUMS against GitHub's build attestation, when gh is installed and logged in.
-    if (-not $From) {
-        $gh = Get-Command gh -ErrorAction SilentlyContinue
-        $authed = $false
-        if ($gh) { $authed = ((Quiet gh @("auth", "status")) -eq 0) }
-        if ($authed) {
-            if ((Quiet gh @("attestation", "verify", (Join-Path $tmp "SHA256SUMS"), "--repo", $Repo)) -ne 0) { Die "SHA256SUMS does not match a build attestation of ${Repo}: refusing to install" }
-            Write-Host "  SHA256SUMS attested by $Repo's release workflow"
-        } else {
-            Write-Host "  (with gh installed and logged in, the installer also checks GitHub's build attestation)"
-        }
-    }
 
     New-Item -ItemType Directory -Force -Path $BinDir, $Share | Out-Null
     # A running exe cannot be overwritten but can be renamed: move the old one aside first.

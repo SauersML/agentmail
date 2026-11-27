@@ -11,8 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/SauersML/islandmail/main/install.sh
 ```
 
 This puts the release's `islandmail-node` and the `islandmail` client in `~/.local/bin`, checked against the
-release's `SHA256SUMS` (and its GitHub build attestation when `gh` is logged in). No sudo, no Rust. On Windows run
-`install.ps1` the same way from PowerShell (`irm .../install.ps1 | iex`).
+release's `SHA256SUMS`. No sudo, no Rust. On Windows run `install.ps1` the same way from PowerShell (`irm .../install.ps1 | iex`).
 
 ## Use
 

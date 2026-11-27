@@ -35,26 +35,6 @@ if [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-}}" ]; then
     API+=(-H "Authorization: Bearer ${GITHUB_TOKEN:-${GH_TOKEN:-}}")
 fi
 
-# raw.githubusercontent.com caches main for minutes, so a piped body can be stale. Run the body at main's current
-# commit instead (once: the pinned copy has ISLANDMAIL_INSTALL_SHA set). Any failure keeps the body we have.
-if [ -z "$FROM" ] && [ -z "${ISLANDMAIL_INSTALL_SHA:-}" ]; then
-    sha=$("${API[@]}" --max-time 10 "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null \
-        | grep -o '"sha": *"[0-9a-f]\{40\}"' | head -n 1 | grep -o '[0-9a-f]\{40\}' || true)
-    if [ -n "$sha" ]; then
-        body=$(mktemp)
-        if "${CURL[@]}" --max-time 20 "https://raw.githubusercontent.com/$REPO/$sha/install.sh" -o "$body" 2>/dev/null \
-            && head -n 1 "$body" | grep -q '^#!'; then
-            args=()
-            [ -n "$TAG" ] && args+=(--tag "$TAG")
-            rc=0
-            ISLANDMAIL_INSTALL_SHA=$sha bash "$body" ${args[@]+"${args[@]}"} || rc=$?
-            rm -f "$body"
-            exit $rc
-        fi
-        rm -f "$body"
-    fi
-fi
-
 # Platform -> release asset.
 os=$(uname -s)
 arch=$(uname -m)
@@ -107,15 +87,6 @@ for f in "$NODE_ASSET" islandmail.py requirements.txt; do
     [ "$(sum "$tmp/$f")" = "$want" ] || die "checksum mismatch for $f: refusing to install"
 done
 say "  checksums match SHA256SUMS"
-
-# SHA256SUMS against GitHub's build attestation (signed by the release workflow), when gh is installed and logged in.
-if [ -z "$FROM" ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
-    gh attestation verify "$tmp/SHA256SUMS" --repo "$REPO" >/dev/null \
-        || die "SHA256SUMS does not match a build attestation of $REPO: refusing to install"
-    say "  SHA256SUMS attested by $REPO's release workflow"
-elif [ -z "$FROM" ]; then
-    say "  (with gh installed and logged in, the installer also checks GitHub's build attestation)"
-fi
 
 mkdir -p "$BIN_DIR" "$SHARE"
 # Rename over the old binary: a running node keeps its open copy.
