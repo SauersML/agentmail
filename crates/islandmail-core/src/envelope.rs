@@ -81,13 +81,8 @@ impl PostStatement<'_> {
     }
 }
 
-/// Hash the encrypted body's public-facing fields using the same length framing as the signature.
-pub fn post_digest(salt: &[u8], text: &str, files: &[serde_json::Value]) -> Result<String> {
-    post_digest_meta(salt, text, files, "")
-}
-
-/// The digest with the body's room fields (`Body::meta`, the exact JSON text the sender signed). Without meta it is
-/// the same digest as before rooms, so earlier messages verify unchanged.
+/// The sender's digest of the body: salt, text, attachments and room fields (`Body::meta`, the exact JSON text the
+/// sender signed; empty meta adds nothing), each with the same length framing as the signature.
 pub fn post_digest_meta(salt: &[u8], text: &str, files: &[serde_json::Value], meta: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -110,8 +105,7 @@ pub const BOUND_SALT_TAG: [u8; 4] = *b"imb1";
 /// A body salt that names the node that will write the envelope: `imb1`, 4 random bytes R, then the first 8 bytes of
 /// SHA-256(PAE("islandmail/salt-bind/v1", R, node key)). The salt is under the sender's signature (through the
 /// digest), so a node that opens the message and seals it again as its own (a replay, with parents and an envelope id
-/// of its choosing) is refused by every reader: the writing node is part of what the sender signed. Older builds
-/// read a bound salt as any other salt.
+/// of its choosing) is refused by every reader: the writing node is part of what the sender signed.
 pub fn bound_salt(node: &PublicKey) -> [u8; 16] {
     let r = crate::random_bytes::<4>();
     let mut out = [0u8; 16];
@@ -127,8 +121,8 @@ fn salt_binding(r: &[u8], node: &PublicKey) -> [u8; 8] {
     h[..8].try_into().expect("8 bytes")
 }
 
-/// Err when `salt` is a bound salt (`bound_salt`) for another node than `node`. Any other salt passes (mail from
-/// clients and nodes before salts were bound).
+/// Err when `salt` is a bound salt (`bound_salt`) for another node than `node`. Any other salt passes (clients'
+/// salts are random).
 pub fn check_salt_binding(salt: &[u8], node: &PublicKey) -> Result<()> {
     if salt.len() == 16 && salt[..4] == BOUND_SALT_TAG && salt[8..] != salt_binding(&salt[4..8], node) {
         bail!("the sender bound this message to another writing node (a replay by another node)");
@@ -319,10 +313,6 @@ impl Envelope {
         }
     }
 
-    pub fn open(&self, me: &Seed) -> Result<Option<Opened>> {
-        self.open_for([me])
-    }
-
     /// The content key, if one of `local_keys` has a slot (for re-wrapping it in a key grant).
     pub fn content_key<'a>(&self, local_keys: impl IntoIterator<Item = &'a Seed>) -> Result<Option<[u8; 32]>> {
         let epk = self.epk_bytes()?;
@@ -338,7 +328,7 @@ impl Envelope {
     /// Header and body under a content key (from a slot or a key grant). Err if the key does not open it.
     pub fn open_with(&self, ck: &[u8; 32]) -> Result<Opened> {
         let ct = b64u_decode(&self.ciphertext).ok_or_else(|| anyhow!("bad ciphertext"))?;
-        let padded = crypto::decrypt_with(&ct, &outer_ad(self.v, &self.ts, &self.node, &self.blobs), ck)?;
+        let padded = crypto::decrypt(&ct, &outer_ad(self.v, &self.ts, &self.node, &self.blobs), ck, "body")?;
         let inner: Inner = serde_json::from_slice(crypto::unpad(&padded)?)?;
         Ok(Opened { header: inner.h, body: inner.b, ck: *ck })
     }
@@ -509,7 +499,7 @@ mod tests {
         let ts = crate::now_ts();
         let salt = crate::random_bytes::<16>();
         let body = Body { text: format!("hi from {from}"), salt: b64u(&salt), files: vec![], meta: String::new() };
-        let digest = post_digest(&salt, &body.text, &[]).unwrap();
+        let digest = post_digest_meta(&salt, &body.text, &[], "").unwrap();
         let recipients = match mode {
             Mode::Members => w.members.all_keys(),
             Mode::Private => members::private_keys(&pinned(&w.members), to, from),
@@ -549,7 +539,7 @@ mod tests {
     /// An envelope signed by `signer` as `from` (the agent-key path), with the given body text.
     fn signed_env(w: &World, from: &str, signer: &Seed, text: &str, ts: String) -> Envelope {
         let salt = crate::random_bytes::<16>();
-        let digest = post_digest(&salt, text, &[]).unwrap();
+        let digest = post_digest_meta(&salt, text, &[], "").unwrap();
         let st = PostStatement {
             from, sub: &format!("agent:{from}@test"), to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &w.members.all_keys(),
@@ -576,7 +566,7 @@ mod tests {
 
     /// `e` opened by the world's node, its header edited, sealed again by the node (the sender's signature is kept).
     fn reseal(w: &World, e: &Envelope, edit: impl FnOnce(&mut Header)) -> Envelope {
-        let o = e.open(&w.node).unwrap().unwrap();
+        let o = e.open_for([&w.node]).unwrap().unwrap();
         let mut h = o.header;
         edit(&mut h);
         let recipients = h.audience_keys().unwrap();
@@ -613,7 +603,7 @@ mod tests {
         }
         // A body swapped by the node under alice's signed digest.
         let good = signed_env(&w, "a.alice", &w.alice, "original", crate::now_ts());
-        let o = good.open(&w.node).unwrap().unwrap();
+        let o = good.open_for([&w.node]).unwrap().unwrap();
         let mut body = o.body.clone();
         body.text = "tampered".into();
         assert!(good.check_body(&o.header, &body).unwrap_err().to_string().contains("digest"));
@@ -630,7 +620,7 @@ mod tests {
         // alice's message, its salt bound to the node that writes it.
         let make = |salt: [u8; 16]| {
             let ts = crate::now_ts();
-            let digest = post_digest(&salt, "bound", &[]).unwrap();
+            let digest = post_digest_meta(&salt, "bound", &[], "").unwrap();
             let st = PostStatement { from: "a.alice", sub: "agent:a.alice@test", to: "all", thread: "t", mode: Mode::Members,
                                      ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&members);
             let attest = Attest { key: fmt_key(&w.alice.public()), digest, sig: b64u(&w.alice.sign(&st)), cert: None };
@@ -640,7 +630,7 @@ mod tests {
         };
         // `other` opens it and seals the same signed header and body as its own, with parents of its choosing.
         let replay = |e: &Envelope| {
-            let o = e.open(&other).unwrap().unwrap();
+            let o = e.open_for([&other]).unwrap().unwrap();
             let h = o.header;
             Envelope::seal(Draft { thread: &h.thread, parents: vec!["ab".repeat(32)], ts: e.ts.clone(), from: &h.from,
                                    to: &h.to, mode: h.mode, body: &o.body, blobs: vec![], attest: h.attest.clone(),
@@ -655,7 +645,7 @@ mod tests {
         // A salt bound to another node than the writer's is refused at the writer too.
         let (wrong, _) = make(bound_salt(&other.public()));
         assert!(verify(&wrong).is_err());
-        // An unbound (random) salt, as older clients and nodes write: still read, as before.
+        // An unbound (random) salt, as clients write: still read.
         let mut legacy = crate::random_bytes::<16>();
         legacy[0] = b'x';
         let (old, _) = make(legacy);
@@ -688,7 +678,7 @@ mod tests {
         l.nodes.push(crate::NodeEntry { name: "other".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec![] });
         let p = env(&w, "a.alice", "a.bob", Mode::Private);
         p.check(&l, crate::now_millis()).unwrap();
-        assert!(p.open(&other).unwrap().is_none());
+        assert!(p.open_for([&other]).unwrap().is_none());
     }
 
     #[test]
@@ -697,7 +687,7 @@ mod tests {
         let now = crate::now_millis();
         let ts = crate::now_ts();
         let salt = crate::random_bytes::<16>();
-        let digest = post_digest(&salt, "hi", &[]).unwrap();
+        let digest = post_digest_meta(&salt, "hi", &[], "").unwrap();
         // alice signs to "all", thread "x|y".
         let st = PostStatement {
             from: "a.alice", sub: "agent:a.alice@test", to: "all", thread: "x|y", mode: Mode::Members,
@@ -791,7 +781,7 @@ mod tests {
         let (lo, hi) = crate::id_prefix_range("abcdefgi").unwrap();
         assert!(env < lo || env > hi);
         assert!(crate::id_prefix_range("ab1").is_none() && crate::id_prefix_range("").is_none());
-        // Fuzz find (codecs): a 52nd character with any of its 4 unused bits set used to resolve to another id.
+        // A 52nd character with any of its 4 unused bits set names no id.
         assert!(crate::id_prefix_range(&format!("{}b", &id[..51])).is_none());
         assert!(crate::id_prefix_range("ggijjjjjjjj666g2uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu6g").is_none());
     }
@@ -799,8 +789,7 @@ mod tests {
     #[test]
     fn room_fields_are_covered_by_the_digest() {
         let salt = [7u8; 16];
-        let plain = post_digest(&salt, "hi", &[]).unwrap();
-        assert_eq!(plain, post_digest_meta(&salt, "hi", &[], "").unwrap(), "no meta: the digest before rooms");
+        let plain = post_digest_meta(&salt, "hi", &[], "").unwrap();
         let meta = r#"{"room":"dana/x","mentions":["bob"]}"#;
         let signed = post_digest_meta(&salt, "hi", &[], meta).unwrap();
         assert_ne!(signed, plain);
@@ -844,7 +833,7 @@ mod tests {
         e.ts = crate::ts_from_millis(now - 5);
         e.sig = b64u(&w.node.sign(&e.signing_bytes()));
         e.check(&w.members, now).unwrap();
-        assert!(e.open(&w.node).is_err());
+        assert!(e.open_for([&w.node]).is_err());
     }
 
     #[test]
@@ -852,22 +841,22 @@ mod tests {
         let w = world();
         let m = env(&w, "a.alice", "a.bob", Mode::Members);
         for k in [&w.alice, &w.bob, &w.carol, &w.node] {
-            assert!(m.open(k).unwrap().is_some(), "members mode opens for every member and node");
+            assert!(m.open_for([k]).unwrap().is_some(), "members mode opens for every member and node");
         }
         let outsider = Seed::generate();
-        assert!(m.open(&outsider).unwrap().is_none());
+        assert!(m.open_for([&outsider]).unwrap().is_none());
 
         let p = env(&w, "a.alice", "a.bob", Mode::Private);
-        assert!(p.open(&w.alice).unwrap().is_some(), "sender reads its own private mail");
-        assert!(p.open(&w.bob).unwrap().is_some(), "recipient reads it");
-        assert!(p.open(&w.carol).unwrap().is_none(), "another member does not");
-        assert!(p.open(&w.node).unwrap().is_none(), "nor does the node");
+        assert!(p.open_for([&w.alice]).unwrap().is_some(), "sender reads its own private mail");
+        assert!(p.open_for([&w.bob]).unwrap().is_some(), "recipient reads it");
+        assert!(p.open_for([&w.carol]).unwrap().is_none(), "another member does not");
+        assert!(p.open_for([&w.node]).unwrap().is_none(), "nor does the node");
         // A team prefix in private mode reaches the team only.
         let t = env(&w, "b.carol", "a.", Mode::Private);
-        assert!(t.open(&w.alice).unwrap().is_some());
-        assert!(t.open(&w.bob).unwrap().is_some());
-        assert!(t.open(&w.carol).unwrap().is_some());
-        assert!(t.open(&w.node).unwrap().is_none());
+        assert!(t.open_for([&w.alice]).unwrap().is_some());
+        assert!(t.open_for([&w.bob]).unwrap().is_some());
+        assert!(t.open_for([&w.carol]).unwrap().is_some());
+        assert!(t.open_for([&w.node]).unwrap().is_none());
     }
 
     /// A certified agent's envelope, written by `writer`, carrying `cert` (or none).
@@ -876,7 +865,7 @@ mod tests {
                      ts: String, cert: Option<Cert>) -> Envelope {
         let salt = crate::random_bytes::<16>();
         let body = Body { text: "hello".into(), files: vec![], salt: b64u(&salt), meta: String::new() };
-        let digest = post_digest(&salt, &body.text, &[]).unwrap();
+        let digest = post_digest_meta(&salt, &body.text, &[], "").unwrap();
         let recipients = match mode {
             Mode::Members => l.all_keys(),
             Mode::Private => members::private_keys(agents, to, from),
@@ -942,8 +931,8 @@ mod tests {
         assert_eq!(members::named(&agents, "dana").count(), 1);
         let p = certified_env(&l, &agents, &pod, "dana", &dana, "b.carol", Mode::Private, crate::now_ts(), Some(pod_cert.clone()));
         p.verify(&l, &agents, now, [&pod]).unwrap();
-        assert!(p.open(&mac).unwrap().is_some() && p.open(&pod).unwrap().is_some() && p.open(&dana).unwrap().is_some());
-        assert!(p.open(&ops).unwrap().is_none());
+        assert!(p.open_for([&mac]).unwrap().is_some() && p.open_for([&pod]).unwrap().is_some() && p.open_for([&dana]).unwrap().is_some());
+        assert!(p.open_for([&ops]).unwrap().is_none());
 
         // Revocation by the mac counts only against the mac's cert, and only from its time on.
         let rev_at = now - 500;

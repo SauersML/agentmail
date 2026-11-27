@@ -268,6 +268,30 @@ fn read_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     })
 }
 
+/// The row whose `clause` matches; the first parameter is the text cap.
+fn row_by(db: &Connection, clause: &str, args: impl rusqlite::Params) -> Result<Option<Row>> {
+    Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE {clause}"), args, read_row).optional()?)
+}
+
+/// Rows up to `limit` or PAGE_CHARS of text (at least one), and whether more were left; `latest`: `rows` came newest
+/// first, and the page is returned oldest first.
+fn page(rows: impl IntoIterator<Item = rusqlite::Result<Row>>, limit: usize, latest: bool) -> Result<(Vec<Row>, bool)> {
+    let (mut out, mut chars, mut more) = (Vec::new(), 0, false);
+    for r in rows {
+        let r = r?;
+        chars += r.text.as_deref().map_or(0, str::len) + r.files.len() + 200;
+        if out.len() == limit || (!out.is_empty() && chars > PAGE_CHARS) {
+            more = true;
+            break;
+        }
+        out.push(r);
+    }
+    if latest {
+        out.reverse();
+    }
+    Ok((out, more))
+}
+
 fn like_prefix(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
@@ -364,28 +388,12 @@ impl Store {
 
     /// The visible row of an agent-signed message, by its sender signature (canonical base64url).
     pub fn by_agent_sig(&self, sig: &str) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db
-            .query_row(&format!("SELECT {COLS} FROM messages WHERE agent_sig = ?"), params![MAX_TEXT, sig], read_row)
-            .optional()?)
+        row_by(&self.db.lock().unwrap(), "agent_sig = ?", params![MAX_TEXT, sig])
     }
 
-    /// Stores a verified envelope. Returns None if it was already here (the envelope id is the dedupe key), or if it
-    /// is another envelope carrying an agent-signed message already here (stored hidden, see agent_sig).
-    #[allow(dead_code)]
-    pub fn insert(
-        &self,
-        env: &Envelope,
-        read: Option<Read<'_>>,
-        text: Option<&str>,
-        files: &str,
-        readers: Option<&str>,
-        received_ms: i64,
-    ) -> Result<Option<Row>> {
-        self.insert_with(env, read, text, files, readers, received_ms, &Extra { kind: "mail", ..Default::default() })
-    }
-
-    /// `insert` with the body's room fields.
+    /// Stores a verified envelope with the body's room fields. Returns None if it was already here (the envelope id is
+    /// the dedupe key), or if it is another envelope carrying an agent-signed message already here (stored hidden, see
+    /// agent_sig).
     #[allow(clippy::too_many_arguments)]
     pub fn insert_with(
         &self,
@@ -408,7 +416,7 @@ impl Store {
             if n == 0 {
                 return Ok(None);
             }
-            return Ok(Some(db.query_row(&format!("SELECT {COLS} FROM messages WHERE env_id = ?"), params![MAX_TEXT, env.id], read_row)?));
+            return row_by(&db, "env_id = ?", params![MAX_TEXT, env.id]);
         };
         let parents = serde_json::to_string(&h.parents)?;
         let islandmail_core::Attest { sig, key, .. } = &h.attest;
@@ -446,12 +454,7 @@ impl Store {
         if n == 0 || replay {
             return Ok(None);
         }
-        let row = db.query_row(
-            &format!("SELECT {COLS} FROM messages WHERE env_id = ?"),
-            params![MAX_TEXT, env.id],
-            read_row,
-        )?;
-        Ok(Some(row))
+        row_by(&db, "env_id = ?", params![MAX_TEXT, env.id])
     }
 
     pub fn last_id(&self) -> Result<i64> {
@@ -467,9 +470,7 @@ impl Store {
 
     #[cfg(test)]
     pub fn get(&self, id: i64, viewer: &Caller) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE id = ?"), params![MAX_TEXT, id], read_row)
-            .optional()?.filter(|r| r.visible_to(viewer)))
+        Ok(row_by(&self.db.lock().unwrap(), "id = ?", params![MAX_TEXT, id])?.filter(|r| r.visible_to(viewer)))
     }
 
     /// Return rows in local-id order, at most `limit` (1000) or PAGE_CHARS of text.
@@ -517,22 +518,8 @@ impl Store {
         );
         let db = self.db.lock().unwrap();
         let mut st = db.prepare(&sql)?;
-        let mut rows = Vec::new();
-        let mut chars = 0usize;
-        let mut more = false;
-        for r in st.query_map(params_from_iter(args), read_row)? {
-            let r = r?;
-            chars += r.text.as_deref().map_or(0, |t| t.len()) + r.files.len() + 200;
-            if rows.len() as i64 >= limit || (!rows.is_empty() && chars > PAGE_CHARS) {
-                more = true;
-                break;
-            }
-            rows.push(r);
-        }
-        if q.latest.is_some() {
-            rows.reverse();
-        }
-        Ok((rows, more))
+        let rows = page(st.query_map(params_from_iter(args), read_row)?, limit.max(0) as usize, q.latest.is_some());
+        rows
     }
 
     pub fn thread_rows(&self, viewer: &Caller, limit: i64) -> Result<Vec<serde_json::Value>> {
@@ -580,17 +567,9 @@ impl Store {
         let limit = q.latest.or(q.limit).unwrap_or(PAGE).clamp(0, PAGE) as usize;
         let name = format!(",{},", norm(&viewer.name));
         let mut read = db.prepare(&format!("SELECT {COLS} FROM messages WHERE id=? AND {}", visible_sql()))?;
-        let mut rows = Vec::new();
-        let mut bytes = 0;
-        let mut more = false;
-        for &i in window.iter() {
-            let Some(row) = read.query_row(params![text_cap, nodes[i].0, name, viewer.key, viewer.key], read_row).optional()? else { continue };
-            bytes += row.text.as_deref().map_or(0, str::len) + row.files.len() + 200;
-            if rows.len() == limit || (!rows.is_empty() && bytes > PAGE_CHARS) { more = true; break; }
-            rows.push(row);
-        }
-        if q.latest.is_some() { rows.reverse(); }
-        Ok((rows, more))
+        page(window.iter().filter_map(|&i| {
+            read.query_row(params![text_cap, nodes[i].0, name, viewer.key, viewer.key], read_row).optional().transpose()
+        }), limit, q.latest.is_some())
     }
 
     /// Thread heads: envelopes of the thread no other envelope of it names as a parent (latest 16 by ts).
@@ -654,17 +633,9 @@ impl Store {
 
     /// The same sender's identical message within the repeat window (a client resending after a dropped answer).
     pub fn repeat(&self, who: &Caller, since_ts: &str, to: &str, thread: &str, text: &str) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db
-            .query_row(
-                &format!(
-                    "SELECT {COLS} FROM messages WHERE sender_sub = ? AND sender = ? AND agent_key = ? AND ts > ? AND recipient = ? AND thread = ? \
-                     AND text = ? AND files = '[]' ORDER BY id DESC LIMIT 1"
-                ),
-                params![MAX_TEXT, who.sub, who.name, who.key, since_ts, to, thread, text],
-                read_row,
-            )
-            .optional()?)
+        row_by(&self.db.lock().unwrap(), "sender_sub = ? AND sender = ? AND agent_key = ? AND ts > ? AND recipient = ? \
+               AND thread = ? AND text = ? AND files = '[]' ORDER BY id DESC LIMIT 1",
+               params![MAX_TEXT, who.sub, who.name, who.key, since_ts, to, thread, text])
     }
 
     /// Records an agent token's jti as used. Ok(false): it was used before (a replay). Rows are kept until the token
@@ -986,34 +957,29 @@ impl Store {
 
     /// The visible row of an envelope (for quotes and replies).
     pub fn by_env(&self, env_id: &str, viewer: &Caller) -> Result<Option<Row>> {
-        let db = self.db.lock().unwrap();
-        Ok(db.query_row(&format!("SELECT {COLS} FROM messages WHERE env_id = ?"), params![MAX_TEXT, env_id], read_row)
-            .optional()?.filter(|r| r.visible_to(viewer)))
+        Ok(row_by(&self.db.lock().unwrap(), "env_id = ?", params![MAX_TEXT, env_id])?.filter(|r| r.visible_to(viewer)))
     }
 
     /// Content keys of a room's private rows the viewer can see, oldest first, for re-wrapping (key grants): the key
     /// this node opened the row with, or one it holds from a grant.
     pub fn room_keys(&self, thread: &str, viewer: &Caller, events_only: bool) -> Result<Vec<(String, String)>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare(&format!(
-            "SELECT env_id, COALESCE(ck, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1)) AS k FROM messages \
-             WHERE thread = ? AND mode = 'private' AND {} {} AND k IS NOT NULL ORDER BY ts, env_id", visible_sql(),
-            if events_only { "AND kind = 'event'" } else { "" }))?;
-        let rows = st.query_map(params![thread, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key],
-                                |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
+        let filter = format!("mode = 'private' AND {} {}", visible_sql(), if events_only { "AND kind = 'event'" } else { "" });
+        self.content_keys(&filter, params![thread, format!(",{},", norm(&viewer.name)), viewer.key, viewer.key])
     }
 
     /// Content keys of an open room's membership events, oldest first: what a host trusted after they were sent
     /// needs to know the room (its create event above all). Members-mode rows only, so nothing private is here; the
     /// key this node opened the row with, or one it holds from a grant (so a host that got them by grant passes them on).
     pub fn room_event_keys(&self, thread: &str) -> Result<Vec<(String, String)>> {
+        self.content_keys("mode = 'members' AND kind = 'event' AND text IS NOT NULL", [thread])
+    }
+
+    fn content_keys(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<(String, String)>> {
         let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id, COALESCE(ck, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1)) \
-                                 AS k FROM messages WHERE thread = ? AND mode = 'members' AND kind = 'event' \
-                                 AND text IS NOT NULL AND k IS NOT NULL ORDER BY ts, env_id")?;
-        let rows = st.query_map([thread], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut st = db.prepare(&format!(
+            "SELECT env_id, COALESCE(ck, (SELECT ck FROM grants g WHERE g.env_id = messages.env_id LIMIT 1)) AS k \
+             FROM messages WHERE thread = ? AND {filter} AND k IS NOT NULL ORDER BY ts, env_id"))?;
+        let rows = st.query_map(args, |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 

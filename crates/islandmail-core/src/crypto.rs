@@ -68,12 +68,7 @@ pub fn seal(plain: &[u8], ad: &[u8], targets: &[[u8; 32]]) -> Result<Sealed> {
         bail!("no recipient keys");
     }
     let ck = Zeroizing::new(crate::random_bytes::<32>());
-    let nonce = crate::random_bytes::<24>();
-    let body = XChaCha20Poly1305::new((&*ck).into())
-        .encrypt((&nonce).into(), Payload { msg: plain, aad: ad })
-        .map_err(|_| anyhow!("encrypt failed"))?;
-    let mut ciphertext = nonce.to_vec();
-    ciphertext.extend_from_slice(&body);
+    let ciphertext = xseal(&ck, plain, ad)?;
 
     let esk = StaticSecret::from(crate::random_bytes::<32>());
     let epk = XPublic::from(&esk).to_bytes();
@@ -102,14 +97,6 @@ pub fn seal(plain: &[u8], ad: &[u8], targets: &[[u8; 32]]) -> Result<Sealed> {
     Ok(Sealed { ciphertext, epk, keys })
 }
 
-/// Opens the body with `me`'s key if one of the wraps is for it. `Ok(None)`: not addressed to this key.
-pub fn open(ciphertext: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<Vec<u8>>> {
-    let Some(mut ck) = content_key(epk, keys, me)? else { return Ok(None) };
-    let plain = decrypt(ciphertext, ad, &ck);
-    ck.zeroize();
-    Ok(Some(plain?))
-}
-
 /// The content key, if one of the wraps is for `me` (its X25519 key: an identity seed's, or a rotating node key's).
 pub fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<[u8; 32]>> {
     let sk = me.x25519_secret();
@@ -128,19 +115,24 @@ pub fn content_key(epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option
     plain.as_slice().try_into().map(Some).map_err(|_| anyhow!("bad content key"))
 }
 
-/// Decrypt a body with a content key obtained elsewhere (a key grant).
-pub fn decrypt_with(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
-    decrypt(ciphertext, ad, ck)
+/// nonce (24, random) || XChaCha20-Poly1305 of `plain`: bodies and attachment blobs.
+fn xseal(key: &[u8; 32], plain: &[u8], ad: &[u8]) -> Result<Vec<u8>> {
+    let nonce = crate::random_bytes::<24>();
+    let ct = XChaCha20Poly1305::new(key.into())
+        .encrypt((&nonce).into(), Payload { msg: plain, aad: ad })
+        .map_err(|_| anyhow!("encrypt failed"))?;
+    Ok([&nonce[..], &ct].concat())
 }
 
-fn decrypt(ciphertext: &[u8], ad: &[u8], ck: &[u8; 32]) -> Result<Vec<u8>> {
+/// Opens `xseal` output; `what` names it in errors. Bodies also open this way with a key from a key grant.
+pub fn decrypt(ciphertext: &[u8], ad: &[u8], key: &[u8; 32], what: &str) -> Result<Vec<u8>> {
     if ciphertext.len() < 24 + 16 {
-        bail!("ciphertext too short");
+        bail!("{what} too short");
     }
     let (nonce, body) = ciphertext.split_at(24);
-    XChaCha20Poly1305::new(ck.into())
+    XChaCha20Poly1305::new(key.into())
         .decrypt(nonce.into(), Payload { msg: body, aad: ad })
-        .map_err(|_| anyhow!("body decrypt failed"))
+        .map_err(|_| anyhow!("{what} decrypt failed"))
 }
 
 /* Padding */
@@ -194,25 +186,11 @@ const BLOB_AD: &[u8] = b"islandmail/blob/v1";
 /// || XChaCha20-Poly1305 ciphertext of the padded bytes. The blob id is hex BLAKE3 of the result.
 pub fn seal_blob(plain: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
     let key: [u8; 32] = crate::random_bytes();
-    let nonce: [u8; 24] = crate::random_bytes();
-    let padded = pad(plain, BLOB_CHUNK)?;
-    let ct = XChaCha20Poly1305::new((&key).into())
-        .encrypt((&nonce).into(), Payload { msg: &padded, aad: BLOB_AD })
-        .map_err(|_| anyhow!("encrypt failed"))?;
-    let mut out = nonce.to_vec();
-    out.extend_from_slice(&ct);
-    Ok((out, key))
+    Ok((xseal(&key, &pad(plain, BLOB_CHUNK)?, BLOB_AD)?, key))
 }
 
 pub fn open_blob(blob: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
-    if blob.len() < 24 + 16 {
-        bail!("blob too short");
-    }
-    let (nonce, ct) = blob.split_at(24);
-    let padded = XChaCha20Poly1305::new(key.into())
-        .decrypt(nonce.into(), Payload { msg: ct, aad: BLOB_AD })
-        .map_err(|_| anyhow!("blob decrypt failed"))?;
-    Ok(unpad(&padded)?.to_vec())
+    Ok(unpad(&decrypt(blob, BLOB_AD, key, "blob")?)?.to_vec())
 }
 
 /// The stored size of an attachment of `n` bytes: padded, plus nonce and tag.
@@ -232,6 +210,10 @@ mod tests {
     }
 
     use super::*;
+
+    fn open(ct: &[u8], ad: &[u8], epk: &[u8; 32], keys: &[Wrapped], me: &Seed) -> Result<Option<Vec<u8>>> {
+        content_key(epk, keys, me)?.map(|ck| decrypt(ct, ad, &ck, "body")).transpose()
+    }
 
     #[test]
     fn only_wrapped_recipients_open_and_slots_say_nothing() {

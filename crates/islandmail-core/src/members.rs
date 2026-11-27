@@ -113,8 +113,7 @@ impl MemberList {
                 "list needs at least one node and at most {} recipient keys", crate::envelope::MAX_KEYS);
         let mut keys = HashSet::new();
         let mut add_key = |raw: &str| -> Result<()> {
-            let key = parse_key(raw)?;
-            ensure!(fmt_key(&key) == raw, "public key must use canonical base64url");
+            let key = cert::canonical_key(raw)?;
             ensure!(keys.insert(keys::x25519_public(&key)?), "keys must be distinct across agents and nodes");
             Ok(())
         };
@@ -122,8 +121,7 @@ impl MemberList {
         let mut subjects = HashSet::new();
         for m in &self.members {
             ensure!(cert::valid_name(&m.name), "invalid agent name");
-            ensure!(!m.sub.is_empty() && m.sub.len() <= 120 && m.sub.bytes().all(|b| b.is_ascii_graphic()),
-                    "invalid agent subject");
+            ensure!(cert::valid_sub(&m.sub), "invalid agent subject");
             ensure!(names.insert(addr::norm(&m.name)) && subjects.insert(&m.sub), "duplicate agent name or subject");
             add_key(&m.key)?;
         }
@@ -203,8 +201,7 @@ impl MemberList {
     }
 
     pub fn is_node(&self, key: &PublicKey) -> bool {
-        let key = fmt_key(key);
-        self.nodes.iter().any(|n| n.key == key)
+        self.node_by_key(key).is_some()
     }
 
     pub fn node_keys(&self) -> Vec<PublicKey> {

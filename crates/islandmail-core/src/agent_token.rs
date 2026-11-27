@@ -64,10 +64,6 @@ fn bad(s: impl Into<String>) -> Refusal {
     Refusal::Bad(s.into())
 }
 
-fn rfc3339(ms: i64) -> String {
-    crate::ts_from_millis(ms)
-}
-
 fn parse_time(s: &str, what: &str) -> Result<i64, Refusal> {
     if s.len() > 40 {
         return Err(bad(format!("{what} is not an RFC 3339 time")));
@@ -86,16 +82,12 @@ pub fn mint(seed: &Seed, name: &str, sub: &str, node: &PublicKey, now_ms: i64, l
         sub: sub.into(),
         name: name.into(),
         aud: fmt_key(node),
-        iat: rfc3339(now_ms),
-        exp: rfc3339(now_ms + life * 1000),
+        iat: crate::ts_from_millis(now_ms),
+        exp: crate::ts_from_millis(now_ms + life * 1000),
         nbf: None,
         jti: crate::b64u(&crate::random_bytes::<18>()),
     };
-    mint_claims(seed, &c)
-}
-
-pub fn mint_claims(seed: &Seed, c: &Claims) -> String {
-    paseto::sign(seed, &serde_json::to_vec(c).expect("claims serialize"), b"", IMPLICIT)
+    paseto::sign(seed, &serde_json::to_vec(&c).expect("claims serialize"), IMPLICIT)
 }
 
 /// Checks a token presented to the node whose key is `node`, now: format, the signer is the member's key on the list
@@ -120,7 +112,7 @@ pub fn verify(token: &str, agents: &[Agent], node: &PublicKey, now_ms: i64) -> R
     let mut verified = None;
     let mut last = String::new();
     for a in candidates {
-        match paseto::verify(token, &a.key, b"", IMPLICIT) {
+        match paseto::verify(token, &a.key, IMPLICIT) {
             Ok(msg) => { verified = Some((a, msg)); break; }
             Err(e) => last = e.to_string(),
         }
@@ -159,9 +151,6 @@ pub fn verify(token: &str, agents: &[Agent], node: &PublicKey, now_ms: i64) -> R
     if !valid_jti(&c.jti) {
         return Err(bad("jti must be 16-128 base64url characters"));
     }
-    if c.name.is_empty() || c.sub.is_empty() {
-        return Err(bad("missing sub or name"));
-    }
     Ok(Checked { key: fmt_key(&key), name: m.name.clone(), sub: c.sub, jti: c.jti, exp_ms: exp })
 }
 
@@ -176,13 +165,17 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
 
+    fn mint_claims(seed: &Seed, c: &Claims) -> String {
+        paseto::sign(seed, &serde_json::to_vec(c).unwrap(), IMPLICIT)
+    }
+
     fn claims(name: &str, node: &Seed, iat: i64, exp: i64) -> Claims {
         Claims {
             sub: format!("agent:{name}@test"),
             name: name.into(),
             aud: fmt_key(&node.public()),
-            iat: rfc3339(iat),
-            exp: rfc3339(exp),
+            iat: crate::ts_from_millis(iat),
+            exp: crate::ts_from_millis(exp),
             nbf: None,
             jti: "AAAAAAAAAAAAAAAAAAAAAAAA".into(),
         }
@@ -239,7 +232,7 @@ mod tests {
         assert!(v(claims("a.alice", &node, NOW + 299_000, NOW + 600_000)).is_ok(), "within the 300 s skew");
         assert_eq!(err(claims("a.alice", &node, NOW, NOW)), "exp is not after iat");
         let mut c = claims("a.alice", &node, NOW, NOW + 60_000);
-        c.nbf = Some(rfc3339(NOW + 400_000));
+        c.nbf = Some(crate::ts_from_millis(NOW + 400_000));
         assert_eq!(err(c), "not valid yet (nbf)");
         let mut c = claims("a.alice", &node, NOW, NOW + 60_000);
         c.exp = "tomorrow".into();
@@ -269,15 +262,15 @@ mod tests {
         let raw = crate::b64u_decode(good.strip_prefix(paseto::HEADER).unwrap()).unwrap();
         let sig = &raw[raw.len() - 64..];
         let mut c: Claims = serde_json::from_slice(&raw[..raw.len() - 64]).unwrap();
-        c.exp = rfc3339(NOW + 80_000_000);
+        c.exp = crate::ts_from_millis(NOW + 80_000_000);
         let mut body = serde_json::to_vec(&c).unwrap();
         body.extend_from_slice(sig);
         let tampered = format!("{}{}", paseto::HEADER, crate::b64u(&body));
         assert!(matches!(verify(&tampered, &l, &node.public(), NOW), Err(Refusal::Bad(e)) if e.contains("signature")));
         // A footer, or the same claims signed without the implicit assertion: refused.
         let msg = serde_json::to_vec(&claims("a.alice", &node, NOW, NOW + 60_000)).unwrap();
-        assert!(verify(&paseto::sign(&alice, &msg, b"{}", IMPLICIT), &l, &node.public(), NOW).is_err());
-        assert!(verify(&paseto::sign(&alice, &msg, b"", b""), &l, &node.public(), NOW).is_err());
+        assert!(verify(&format!("{}.e30", paseto::sign(&alice, &msg, IMPLICIT)), &l, &node.public(), NOW).is_err());
+        assert!(verify(&paseto::sign(&alice, &msg, b""), &l, &node.public(), NOW).is_err());
         // Bad jti, garbage, and an aid1 token are refused without panicking.
         let mut c = claims("a.alice", &node, NOW, NOW + 60_000);
         c.jti = "short".into();

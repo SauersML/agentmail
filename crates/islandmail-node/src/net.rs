@@ -1025,9 +1025,9 @@ mod tests {
                 &node.seed,
             )
             .unwrap();
-            let o = e.open(&node.seed).unwrap().unwrap();
+            let o = e.open_for([&node.seed]).unwrap().unwrap();
             let read = crate::store::Read { header: &o.header, v: &v, ck: &o.ck };
-            node.store.insert(&e, Some(read), Some("x"), "[]", None, 0).unwrap().unwrap();
+            node.store.insert_with(&e, Some(read), Some("x"), "[]", None, 0, &Default::default()).unwrap().unwrap();
             ids.push(e.id);
         }
         ids.insert(2, "0".repeat(64)); // one id the peer does not have

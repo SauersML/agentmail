@@ -26,11 +26,6 @@ pub fn valid_name(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("all")
 }
 
-/// A name a certificate may carry.
-pub fn valid_agent_name(name: &str) -> bool {
-    valid_name(name)
-}
-
 /// A namespace entry in a trust file: an exact agent name, or a prefix ending in '.' (e.g. "ops.").
 pub fn valid_namespace_entry(entry: &str) -> bool {
     match entry.strip_suffix('.') {
@@ -43,6 +38,11 @@ pub fn valid_namespace_entry(entry: &str) -> bool {
 pub fn entry_covers(entry: &str, name: &str) -> bool {
     let (e, n) = (crate::addr::norm(entry), crate::addr::norm(name));
     if e.ends_with('.') { n.starts_with(&e) && n.len() > e.len() } else { e == n }
+}
+
+/// A durable agent id (`sub`): 1-120 printable ASCII characters, no spaces.
+pub fn valid_sub(sub: &str) -> bool {
+    !sub.is_empty() && sub.len() <= 120 && sub.bytes().all(|b| b.is_ascii_graphic())
 }
 
 /// The durable id of a certified agent, the same on every host (the client's default sub).
@@ -61,7 +61,7 @@ fn canonical_sig(sig: &str) -> Result<[u8; 64]> {
     b.try_into().map_err(|_| anyhow!("signature is not 64 bytes"))
 }
 
-fn canonical_key(key: &str) -> Result<PublicKey> {
+pub(crate) fn canonical_key(key: &str) -> Result<PublicKey> {
     let k = parse_key(key)?;
     ensure!(fmt_key(&k) == key, "key must be ed25519:<base64url without padding>");
     Ok(k)
@@ -70,7 +70,7 @@ fn canonical_key(key: &str) -> Result<PublicKey> {
 /// Checks an issuance request `{name, key, ts, sig}` for the node `node`: valid name, canonical key, a timestamp within
 /// 5 minutes of `now_ms`, and the key's signature over the certify statement. Returns the agent key.
 pub fn check_issuance(name: &str, key: &str, ts: &str, sig: &str, node: &PublicKey, now_ms: i64) -> Result<PublicKey> {
-    ensure!(valid_agent_name(name), "invalid agent name");
+    ensure!(valid_name(name), "invalid agent name");
     let k = canonical_key(key)?;
     keys::x25519_public(&k)?;
     let t = parse_ts(ts).ok_or_else(|| anyhow!("ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
@@ -114,7 +114,7 @@ fn signed_json<T: Serialize>(context: &[u8], v: &T) -> Vec<u8> {
 
 fn check_signed(v: u32, name: &str, key: &str, node: &str, ts: &str, sig: &str, msg: &[u8]) -> Result<()> {
     ensure!(v == VERSION, "unsupported certificate version {v}");
-    ensure!(valid_agent_name(name), "invalid agent name in certificate");
+    ensure!(valid_name(name), "invalid agent name in certificate");
     canonical_key(key)?;
     let n = canonical_key(node)?;
     ensure!(parse_ts(ts).is_some(), "bad certificate timestamp");
@@ -132,7 +132,6 @@ impl Cert {
         c.sig = b64u(&node.sign(&c.signing_bytes()));
         c
     }
-
 
     pub fn signing_bytes(&self) -> Vec<u8> {
         signed_json(CERT_CONTEXT, &Cert { sig: String::new(), ..self.clone() })

@@ -7,17 +7,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Open options that create files owner-only and do not follow a symlink at the final path component.
-pub fn options() -> OpenOptions {
-    let mut o = OpenOptions::new();
-    imp::no_follow(&mut o);
-    o
-}
-
-/// Refuse a file other users could read or write.
-pub fn check_file(file: &File, path: &Path) -> Result<()> {
-    imp::check(file, path)
-}
+/// Open options that create files owner-only and do not follow a symlink at the final path component;
+/// `check_file` refuses a file other users could read or write; `check_writers` refuses a file that decides what this
+/// node trusts or holds (config, trust file) when another user could change it: on Unix, group or other write bits on
+/// it, or on its folder without the sticky bit, or an owner other than this user or root (Windows: not checked, access
+/// lists there are inherited and checked for key files only); `sync_dir` persists directory entries (Windows has no
+/// directory fsync; NTFS journals metadata).
+pub use imp::{check_file, check_writers, links, options, sync_dir};
 
 /// Make an open file owner-only.
 pub fn restrict_file(file: &File, path: &Path) -> Result<()> {
@@ -37,23 +33,7 @@ pub fn restrict_dir(path: &Path) -> Result<()> {
 /// Refuse a directory that is a symlink, not a directory, or open to other users.
 pub fn check_dir(path: &Path) -> Result<()> {
     anyhow::ensure!(path.symlink_metadata()?.is_dir(), "{} is not a directory", path.display());
-    imp::check(&imp::open_dir(path)?, path)
-}
-
-/// Refuse a file that decides what this node trusts or holds (config, trust file) when another user could change it:
-/// on Unix, group or other write bits on it, or on its folder without the sticky bit, or an owner other than this
-/// user or root. Windows: not checked (access lists there are inherited and checked for key files only).
-pub fn check_writers(path: &Path) -> Result<()> {
-    imp::check_writers(path)
-}
-
-pub fn links(file: &File) -> Result<u64> {
-    imp::links(file)
-}
-
-/// Persist directory entries (a new or removed file name). Windows has no directory fsync; NTFS journals metadata.
-pub fn sync_dir(path: &Path) -> Result<()> {
-    imp::sync_dir(path)
+    imp::check_file(&imp::open_dir(path)?, path)
 }
 
 // The access list check runs on Windows; its parser is tested everywhere.
@@ -96,11 +76,13 @@ mod imp {
     use super::*;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    pub fn no_follow(o: &mut OpenOptions) {
+    pub fn options() -> OpenOptions {
+        let mut o = OpenOptions::new();
         o.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        o
     }
 
-    pub fn check(file: &File, path: &Path) -> Result<()> {
+    pub fn check_file(file: &File, path: &Path) -> Result<()> {
         let md = file.metadata()?;
         let mode = md.permissions().mode() & 0o777;
         anyhow::ensure!(mode & 0o077 == 0, "{} must be private but has mode {mode:o}; run chmod go= on it", path.display());
@@ -240,7 +222,7 @@ mod imp {
         }
     }
 
-    pub fn check(file: &File, path: &Path) -> Result<()> {
+    pub fn check_file(file: &File, path: &Path) -> Result<()> {
         if let Err(who) = sddl_private(&sddl_of(file)?, &user_sid()?) {
             anyhow::bail!("{} must be private but {who} can access it; allow only your user \
                 (icacls \"{}\" /inheritance:r /grant:r \"%USERNAME%:F\")", path.display(), path.display());
@@ -274,8 +256,10 @@ mod imp {
         Ok(())
     }
 
-    pub fn no_follow(o: &mut OpenOptions) {
+    pub fn options() -> OpenOptions {
+        let mut o = OpenOptions::new();
         o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        o
     }
 
     pub fn restrict_file(_file: &File, path: &Path) -> Result<()> {

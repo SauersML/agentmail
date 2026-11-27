@@ -159,7 +159,7 @@ impl Meta {
         if let Some(r) = &m.room {
             ensure!(valid_room_id(r), "invalid room id");
         }
-        ensure!(m.mentions.len() <= MAX_MENTIONS && m.mentions.iter().all(|n| crate::cert::valid_agent_name(n)), "invalid mentions");
+        ensure!(m.mentions.len() <= MAX_MENTIONS && m.mentions.iter().all(|n| crate::cert::valid_name(n)), "invalid mentions");
         if let Some(r) = &m.reply_to {
             ensure!(crate::envelope::is_id(r), "reply_to must be an envelope id");
         }
@@ -187,9 +187,8 @@ impl Meta {
                 Event::Vouch { members } => {
                     ensure!(members.len() <= MAX_ROOM_MEMBERS, "invalid member names");
                     for v in members {
-                        ensure!(crate::cert::valid_agent_name(&v.name), "invalid member names");
-                        ensure!(!v.sub.is_empty() && v.sub.len() <= 120 && v.sub.bytes().all(|b| (b'!'..=b'~').contains(&b)),
-                                "invalid vouched sub");
+                        ensure!(crate::cert::valid_name(&v.name), "invalid member names");
+                        ensure!(crate::cert::valid_sub(&v.sub), "invalid vouched sub");
                         ensure!(crate::keys::parse_key(&v.key).is_ok(), "invalid vouched key");
                         ensure!((1..=MAX_VOUCH_NODES).contains(&v.nodes.len())
                                 && v.nodes.iter().all(|n| crate::keys::parse_key(n).is_ok()), "invalid vouched nodes");
@@ -197,15 +196,10 @@ impl Meta {
                     &[]
                 }
             };
-            ensure!(names.len() <= MAX_ROOM_MEMBERS && names.iter().all(|n| crate::cert::valid_agent_name(n)), "invalid member names");
+            ensure!(names.len() <= MAX_ROOM_MEMBERS && names.iter().all(|n| crate::cert::valid_name(n)), "invalid member names");
         }
         Ok(m)
     }
-}
-
-/// Room name part (after `creator/`): what an agent name allows.
-pub fn valid_room_name(name: &str) -> bool {
-    crate::cert::valid_name(name)
 }
 
 /// A room id: a thread name (open room), `creator/name`, or a DM id.
@@ -223,13 +217,13 @@ pub fn dm_id(a: &str, b: &str) -> String {
 /// The two names of a DM room id.
 pub fn dm_pair(id: &str) -> Option<(String, String)> {
     let (a, b) = id.strip_prefix("dm:")?.split_once('+')?;
-    (crate::cert::valid_agent_name(a) && crate::cert::valid_agent_name(b) && dm_id(a, b) == id).then(|| (a.to_string(), b.to_string()))
+    (crate::cert::valid_name(a) && crate::cert::valid_name(b) && dm_id(a, b) == id).then(|| (a.to_string(), b.to_string()))
 }
 
 /// The creator part of `creator/name`.
 pub fn creator_of(id: &str) -> Option<&str> {
     let (c, name) = id.split_once('/')?;
-    (crate::cert::valid_agent_name(c) && valid_room_name(name)).then_some(c)
+    (crate::cert::valid_name(c) && crate::cert::valid_name(name)).then_some(c)
 }
 
 /// `to` of a room post that is not a DM: it addresses no agent, so only mentions wake anyone.
@@ -254,7 +248,7 @@ pub fn mentions_in(text: &str) -> Vec<String> {
                 j += 1;
             }
             let name: String = chars[i + 1..j].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
-            if crate::cert::valid_agent_name(&name) && !out.contains(&name) && out.len() < MAX_MENTIONS {
+            if crate::cert::valid_name(&name) && !out.contains(&name) && out.len() < MAX_MENTIONS {
                 out.push(name);
             }
             i = j;

@@ -1760,7 +1760,7 @@ mod tests {
         let (node, alice, node_b, list, _rx) = setup();
         let ts = now_ts();
         let salt = islandmail_core::random_bytes::<16>();
-        let digest = islandmail_core::envelope::post_digest(&salt, "deploy now", &[]).unwrap();
+        let digest = islandmail_core::envelope::post_digest_meta(&salt, "deploy now", &[], "").unwrap();
         let st = PostStatement {
             from: "a.alice", sub: "agent:alice@t", to: "all", thread: "t", mode: Mode::Members,
             ts: &ts, digest: &digest, blobs: &[], recipients: &list.all_keys(),
@@ -1836,9 +1836,9 @@ mod tests {
             recipients: &list.all_keys() }, &node_b).unwrap();
         let v = islandmail_core::Verified { sender_sub: "agent:alice@t".into() };
         let wrong = json!([{ "id": id, "name": "a.txt", "type": "text/plain", "size": 10, "key": islandmail_core::b64u(&[7u8; 32]) }]);
-        let opened = decoy.open(&node.seed).unwrap().unwrap();
+        let opened = decoy.open_for([&node.seed]).unwrap().unwrap();
         let read = Read { header: &opened.header, v: &v, ck: &opened.ck };
-        node.store.insert(&decoy, Some(read), Some("decoy"), &wrong.to_string(), None, now_millis()).unwrap().unwrap();
+        node.store.insert_with(&decoy, Some(read), Some("decoy"), &wrong.to_string(), None, now_millis(), &Default::default()).unwrap().unwrap();
         node.post(&alice, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
             "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
@@ -1909,14 +1909,14 @@ mod tests {
             assert!(node.post(&who, &invalid).is_err());
         }
         let p3 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "next" })).unwrap();
-        assert_eq!(rx.try_recv().unwrap().open(&node.seed).unwrap().unwrap().header.parents, vec![p.row.env_id.clone()],
+        assert_eq!(rx.try_recv().unwrap().open_for([&node.seed]).unwrap().unwrap().header.parents, vec![p.row.env_id.clone()],
                    "parents = thread heads");
         assert!(p3.row.id > p.row.id);
     }
 
     fn signed(list: &MemberList, alice: &Seed, to: &str, thread: &str, text: &str, files: &[Value], ts: &str) -> Value {
         let salt = islandmail_core::random_bytes::<16>();
-        let digest = islandmail_core::envelope::post_digest(&salt, text, files).unwrap();
+        let digest = islandmail_core::envelope::post_digest_meta(&salt, text, files, "").unwrap();
         let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
         let st = PostStatement {
             from: "a.alice", sub: "agent:alice@t", to, thread, mode: Mode::Members,
@@ -1980,7 +1980,7 @@ mod tests {
                                  "signed": signed(&_l, &alice, "all", "t", "see file", std::slice::from_ref(&f), &ts) }))
             .unwrap();
         let e = rx.try_recv().unwrap();
-        let o = e.open(&node.seed).unwrap().unwrap();
+        let o = e.open_for([&node.seed]).unwrap().unwrap();
         for (field, replacement) in [("name", json!("different.txt")), ("type", json!("application/json")), ("size", json!(1))] {
             let mut changed = o.body.clone();
             changed.files[0][field] = replacement;
@@ -2191,7 +2191,7 @@ mod tests {
     fn envelope_from(writer: &Node, agent: &Seed, name: &str, text: &str, cert: Option<Cert>) -> Envelope {
         let list = writer.members.read().unwrap().clone();
         let (ts, salt) = (now_ts(), islandmail_core::random_bytes::<16>());
-        let digest = islandmail_core::envelope::post_digest(&salt, text, &[]).unwrap();
+        let digest = islandmail_core::envelope::post_digest_meta(&salt, text, &[], "").unwrap();
         let keys = list.all_keys();
         let st = PostStatement { from: name, sub: &format!("agent:{name}"), to: "all", thread: "t", mode: Mode::Members,
                                  ts: &ts, digest: &digest, blobs: &[], recipients: &keys }.signing_bytes(&list);
@@ -2248,7 +2248,7 @@ mod tests {
         mac.store.remember_encryption_key(&record).unwrap();
         let p = mac.post(&bob, &json!({"to": "dana", "mode": "private", "text": "for now"})).unwrap();
         let env: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0]).unwrap();
-        assert!(env.open(&pod.seed).unwrap().is_none(), "the pod's long-lived key has no slot");
+        assert!(env.open_for([&pod.seed]).unwrap().is_none(), "the pod's long-lived key has no slot");
         assert_eq!(pod.ingest(env.clone()).unwrap().unwrap().text.as_deref(), Some("for now"));
         // Once the pod's rotating seed is gone (expired and deleted), its own copy of the ciphertext stays shut.
         pod.epoch_keys.write().unwrap().clear();
@@ -2278,7 +2278,7 @@ mod tests {
         let bob = mac.verify(&token(&h_bob, "h.bob", &mac)).unwrap();
         let p = mac.post(&bob, &json!({"to": "dana", "mode": "private", "text": "for dana only"})).unwrap();
         let env: Envelope = serde_json::from_str(&mac.store.envelopes(std::slice::from_ref(&p.row.env_id)).unwrap()[0]).unwrap();
-        assert!(env.open(&pod.seed).unwrap().is_some(), "wrapped to the pod's node key");
+        assert!(env.open_for([&pod.seed]).unwrap().is_some(), "wrapped to the pod's node key");
         let row = pod.ingest(env).unwrap().expect("stored at the pod");
         let at_pod = pod.verify(&token(&dana, "dana", &pod)).unwrap();
         let got = pod.store.get(row.id, &at_pod).unwrap().expect("dana reads it at the pod");
@@ -2288,7 +2288,7 @@ mod tests {
         // dana writes from the pod; the mac accepts it (pod's cert travels in the envelope) and can read the reply.
         let r = pod.post(&at_pod, &json!({"to": "h.bob", "mode": "private", "text": "reply"})).unwrap();
         let env: Envelope = serde_json::from_str(&pod.store.envelopes(std::slice::from_ref(&r.row.env_id)).unwrap()[0]).unwrap();
-        let carried = env.open(&mac.seed).unwrap().unwrap().header.attest.cert;
+        let carried = env.open_for([&mac.seed]).unwrap().unwrap().header.attest.cert;
         assert!(carried.is_some_and(|c| c.node == fmt_key(&pod.seed.public())));
         let row = mac.ingest(env).unwrap().unwrap();
         assert!(mac.store.get(row.id, &bob).unwrap().is_some());
