@@ -436,8 +436,9 @@ def issue12_checks(cl, js, req, api, token, bg, orig):
           out[:160])
     rc, out = cl("alice", "get", orig["env"])
     check("and the full envelope hash", rc == 0 and "secret one" in out)
-    ids = sorted(m["id"] for m in js("alice", "read", "--latest", "200"))
-    pre = next((a[:n] for n in (1, 2) for a, b in zip(ids, ids[1:]) if a[:n] == b[:n]), None)
+    # Every message get resolves, membership notices included (read leaves those out unless --all).
+    ids = sorted(m["id"] for m in js("alice", "read", "--latest", "200", "--all"))
+    pre = next((a[:n] for n in (1, 2, 3) for a, b in zip(ids, ids[1:]) if a[:n] == b[:n]), None)
     rc, out = cl("alice", "get", pre or "a")
     check("an ambiguous prefix asks for more of the id", rc != 0 and "more than one" in out, "%s: %s" % (pre, out[-120:]))
     rc, out = cl("alice", "get", "zzzzzzzz")
