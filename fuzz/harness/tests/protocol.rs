@@ -136,20 +136,24 @@ proptest! {
                     _ => { let _ = n.ingest(after.clone()); }
                 }
             }
+            // Mail that opens but does not verify yet is refused, and a later sync offers it again.
+            let _ = n.ingest(before.clone());
+            let _ = n.ingest(after.clone());
             n
         };
         let (x, y) = (run(&order_x), run(&order_y));
-        // Both nodes end with the same roster, keep both envelopes (sealed or read), and show the mail from before
-        // the revocation once its certificate is known. Mail dated after a known revocation is never shown.
+        // Both nodes end with the same roster and show the mail from before the revocation (it carries its
+        // certificate). Mail dated after the revocation that arrives once the revocation is known is refused, every
+        // time a later sync offers it again: never stored, never shown.
         prop_assert_eq!(x.agents(), y.agents());
         prop_assert!(x.agents().iter().all(|a| a.name != "c.carol"), "a revoked certificate still counts now");
         for (n, order) in [(&x, &order_x), (&y, &order_y)] {
             let rows = islandmail_fuzz_harness::rows(n);
             let text = |id: &str| rows.iter().find(|r| r.0 == id).map(|r| r.4.clone());
-            prop_assert!(text(&before.id).is_some() && text(&after.id).is_some(), "an envelope was dropped");
+            prop_assert!(matches!(text(&before.id), Some(Some(_))), "mail from before the revocation is not shown");
             let pos = |s| order.iter().position(|&o| o == s).unwrap();
             if pos(1) < pos(3) {
-                prop_assert_eq!(text(&after.id), Some(None), "mail dated after a known revocation was shown");
+                prop_assert_eq!(text(&after.id), None, "mail dated after a known revocation was kept");
             }
         }
         world::remove(&x);

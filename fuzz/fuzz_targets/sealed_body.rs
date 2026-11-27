@@ -34,10 +34,12 @@ fuzz_target!(|data: &[u8]| {
     }
     // Only padded lengths pass the forwarding check; those reach ingest.
     if env.check(&l, islandmail_core::now_millis()).is_ok() {
-        let row = node().ingest(env.clone()).unwrap();
-        if let Some(r) = row {
-            let _ = r.to_message();
+        // Mail that opens here but does not verify is refused (an Err), so a later sync can offer it again.
+        if let Ok(row) = node().ingest(env.clone()) {
+            if let Some(r) = row {
+                let _ = r.to_message();
+            }
+            assert!(node().ingest(env).unwrap().is_none());
         }
-        assert!(node().ingest(env).unwrap().is_none());
     }
 });
