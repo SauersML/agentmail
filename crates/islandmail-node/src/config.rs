@@ -22,16 +22,24 @@ pub struct Config {
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
     pub members_file: PathBuf,
-    /// The folder of islandmail.py identity files ({name, seed, …}) of the agents on this host (required): the node
-    /// signs their posts and reads their private mail with these keys. Seeds are read, never logged or copied.
-    #[serde(default)]
-    pub identities_dir: Option<PathBuf>,
+    /// The folder, or list of folders, of islandmail.py identity files ({name, seed, …}) of the agents on this host
+    /// (required): the node signs their posts and reads their private mail with these keys. Seeds are read, never
+    /// logged or copied.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub identities_dir: Vec<PathBuf>,
     /// Seconds between anti-entropy rounds with every peer.
     #[serde(default = "default_sync")]
     pub sync_secs: u64,
 }
 
 const KEYS: [&str; 8] = ["data_dir", "api_listen", "iroh_port", "relay", "node_key_file", "members_file", "identities_dir", "sync_secs"];
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PathBuf>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Dirs { One(PathBuf), Many(Vec<PathBuf>) }
+    Ok(match Dirs::deserialize(d)? { Dirs::One(p) => vec![p], Dirs::Many(v) => v })
+}
 
 fn default_api() -> String {
     "127.0.0.1:8787".into()
@@ -52,15 +60,15 @@ impl Config {
             tracing::warn!("config {}: ignoring unknown keys {}", path.display(), unknown.join(", "));
         }
         let mut c: Config = serde_json::from_value(v.into()).context("config is not valid")?;
-        anyhow::ensure!(c.identities_dir.is_some(), "config {} needs \"identities_dir\": the folder with this host's \
-                        agent identity files (~/.islandmail/identities); the node signs its agents' posts with them",
-                        path.display());
+        anyhow::ensure!(!c.identities_dir.is_empty(), "config {} needs \"identities_dir\": the folder (or list of \
+                        folders) with this host's agent identity files (~/.islandmail/identities); the node signs its \
+                        agents' posts with them", path.display());
         let base = path.parent().unwrap_or(Path::new("."));
         let fix = |p: &mut PathBuf| if p.is_relative() { *p = base.join(&*p) };
         fix(&mut c.data_dir);
         fix(&mut c.node_key_file);
         fix(&mut c.members_file);
-        if let Some(d) = c.identities_dir.as_mut() { fix(d) }
+        c.identities_dir.iter_mut().for_each(fix);
         Ok(c)
     }
 
@@ -76,12 +84,10 @@ impl Config {
         Ok(list)
     }
 
-    /// Names, sizes and modification times in identities_dir: a change means the files need reading again.
-    pub fn identities_stamp(&self) -> Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)> {
-        let Some(dir) = &self.identities_dir else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
-        let mut v: Vec<_> = rd.flatten()
-            .map(|e| { let m = e.metadata().ok(); (e.file_name(), m.as_ref().map_or(0, |m| m.len()), m.and_then(|m| m.modified().ok())) })
+    /// Paths, sizes and modification times in identities_dir: a change means the files need reading again.
+    pub fn identities_stamp(&self) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
+        let mut v: Vec<_> = self.identities_dir.iter().filter_map(|d| std::fs::read_dir(d).ok()).flat_map(|rd| rd.flatten())
+            .map(|e| { let m = e.metadata().ok(); (e.path(), m.as_ref().map_or(0, |m| m.len()), m.and_then(|m| m.modified().ok())) })
             .collect();
         v.sort();
         v
@@ -92,12 +98,11 @@ impl Config {
 /// (its pin's, else agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known
 /// here with another sub"), so it is refused here with a log line naming the file and the fix. Files that do not
 /// parse, and files other users could read (group or world bits set), are skipped with a warning.
-pub fn held(dir: Option<&Path>, members: &MemberList) -> Vec<(String, Seed)> {
-    let Some(dir) = dir else { return vec![] };
-    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+pub fn held(dirs: &[PathBuf], members: &MemberList) -> Vec<(String, Seed)> {
     let norm = islandmail_core::addr::norm;
     let mut out = Vec::new();
-    for path in rd.flatten().map(|e| e.path()) {
+    let files = dirs.iter().filter_map(|d| std::fs::read_dir(d).ok()).flat_map(|rd| rd.flatten().map(|e| e.path()));
+    for path in files {
         if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
         let raw = match read_private(&path) {
             Ok(raw) => raw,
@@ -181,6 +186,8 @@ mod tests {
         std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m", "identities_dir": "i", "certify": "open"}"#).unwrap();
         let c = Config::load(&path).unwrap();
         assert_eq!((c.data_dir, c.sync_secs), (dir.join("d"), 30));
+        std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m", "identities_dir": ["a", "/b"]}"#).unwrap();
+        assert_eq!(Config::load(&path).unwrap().identities_dir, vec![dir.join("a"), PathBuf::from("/b")]);
         std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m"}"#).unwrap();
         assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("identities_dir"));
         std::fs::remove_dir_all(dir).unwrap();

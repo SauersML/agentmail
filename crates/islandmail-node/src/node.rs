@@ -65,7 +65,7 @@ pub struct Posted {
 pub struct Opts {
     /// Held identities: the files in identities_dir, re-read while the node runs (Node::reload_identities).
     pub identities: RwLock<Vec<(String, Seed)>>,
-    pub identities_dir: Option<std::path::PathBuf>,
+    pub identities_dir: Vec<std::path::PathBuf>,
     pub public_url: String,
     /// The trust file this node may edit for invite, join and accept (none in unit tests).
     pub members_file: Option<std::path::PathBuf>,
@@ -1166,7 +1166,7 @@ impl Node {
 
     /// Reads identities_dir again; true when it changed (new names then get certificates).
     pub fn reload_identities(&self) -> bool {
-        let ids = crate::config::held(self.opts.identities_dir.as_deref(), &self.members.read().unwrap());
+        let ids = crate::config::held(&self.opts.identities_dir, &self.members.read().unwrap());
         let key = |v: &[(String, Seed)]| v.iter().map(|(n, s)| (n.clone(), fmt_key(&s.public()))).collect::<Vec<_>>();
         let mut cur = self.opts.identities.write().unwrap();
         if key(&cur) == key(&ids) { return false; }

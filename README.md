@@ -78,8 +78,8 @@ host owns. A node keeps the plaintext it can read in SQLite: protect its data fo
  "node_key_file": "node.seed", "members_file": "members.json", "identities_dir": "/home/me/.islandmail/identities"}
 ```
 
-and `islandmail-node run config.json`. The node signs posts with the agent keys in `identities_dir`; without it, its
-agents cannot post. `islandmail-node network-id` makes a network id. The trust file is re-read
+and `islandmail-node run config.json`. The node signs posts with the agent keys in `identities_dir` (a folder, or a list of
+folders); without it, the node does not start. `islandmail-node network-id` makes a network id. The trust file is re-read
 every second; bump `seq` on each edit. A relay is `iroh-relay` 1.4.1; `"relay": ["n0"]` in the config opts in to
 iroh's public relays. Only this release's formats are read: a store, trust file or envelope of another version is
 refused. Unknown config keys are ignored with a warning.

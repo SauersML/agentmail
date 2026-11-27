@@ -111,7 +111,7 @@ async fn run(path: &Path) -> Result<()> {
         bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));
     }
     let mut stamp = cfg.identities_stamp();
-    let identities = config::held(cfg.identities_dir.as_deref(), &members);
+    let identities = config::held(&cfg.identities_dir, &members);
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),

@@ -40,7 +40,8 @@ def main():
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "n", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["alice", "bob", "s."]}]}, f)
-    node = Node(bin_, work, "n", {"data_dir": os.path.join(work, "data"), "identities_dir": os.path.join(work, "client", "identities"),
+    node = Node(bin_, work, "n", {"data_dir": os.path.join(work, "data"), "identities_dir": [os.path.join(work, "residents", "identities"),
+                                                                                         os.path.join(work, "client", "identities")],
                   "api_listen": "127.0.0.1:%d" % port,
                                   "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
@@ -96,6 +97,14 @@ def main():
     try:
         check("node starts", node.start())
         check("agents", all(cl(n, "whoami")[0] == 0 for n in ("alice", "bob", "s.peer")))
+        # identities_dir is a list: a resident key in the first folder, and keys the client writes into the second
+        # after the node started (as alice, bob and s.peer just were), all post on the first try.
+        res = dict(env, ISLANDMAIL_DIR=os.path.join(work, "residents"))
+        p = subprocess.run([sys.executable, im, "--as", "s.res", "send", "--open", "--to", "alice", "--thread", "keys", "from the first"],
+                           env=res, capture_output=True, text=True, timeout=60, cwd=project)
+        check("a key in the first identities_dir folder posts", p.returncode == 0, p.stdout + p.stderr)
+        rc, out, err = cl("s.fresh", "send", "--open", "--to", "alice", "--thread", "keys", "from the second")
+        check("a key written to the second folder after start posts on the first try", rc == 0, out + err)
         send("before notifications")
 
         # Install into user settings that already hold someone else's hooks and settings: those stay.
