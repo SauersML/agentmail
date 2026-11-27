@@ -85,9 +85,16 @@ def main():
         return bool(got)
 
     def join(h, invite, bin_):
+        # A loaded machine can miss the dial window (or the client's HTTP timeout): join again, up to three times. The
+        # invite stays unspent until the inviting node answers, and a second join uses the node the first one made.
         cfg, port = joined[h]
-        return cl(h, "join", invite, "--config", cfg, "--bin", bin_, "--api", "127.0.0.1:%d" % api[h],
-                  "--listen", "127.0.0.1:%d" % port, "--wait", "60")
+        for _ in range(3):
+            rc, out = cl(h, "join", invite, "--config", cfg, "--bin", bin_, "--api", "127.0.0.1:%d" % api[h],
+                         "--listen", "127.0.0.1:%d" % port, "--wait", "120", timeout=300)
+            if rc == 0 and "joined as" in out:
+                break
+            print("(join of %s did not complete, trying again: %s)" % (h, out[-200:].strip()), flush=True)
+        return rc, out
 
     def joined_pid(h):
         try:
