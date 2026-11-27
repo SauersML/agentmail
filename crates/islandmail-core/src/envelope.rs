@@ -359,10 +359,7 @@ impl Envelope {
 
     /// `check` without the membership of the writing node: framing, sizes, time and the node's signature.
     pub fn check_frame(&self, now_ms: i64) -> Result<()> {
-        if !crate::versions::ENVELOPE_READS.contains(&self.v) {
-            if self.v > VERSION {
-                bail!("{}", crate::versions::too_new("envelope", self.v, VERSION));
-            }
+        if self.v != VERSION {
             bail!("unsupported envelope version {}", self.v);
         }
         let n = self.keys.len();

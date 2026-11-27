@@ -176,60 +176,6 @@ impl Node {
         self.trust.send_modify(|g| *g += 1);
     }
 
-    /// Run once at start: what an older build stored but could not use. (1) Room traffic stored as plain mail
-    /// because that build did not know one of its room fields (it logged "invalid room fields, shown as plain mail"):
-    /// a vouch that arrived before this host was upgraded, say. Sync never offers an envelope the store already has,
-    /// so without this the event stays invisible for good. Each body is opened with the stored content key and
-    /// checked against the signed digest; a row changes only when this build can parse its room fields. (2) Key
-    /// grants of an open room's membership events, which builds before this one skipped: applied now, newest first,
-    /// for a room that is still unknown here. Returns the rows changed and the rooms repaired. After Morel's #20.
-    pub fn reread_stored(&self) -> Result<(usize, usize)> {
-        let agents = self.agents();
-        let mut changed = 0;
-        for (id, raw, ck) in self.store.plain_readable()? {
-            let Ok(env) = serde_json::from_str::<Envelope>(&raw) else { continue };
-            let Some(ck) = islandmail_core::b64u_decode(&ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
-            let Ok(o) = env.open_with(&ck) else { continue };
-            if o.body.meta.is_empty() || env.check_body(&o.header, &o.body).is_err() {
-                continue;
-            }
-            let Ok(meta) = islandmail_core::room::Meta::parse(&o.body.meta) else { continue };
-            if self.store.set_room_fields(&id, &crate::store::Extra::of(&o.body.meta, &meta))? {
-                changed += 1;
-                if !meta.grant.is_empty() {
-                    self.apply_grant(&env, &o.header, &meta, &agents)?;
-                }
-            }
-        }
-        if changed > 0 {
-            tracing::warn!("{changed} stored message(s) had room fields an older build could not read; they are room traffic now");
-            // Membership and vouches decide which refused envelopes may now be taken.
-            self.trust.send_modify(|g| *g += 1);
-        }
-        let mut repaired = 0;
-        let mut done: HashSet<String> = HashSet::new();
-        for (raw, ck, thread) in self.store.open_room_grants()? {
-            if done.contains(&thread) || self.room_state(&thread)?.is_some_and(|s| s.created) {
-                done.insert(thread);
-                continue;
-            }
-            let Ok(env) = serde_json::from_str::<Envelope>(&raw) else { continue };
-            let Some(ck) = islandmail_core::b64u_decode(&ck).and_then(|k| <[u8; 32]>::try_from(k).ok()) else { continue };
-            let Ok(o) = env.open_with(&ck) else { continue };
-            let Ok(meta) = islandmail_core::room::Meta::parse(&o.body.meta) else { continue };
-            if o.header.thread != thread || meta.grant.is_empty() || env.check_body(&o.header, &o.body).is_err() {
-                continue;
-            }
-            self.apply_grant(&env, &o.header, &meta, &agents)?;
-            if self.room_state(&thread)?.is_some_and(|s| s.created) {
-                tracing::warn!("{thread}: opened its membership events from a key grant an older build stored unused");
-                repaired += 1;
-                done.insert(thread);
-            }
-        }
-        Ok((changed, repaired))
-    }
-
     /// Whether `id` was refused and nothing that could change the answer has happened since.
     pub fn refused_now(&self, id: &str) -> bool {
         let generation = *self.trust.borrow();
@@ -1780,25 +1726,6 @@ mod tests {
             writer,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn rereads_room_fields_an_older_build_stored_as_plain_mail() {
-        let (node, alice, writer, list, _rx) = setup();
-        let viewer = Caller {
-            name: "a.alice".into(), sub: "agent:alice@t".into(), key: fmt_key(&alice.public()), exp_ms: i64::MAX,
-        };
-        let first = node.ingest(envelope(&writer, &list, &alice, "first")).unwrap().unwrap();
-        let meta = format!(r#"{{"reply_to":"{}","room":"t"}}"#, first.env_id);
-        let reply = node.ingest(envelope_in(&writer, &list, &alice, "re first", now_ts(), &meta, ("room:t", "t"))).unwrap().unwrap();
-        assert_eq!(reply.meta.as_deref(), Some(meta.as_str()));
-        // What a build that could not parse these room fields left behind: plain mail, no meta.
-        node.store.forget_room_fields(&reply.env_id).unwrap();
-        assert_eq!(node.store.get(reply.id, &viewer).unwrap().unwrap().meta, None);
-        assert_eq!(node.reread_stored().unwrap(), (1, 0), "the room post with room fields, not the mail without");
-        let row = node.store.get(reply.id, &viewer).unwrap().unwrap();
-        assert_eq!(row.meta.as_deref(), Some(meta.as_str()));
-        assert_eq!(node.reread_stored().unwrap(), (0, 0), "nothing left to read again");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::endpoint::{presets, AfterHandshakeOutcome, BeforeConnectOutcome, ConnectOptions, Connection, EndpointHooks, WeakConnectionHandle};
+use iroh::endpoint::{presets, AfterHandshakeOutcome, BeforeConnectOutcome, Connection, EndpointHooks, WeakConnectionHandle};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
@@ -24,14 +24,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::config::Config;
 use crate::node::Node;
 
-/// The newest sync protocol (versions::SYNC lists every one this build speaks).
-pub const SYNC_ALPN: &[u8] = versions::SYNC[0];
-use islandmail_core::versions::{self, HELLO_ALPN};
-/// The sync protocol of pre-release nodes from before sealed envelopes (and before the hello exchange): answered
-/// only with a clear refusal, both ways.
-const OLD_SYNC_ALPN: &[u8] = b"islandmail/sync/1";
-/// Closing code for a peer this build shares no sync protocol with.
-const INCOMPATIBLE: u32 = 426;
+pub const SYNC_ALPN: &[u8] = islandmail_core::versions::SYNC;
 /// The one protocol a key that is not on the trust file may use: present a reply to this node's invite (invite.rs).
 pub const JOIN_ALPN: &[u8] = b"islandmail/join/1";
 const MAX_GOSSIP: usize = 1 << 20;
@@ -221,97 +214,6 @@ struct SyncProto {
     node: Arc<Node>,
 }
 
-const INCOMPATIBLE_REASON: &[u8] = b"peer runs an incompatible wire format: this node speaks islandmail/sync/2 (sealed envelopes)";
-
-/// Logs `msg` about `peer` at most every ten minutes.
-fn warn_incompatible(peer: &EndpointId, msg: &str) {
-    static LAST: std::sync::Mutex<Option<std::collections::HashMap<EndpointId, std::time::Instant>>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
-    let last = last.get_or_insert_with(Default::default);
-    if last.get(peer).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
-        return;
-    }
-    last.insert(*peer, std::time::Instant::now());
-    tracing::warn!("peer {} {msg}", peer.fmt_short());
-}
-
-/// The number at the end of a protocol name (islandmail/sync/2 -> 2).
-fn proto_number(p: &str) -> u64 {
-    p.rsplit('/').next().and_then(|n| n.parse().ok()).unwrap_or(0)
-}
-
-/// What to log when a peer speaks the sync protocols `theirs` and this build none of them: None if one is shared.
-fn mismatch(theirs: &[String]) -> Option<String> {
-    let ours: Vec<String> = versions::SYNC.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    if theirs.iter().any(|t| ours.contains(t)) {
-        return None;
-    }
-    let (their_max, our_max) = (theirs.iter().map(|t| proto_number(t)).max().unwrap_or(0),
-                                ours.iter().map(|t| proto_number(t)).max().unwrap_or(0));
-    Some(if their_max > our_max {
-        format!("runs a newer Islandmail build (speaks {}; this node {}): please upgrade this node", theirs.join(", "), ours.join(", "))
-    } else {
-        format!("runs an older Islandmail build (speaks {}; this node {}): please upgrade that node", theirs.join(", "), ours.join(", "))
-    })
-}
-
-/// HELLO_ALPN: the caller sends its versions (versions::report), we answer with ours. Both sides log a mismatch.
-#[derive(Debug, Clone)]
-struct HelloProto;
-
-impl ProtocolHandler for HelloProto {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let (mut send, mut recv) = conn.accept_bi().await.map_err(AcceptError::from_err)?;
-        let req = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(64 * 1024)).await
-            .map_err(AcceptError::from_err)?.map_err(AcceptError::from_err)?;
-        if let Some(msg) = sync_list(&req).as_deref().and_then(mismatch) {
-            warn_incompatible(&conn.remote_id(), &msg);
-        }
-        send.write_all(&serde_json::to_vec(&versions::report()).expect("json")).await.map_err(AcceptError::from_err)?;
-        send.finish().map_err(AcceptError::from_err)?;
-        let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
-        Ok(())
-    }
-}
-
-fn sync_list(report: &[u8]) -> Option<Vec<String>> {
-    let v: serde_json::Value = serde_json::from_slice(report).ok()?;
-    serde_json::from_value(v.get("sync")?.clone()).ok()
-}
-
-/// Asks `peer` what it speaks (after a failed sync handshake) and logs who must upgrade.
-async fn hello(endpoint: &Endpoint, peer: EndpointId) -> Result<()> {
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(EndpointAddr::new(peer), HELLO_ALPN)).await??;
-    let (mut send, mut recv) = conn.open_bi().await?;
-    send.write_all(&serde_json::to_vec(&versions::report())?).await?;
-    send.finish()?;
-    let resp = tokio::time::timeout(Duration::from_secs(10), recv.read_to_end(64 * 1024)).await??;
-    conn.close(0u32.into(), b"done");
-    let theirs = sync_list(&resp).context("bad hello answer")?;
-    match mismatch(&theirs) {
-        Some(msg) => {
-            warn_incompatible(&peer, &msg);
-            anyhow::bail!("peer {msg}")
-        }
-        None => Ok(()),
-    }
-}
-
-const OLD_FORMAT: &str = "runs an incompatible wire format (islandmail/sync/1, before sealed envelopes); \
-                          it must upgrade to this build (islandmail/sync/2)";
-
-/// OLD_SYNC_ALPN: a node on the old wire format dialed us. Log it and close with a reason its log shows.
-#[derive(Debug, Clone)]
-struct OldSyncProto;
-
-impl ProtocolHandler for OldSyncProto {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        warn_incompatible(&conn.remote_id(), OLD_FORMAT);
-        conn.close(INCOMPATIBLE.into(), INCOMPATIBLE_REASON);
-        Ok(())
-    }
-}
-
 impl ProtocolHandler for SyncProto {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         loop {
@@ -434,12 +336,8 @@ fn is_cover(msg: &[u8]) -> bool {
     msg.starts_with(br#"{"cover":"#)
 }
 
-/// A sync connection offering every protocol in versions::SYNC; the listener picks the newest both speak.
 async fn connect_sync(endpoint: &Endpoint, peer: EndpointId) -> Result<Connection> {
-    let extra = versions::SYNC[1..].iter().map(|a| a.to_vec()).collect();
-    let conn = endpoint.connect_with_opts(EndpointAddr::new(peer), SYNC_ALPN,
-                                          ConnectOptions::new().with_additional_alpns(extra)).await?.await?;
-    Ok(conn)
+    Ok(endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?)
 }
 
 /// Kept alive for the node's lifetime (dropping the router stops accepting).
@@ -579,21 +477,7 @@ impl Ctx {
         let conn = match tokio::time::timeout(CONNECT_TIMEOUT, connect_sync(&self.endpoint, peer))
             .await.context("connect timed out")? {
             Ok(c) => c,
-            Err(e) => {
-                // No shared sync protocol? Ask what the peer speaks (both sides then log who must upgrade); a
-                // pre-release peer that knows no hello but the old sync protocol is on the old wire format.
-                match hello(&self.endpoint, peer).await {
-                    Err(h) if h.to_string().starts_with("peer ") => return Err(h),
-                    Ok(()) => return Err(e),
-                    Err(_) => {}
-                }
-                if let Ok(Ok(old)) = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), OLD_SYNC_ALPN)).await {
-                    old.close(INCOMPATIBLE.into(), INCOMPATIBLE_REASON);
-                    warn_incompatible(&peer, OLD_FORMAT);
-                    anyhow::bail!("peer {OLD_FORMAT}");
-                }
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         };
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
@@ -794,14 +678,8 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
     let services = endpoint.address_lookup()?;
     services.clear();
     services.add(lookup.clone());
-    // Sync protocols newest first: the listener's order decides which one a connection uses.
-    let mut router = Router::builder(endpoint.clone()).accept(GOSSIP_ALPN, gossip.clone());
-    for alpn in versions::SYNC {
-        router = router.accept(*alpn, SyncProto { node: node.clone() });
-    }
-    let router = router
-        .accept(HELLO_ALPN, HelloProto)
-        .accept(OLD_SYNC_ALPN, OldSyncProto)
+    let router = Router::builder(endpoint.clone()).accept(GOSSIP_ALPN, gossip.clone())
+        .accept(SYNC_ALPN, SyncProto { node: node.clone() })
         .accept(JOIN_ALPN, JoinProto::new(node.clone()))
         .spawn();
     *node.dialer.lock().unwrap() = Some(Dialer { endpoint: endpoint.clone(), lookup: lookup.clone(), relays: relays.clone() });
@@ -992,12 +870,6 @@ mod tests {
     use islandmail_core::keys::{fmt_key, Seed};
     use islandmail_core::{Attest, Body, Mode, NodeEntry, Verified};
 
-    #[test]
-    fn a_peer_with_no_shared_sync_protocol_is_told_who_must_upgrade() {
-        assert!(mismatch(&[String::from_utf8_lossy(SYNC_ALPN).into_owned(), "islandmail/sync/9".into()]).is_none());
-        assert!(mismatch(&["islandmail/sync/9".into()]).unwrap().contains("please upgrade this node"));
-        assert!(mismatch(&["islandmail/sync/1".into()]).unwrap().contains("please upgrade that node"));
-    }
 
     #[test]
     fn cover_messages_look_like_small_envelopes_and_are_dropped() {
@@ -1152,17 +1024,7 @@ mod tests {
         let issuer = fmt_key(&reader.seed.public());
         let page = call(&peer, &network, &Req::CertsFor { issuer: issuer.clone() }).await?;
         assert!(!page.more_trust && page.certs.len() == 1 && page.certs[0].node == issuer);
-        // A newer peer offering sync/9 first settles on the newest protocol both speak; hello agrees.
-        let newer = hosts[0].1.endpoint.connect_with_opts(remote.id(), b"islandmail/sync/9",
-            ConnectOptions::new().with_additional_alpns(vec![SYNC_ALPN.to_vec()])).await?.await?;
-        assert_eq!(newer.alpn(), SYNC_ALPN);
-        drop(newer);
-        hello(&hosts[0].1.endpoint, remote.id()).await?;
-        // A member on the old wire format is told why, in the close reason, not silently dropped.
-        let old = hosts[0].1.endpoint.connect(remote.id(), OLD_SYNC_ALPN).await?;
-        let closed = tokio::time::timeout(Duration::from_secs(10), old.closed()).await
-            .context("no close reason for the old wire format")?;
-        assert!(closed.to_string().contains("incompatible wire format"), "{closed}");
+
         let outsider = Endpoint::builder(presets::Minimal).clear_ip_transports()
             .relay_mode(relay_mode(std::slice::from_ref(&url))?).bind().await?;
         let attempt = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1173,7 +1035,6 @@ mod tests {
         assert!(refused.contains("not a member node"), "{refused}");
         outsider.close().await;
         drop(peer);
-        drop(old);
         // Windows cannot delete open files: release every node (and its store) before removing the directory.
         for (node, net) in hosts {
             net.shutdown().await?;

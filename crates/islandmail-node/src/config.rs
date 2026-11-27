@@ -10,7 +10,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Config format version (islandmail_core::versions::CONFIG); older configs are migrated at start.
+    /// Config format version (islandmail_core::versions::CONFIG).
     #[serde(default = "one")]
     pub v: u32,
     pub data_dir: PathBuf,
@@ -71,9 +71,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         // Whoever can change the config or the trust file decides what this node trusts: only this user (or root).
         crate::private_fs::check_writers(path).context("refusing the config")?;
-        let value = crate::migrate::file(path, crate::migrate::config)?;
-        let mut c: Config = serde_json::from_value(value).context("config is not valid")?;
-        anyhow::ensure!(c.v == islandmail_core::versions::CONFIG, "config version {} after migration", c.v);
+        let raw = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut c: Config = serde_json::from_slice(&raw).context("config is not valid")?;
+        anyhow::ensure!(c.v == islandmail_core::versions::CONFIG, "unsupported config version {}", c.v);
         let base = path.parent().unwrap_or(Path::new("."));
         let fix = |p: &mut PathBuf| {
             if p.is_relative() {
@@ -91,17 +91,13 @@ impl Config {
 
     pub fn members(&self) -> Result<MemberList> {
         crate::private_fs::check_writers(&self.members_file).context("refusing the trust file")?;
-        let value = crate::migrate::file(&self.members_file, crate::migrate::trust)?;
-        let list: MemberList = serde_json::from_value(value).context("member list is not valid")?;
-        list.validate()?;
-        Ok(list)
+        let raw = std::fs::read(&self.members_file).with_context(|| format!("reading {}", self.members_file.display()))?;
+        Self::parse_members(&raw)
     }
 
-    /// A trust file's bytes as this build's member list (an older version is brought forward in memory).
+    /// A trust file's bytes as a member list.
     pub fn parse_members(raw: &[u8]) -> Result<MemberList> {
-        let mut value: serde_json::Value = serde_json::from_slice(raw).context("member list is not valid JSON")?;
-        crate::migrate::trust(&mut value)?;
-        let list: MemberList = serde_json::from_value(value).context("member list is not valid")?;
+        let list: MemberList = serde_json::from_slice(raw).context("member list is not valid")?;
         list.validate()?;
         Ok(list)
     }

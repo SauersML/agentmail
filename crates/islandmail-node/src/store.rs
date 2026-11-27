@@ -83,7 +83,7 @@ CREATE TRIGGER IF NOT EXISTS finish_blob AFTER INSERT ON blobs BEGIN
 END;
 ";
 
-/// The store format (SQLite `user_version`). Older stores are migrated at open (see migrate.rs).
+/// The store format (SQLite `user_version`).
 const STORE_VERSION: i64 = islandmail_core::versions::STORE;
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
@@ -320,9 +320,7 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF")?;
         let empty = !db.prepare("SELECT 1 FROM sqlite_schema")?.exists([])?;
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !empty {
-            crate::migrate::store(&mut db, path, version)?;
-        }
+        anyhow::ensure!(empty || version == STORE_VERSION, "{}: unsupported store version {version}", path.display());
         let tx = db.transaction()?;
         tx.execute_batch(SCHEMA)?;
         tx.execute_batch(&format!("PRAGMA user_version = {STORE_VERSION}"))?;
@@ -1081,43 +1079,6 @@ impl Store {
         Ok(())
     }
 
-    /// Room traffic (to `room:…`, or in a DM room) stored as plain mail with no room fields, whose content key this
-    /// node holds: `(env_id, envelope, ck)`. A build that did not know one of a message's room fields (say a newer
-    /// membership event) stored it this way. Plain mail between agents is not read again, so a start stays cheap.
-    pub fn plain_readable(&self) -> Result<Vec<(String, String, String)>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env_id, env, ck FROM messages WHERE kind = 'mail' AND meta IS NULL AND ck IS NOT NULL \
-                                 AND (recipient LIKE 'room:%' OR thread LIKE 'dm:%')")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
-
-    /// Members-mode key grants in a room (an open room's membership events), newest first: `(envelope, ck, thread)`.
-    /// Builds before these grants stored them unused.
-    pub fn open_room_grants(&self) -> Result<Vec<(String, String, String)>> {
-        let db = self.db.lock().unwrap();
-        let mut st = db.prepare("SELECT env, ck, thread FROM messages WHERE kind = 'grant' AND mode = 'members' \
-                                 AND ck IS NOT NULL AND thread IS NOT NULL ORDER BY id DESC")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
-        Ok(rows)
-    }
-
-    /// Give a row stored as plain mail the room fields its signed body carries. Ok(true) when the row changed.
-    pub fn set_room_fields(&self, env_id: &str, extra: &Extra) -> Result<bool> {
-        let db = self.db.lock().unwrap();
-        Ok(db.execute("UPDATE messages SET kind = ?, meta = ?, mentions = ?, reply_to = ? \
-                       WHERE env_id = ? AND kind = 'mail' AND meta IS NULL",
-                      params![extra.kind, extra.meta, extra.mentions, extra.reply_to, env_id])? > 0)
-    }
-
-    /// Test only: store a row the way a build that could not read its room fields did.
-    #[cfg(test)]
-    pub fn forget_room_fields(&self, env_id: &str) -> Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute("UPDATE messages SET kind = 'mail', meta = NULL, mentions = NULL, reply_to = NULL WHERE env_id = ?", [env_id])?;
-        Ok(())
-    }
-
     pub fn count(&self) -> Result<i64> {
         let db = self.db.lock().unwrap();
         Ok(db.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?)
@@ -1182,7 +1143,7 @@ mod tests {
         let path = dir.join("mail.sqlite");
         Connection::open(&path)?.execute_batch("CREATE TABLE messages (id INTEGER PRIMARY KEY)")?;
         let err = Store::open(&path).err().expect("a store without the format tag must be refused");
-        assert!(err.to_string().contains("not an Islandmail store"), "{err:#}");
+        assert!(err.to_string().contains("unsupported store version 0"), "{err:#}");
         std::fs::remove_dir_all(&dir)?;
         std::fs::create_dir(&dir)?;
         drop(Store::open(&path)?);

@@ -14,7 +14,7 @@ mod encryption_keys;
 mod homes;
 mod invite;
 mod mcpl;
-mod migrate;
+
 mod net;
 mod node;
 mod private_fs;
@@ -177,9 +177,7 @@ async fn run(path: &Path) -> Result<()> {
     };
     store.bind_roster(&seed.public(), &members)?;
     let node = Arc::new(node::Node::new(store, members, seed, opts, out_tx));
-    if let Err(e) = node.reread_stored() {
-        tracing::warn!("re-reading messages stored as plain mail: {e:#}");
-    }
+
     node.certify_identities();
     let net = net::start(&cfg, node.clone(), out_rx).await?;
     // identities_dir is re-read when a file in it is added, removed or rewritten: new held identities are certified
