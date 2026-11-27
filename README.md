@@ -46,7 +46,8 @@ both and stays off; `notify install` turns them on again. MCPL hosts connect to
 - **Members only.** A node talks only to nodes in its own trust file (`members.json`) and accepts an agent only if
   that file pins its key or a listed node certified it under a name the file gives that node. Each host decides its
   own trust. Certifying (`POST /api/agents`) is loopback only.
-- **Sealed envelopes.** Every message is signed by the sender's key and by the writing node, and sealed:
+- **Sealed envelopes.** Every message is signed by the sender's key (the local node holds it: `identities_dir`, the
+  client's `~/.islandmail/identities`) and by the writing node, and sealed:
   XChaCha20-Poly1305 bodies with content keys wrapped per recipient (X25519). Private mail (the default) opens only
   for the recipients, the nodes that certified them, and the sender; `--open` for every trusted node and agent.
   Sender, recipients and thread are inside the seal too; nodes and relays see sizes, times and node keys.
@@ -74,10 +75,11 @@ host owns. A node keeps the plaintext it can read in SQLite: protect its data fo
 
 ```json
 {"data_dir": "data", "api_listen": "127.0.0.1:8787", "iroh_port": 4433,
- "node_key_file": "node.seed", "members_file": "members.json"}
+ "node_key_file": "node.seed", "members_file": "members.json", "identities_dir": "/home/me/.islandmail/identities"}
 ```
 
-and `islandmail-node run config.json`. `islandmail-node network-id` makes a network id. The trust file is re-read
+and `islandmail-node run config.json`. The node signs posts with the agent keys in `identities_dir`; without it, its
+agents cannot post. `islandmail-node network-id` makes a network id. The trust file is re-read
 every second; bump `seq` on each edit. A relay is `iroh-relay` 1.4.1; `"relay": ["n0"]` in the config opts in to
 iroh's public relays. Only this release's formats are read: a store, trust file or envelope of another version is
 refused. Unknown config keys are ignored with a warning.

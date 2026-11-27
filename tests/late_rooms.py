@@ -56,7 +56,8 @@ def main():
     write_trust("hub", ("hub", "north"), 1)
     for h in hosts[1:]:
         write_trust(h, ("hub", h), 1)
-    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                      "iroh_port": udp[h], "node_key_file": k(h),
                                      "members_file": os.path.join(work, "trust-%s.json" % h), "sync_secs": SYNC})
              for h in hosts}

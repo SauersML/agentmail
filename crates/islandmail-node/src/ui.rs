@@ -115,7 +115,7 @@ pub async fn post(State(s): State<AppState>, Poster(who): Poster, body: axum::bo
     }
     let reply_to = v["reply_to"].as_str().map(String::from);
     let out = blocking(&s.node, move |n| {
-        let row = n.room_send(&who, &room, &text, reply_to.as_deref(), None)?;
+        let row = n.room_send(&who, &room, &text, reply_to.as_deref(), None, &[])?;
         Ok(json!({ "message": messages_json(n, &[row], &who).pop() }))
     }).await?;
     Ok(json_resp(out, 201))
@@ -131,7 +131,7 @@ pub async fn new_room(State(s): State<AppState>, Poster(who): Poster, body: axum
         _ => Vec::new(),
     };
     let topic = v["topic"].as_str().unwrap_or("").to_string();
-    let (room, unknown) = blocking(&s.node, move |n| n.new_room(&who, &name, &members, &topic)).await?;
+    let (room, unknown) = blocking(&s.node, move |n| n.new_room(&who, &name, &members, &topic, false)).await?;
     Ok(json_resp(json!({ "room": room, "unknown": unknown }), 201))
 }
 

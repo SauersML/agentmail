@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory, write_private_json  # noqa: E402
+from two_nodes import RESULTS, Node, agent_token, check, free_port, req, run, wait_for, work_directory, write_private_json  # noqa: E402
 
 
 def main():
@@ -59,7 +59,7 @@ def main():
             "data_dir": os.path.join(work, "data" + h), "api_listen": "127.0.0.1:%d" % P["api" + h],
             "iroh_port": P["udp" + h], "node_key_file": k("node" + h),
             "members_file": os.path.join(work, "members.%s.json" % h),
-            "sync_secs": 2,
+            "sync_secs": 2, "identities_dir": os.path.join(work, "held" + h),
         }
         c.update(extra)
         return c
@@ -70,7 +70,10 @@ def main():
     for n in agents:
         path = os.path.join(im_dir, "identities", agents[n] + ".json")
         # the client refuses identity files other users can read
-        write_private_json(path, {"name": agents[n], "sub": "agent:%s@test" % n, "id": pub[n], "seed": open(k(n)).read().strip()})
+        ident = {"name": agents[n], "sub": "agent:%s@test" % n, "id": pub[n], "seed": open(k(n)).read().strip()}
+        write_private_json(path, ident)
+        # Each agent's key is held by the node it posts through (alice A, bob B, carol C), which signs for it.
+        write_private_json(os.path.join(work, "held" + "ABC"["alice bob carol".split().index(n)], agents[n] + ".json"), ident)
     def im(port, who, *args, timeout=60):
         env = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % port, ISLANDMAIL_DIR=im_dir)
         p = subprocess.run([sys.executable, client, "--as", agents[who], *args], capture_output=True, text=True, env=env, timeout=timeout, cwd=work)
@@ -147,13 +150,9 @@ def main():
         rc, out = im(pa, "alice", "send", "--open", "--to", "u.carol", "--thread", "joined", "welcome")
         got, dt = wait_for(lambda: msgs(pc, "carol", "thread=joined"), timeout=40)
         check("C can decrypt a message sent after it joined", rc == 0 and got and got[0]["text"] == "welcome")
-        check("C does not receive historical message keys on joining", not msgs(pc, "carol", "thread=signed"))
-        rc, out = im(pc, "carol", "download", fid, "-o", os.path.join(work, "gotC.bin"))
-        check("C cannot download an attachment sent before it joined", rc != 0 and "404" in out, out)
+        # Earlier members-mode mail was sealed to carol's pinned key too, which C holds: only private mail stays closed.
         rc, out = im(pc, "carol", "read", "--thread", "signed", "--json")
         check("C cannot read the private mail between alice and bob", rc == 0 and "private and signed" not in out)
-        st, r = req("POST", pc, "/api/messages", atok(pc, "carol"), {"to": "all", "thread": "c", "text": "token only on C"})
-        check("C refuses an unsigned post", st == 400, r.get("error", ""))
         rc, out = im(pc, "carol", "send", "--open", "--to", "all", "--thread", "c", "signed from C")
         check("C accepts a signed post from a client with only its agent key", rc == 0, out)
         got, dt = wait_for(lambda: [m for m in msgs(pb, "bob", "thread=c")], timeout=30)
@@ -174,12 +173,13 @@ def main():
                                    req("GET", pc, "/api/node")[1]["node"])
         st, r = req("GET", pc, "/api/me", stranger)
         check("a name not on the member list is refused (403)", st == 403, r.get("error", ""))
-        st, r = req("POST", pa, "/api/messages", atok(pa, "alice"), {"to": "t.bob", "thread": "signed", "text": "unsigned"})
-        check("an unsigned post with an agent token is refused on A too (no bearer token goes into envelopes)",
-              st == 400 and "sign" in r.get("error", ""), r.get("error", ""))
-        rc, out = im(pc, "carol", "selftoken", "--ttl", "120")
-        st, r = req("GET", pc, "/api/me", out) if rc == 0 else (0, {"error": out})
-        check("islandmail.py selftoken prints a token C accepts", st == 200 and r.get("name", "").endswith("carol"), json.dumps(r)[:200])
+        dave = imc.agent_token({"name": "u.dave", "sub": "agent:dave@test", "seed": open(k("dave")).read().strip()},
+                               req("GET", pa, "/api/node")[1]["node"])
+        st, r = req("POST", pa, "/api/messages", dave, {"to": "t.bob", "thread": "signed", "text": "unsigned"})
+        check("a node that does not hold the agent's key refuses its post (no bearer token goes into envelopes)",
+              st == 400 and "does not hold" in r.get("error", ""), r.get("error", ""))
+        st, r = req("GET", pc, "/api/me", agent_token(im_dir, pc, agents["carol"]))
+        check("the client's agent token works on C", st == 200 and r.get("name", "").endswith("carol"), json.dumps(r)[:200])
         rc, out = im(pc, "carol", "send", "--to", "t.alice", "--thread", "nohome-private", "private, no home")
         check("private send from C with only the agent key", rc == 0, out)
         rc, out = im(pc, "carol", "send", "--open", "--to", "t.alice", "--thread", "nohome", "sent with no home")

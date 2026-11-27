@@ -702,7 +702,7 @@ pub fn complete_held(node: &Node) {
         let Some(who) = islandmail_core::members::named(&agents, &from)
             .map(|a| crate::node::Caller { key: fmt_key(&a.key), name: a.name.clone(), sub: a.sub.clone(), exp_ms: i64::MAX })
             .find(|w| node.local_key(w).is_some()) else { continue };
-        match add_as(node, &who, &room, &names) {
+        match node.room_add(&who, &room, &names) {
             Ok(note) => {
                 let _ = joined_seen(node, &from, &nonce);
                 tracing::info!("added {} to {room} for {from}, who invited them{note}", names.join(", "));
@@ -713,37 +713,6 @@ pub fn complete_held(node: &Node) {
             },
         }
     }
-}
-
-/// A room add made by the node for a held identity: the membership event, the grants (a private room's history),
-/// then the creator's vouch, as `room_send` and the client do after an add. In an open CREATOR/NAME room the vouch
-/// carries on with the grant of its membership events (`Node::grant_open_events`); another member's add sends it here.
-fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) -> Result<String, ApiError> {
-    let ev = islandmail_core::room::Event::Add { members: names.to_vec() };
-    let (members, agents) = (node.members.read().unwrap().clone(), node.agents());
-    let plan = node.room_plan(room, &who.name, Some(&ev), &members, &agents)?;
-    let text = format!("added {}", names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", "));
-    node.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": ev }))?;
-    let mut note = String::new();
-    if plan.mode == islandmail_core::Mode::Private {
-        let keys = node.room_keys(who, room)?;
-        for n in names {
-            for chunk in keys.chunks(500) {
-                let meta = serde_json::to_string(&json!({ "grant": chunk })).expect("JSON");
-                node.post(who, &json!({ "to": n, "thread": room, "mode": "private", "meta": meta,
-                                        "text": format!("key grant: {} earlier messages of {room}", chunk.len()) }))?;
-            }
-        }
-        note = format!("; {} earlier messages granted", keys.len());
-    }
-    if islandmail_core::room::creator_of(room).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
-        if let Err(e) = node.send_vouch(who, room) {
-            tracing::warn!("{room}: could not post the creator's vouch: {}", e.message);
-        }
-    } else if plan.mode != islandmail_core::Mode::Private {
-        node.grant_open_events(who, room)?;
-    }
-    Ok(note)
 }
 
 /// POST /api/invites/joined {nonce}: this agent has seen (and done the room add for) that join.

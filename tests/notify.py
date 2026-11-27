@@ -17,7 +17,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, run, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, agent_token, check, free_port, run, work_directory  # noqa: E402
 
 # Claude Code runs hooks with Git Bash on Windows; a bare "bash" there is WSL's (System32 comes before PATH).
 BASH = shutil.which("bash") or "bash"
@@ -40,7 +40,8 @@ def main():
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "n", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["alice", "bob", "s."]}]}, f)
-    node = Node(bin_, work, "n", {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port,
+    node = Node(bin_, work, "n", {"data_dir": os.path.join(work, "data"), "identities_dir": os.path.join(work, "client", "identities"),
+                  "api_listen": "127.0.0.1:%d" % port,
                                   "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
     claude = os.path.join(work, "claude-home")
@@ -281,7 +282,7 @@ def main():
             check("MCPL (websockets not installed: skipped)", True)
         if connect:
             def mcpl(who):
-                rc, tok, err = cl(who, "selftoken", "--ttl", "120")
+                tok = agent_token(client_dir, port, who)
                 ws = connect("ws://127.0.0.1:%d/mcpl" % port, additional_headers={"Authorization": "Bearer " + tok.strip()})
                 ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
                     "protocolVersion": "2024-11-05", "capabilities": {"experimental": {"mcpl": {"version": "0.4"}}}}}))

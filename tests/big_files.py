@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, run, wait_for, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, agent_token, check, free_port, run, wait_for, work_directory  # noqa: E402
 
 MiB = 1024 * 1024
 LIMIT = 100 * MiB
@@ -45,7 +45,8 @@ def main():
         path = os.path.join(work, "trust-%s.json" % h)
         with open(path, "w") as f:
             json.dump(trust, f)
-        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                         "iroh_port": udp[h], "node_key_file": seed[h], "members_file": path, "sync_secs": 3})
 
     def cl(h, *args, timeout=300):
@@ -95,7 +96,7 @@ def main():
         over = blob("over.bin", LIMIT + 1)
         rc, out = cl("a", "send", "--open", "--to", "bob", "--file", over, "too big")
         check("a send one byte over 100 MiB fails (the node's 413)", rc != 0 and "413" in out, out[-200:])
-        rc, token = cl("a", "selftoken", "--ttl", "120")
+        token = agent_token(os.path.join(work, "client-a"), api["a"])
         with open(over, "rb") as f:
             body = f.read()
         r = urllib.request.Request("http://127.0.0.1:%d/api/files?name=over" % api["a"], data=body, method="POST",

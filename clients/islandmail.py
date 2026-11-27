@@ -31,7 +31,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -580,6 +579,7 @@ def addressed_to(to, name):
 # Everything some reader takes as a line end (str.splitlines' set), and what may not appear in a header field.
 _BREAKS = re.compile("\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 _NOT_HEADER = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 def _one_line(s):
@@ -644,14 +644,6 @@ def reply_lines(m, quoted=3):
     return out + "".join("  | %s\n" % _one_line(l) for l in _BREAKS.split(q["text"])[:quoted])
 
 
-def cmd_selftoken(a):
-    if not 1 <= a.ttl <= MAX_TTL:
-        raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
-    ident = load_identity(a.as_)
-    key = a.node_key or node_key()
-    print(agent_token(ident, key, a.ttl))
-
-
 def cmd_whoami(a):
     ident = load_identity(a.as_)
     me = api(ident, "GET", "/api/me")
@@ -660,69 +652,20 @@ def cmd_whoami(a):
 
 def cmd_send(a):
     ident = load_identity(a.as_)
-    text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
+    text = sys.stdin.read() if a.text == "-" else (a.text or "")
     mode = "members" if a.open else "private"
-    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", norm_field(a.to)) \
+    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", a.to.strip()) \
             and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
         # Private mail to one agent with no thread named is the DM room of the two of you.
         return room_post(ident, dm_id(ident["name"], a.to), text, a.file)
-    to, thread = norm_field(a.to), norm_field(a.thread or "general")
-    r = post(ident, to, thread, text, upload(ident, a.file), mode)
+    r = post(ident, a.to, a.thread or "general", text, upload(ident, a.file), mode)
     m = r["message"]
     print("sent %s to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(r.get("reaches"), m["to"])), flush=True)
 
 
-_FORMAT = re.compile("[­؜ᅟᅠ឴឵᠎​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ]")
-_BIDI = re.compile("[؜‎‏‪-‮⁦-⁩]")
-_CTRL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
-def norm_field(s):
-    # The mailbox's own field rule (NFC, no invisible formatting characters, trimmed), applied before signing.
-    return _FORMAT.sub("", unicodedata.normalize("NFC", s)).strip()
-
-
-def norm_text(s):
-    s = unicodedata.normalize("NFC", s).replace("\r\n", "\n").replace("\r", "\n")
-    return _BIDI.sub("", _CTRL.sub("", s))
-
-
-def bound_salt(node_key):
-    # Names the node that writes the envelope (envelope.rs bound_salt): the salt is signed through the digest, so
-    # another node that opens the message cannot seal it again as its own (its parents, its envelope id).
-    r = os.urandom(4)
-    node = base64.urlsafe_b64decode(node_key.split(":", 1)[1] + "=")
-    return b"imb1" + r + hashlib.sha256(pae(b"islandmail/salt-bind/v1", r, node)).digest()[:8]
-
-
-def signed_block(ident, to, thread, text, files, mode, meta="", keys=None):
-    # meta: the room fields as exact JSON text (signed through the digest); keys: the recipients a room post's plan
-    # gave (else asked for by to and mode).
-    seed = bytes.fromhex(ident["seed"])
-    now = datetime.datetime.now(datetime.timezone.utc)
-    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + "%03dZ" % (now.microsecond // 1000)
-    salt = bound_salt(node_info()["node"])
-    digest = hashlib.sha256(pae(b"islandmail/body-digest/v1", salt, text.encode()))
-    for f in files:
-        digest.update(pae(f["id"].encode(), f["name"].encode(), f["type"].encode(), f["size"].to_bytes(8, "little")))
-    if meta:
-        digest.update(pae(b"islandmail/body-meta/v1", meta.encode()))
-    topic = base64.urlsafe_b64decode(node_info()["network_id"] + "=")
-    header = [ident["name"], ident["sub"], to, thread, mode, ts, digest.hexdigest()]
-    if keys is None:
-        query = urllib.parse.urlencode({"to": to, "mode": mode})
-        keys = api(ident, "GET", "/api/recipients?" + query)["keys"]
-    audience = pae(*sorted(base64.urlsafe_b64decode(k + "=") for k in keys))
-    statement = pae(b"islandmail/post/v1", topic, *(s.encode() for s in header), audience, *(f["id"].encode() for f in files))
-    return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
-
-
-def post(ident, to, thread, text, files, mode, meta="", keys=None):
-    # Sign one envelope and hand it to the node; its answer holds the stored message and who it reaches.
-    body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files], "mode": mode,
-            "signed": signed_block(ident, to, thread, text, files, mode, meta, keys)}
-    if meta:
-        body["meta"] = meta
+def post(ident, to, thread, text, files, mode, reply_to=None):
+    # The node signs with this agent's key (identities_dir); its answer holds the stored message and who it reaches.
+    body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files], "mode": mode, "reply_to": reply_to}
     return api(ident, "POST", "/api/messages", body)
 
 
@@ -745,21 +688,10 @@ def dm_id(a, b):
     return "dm:%s+%s" % (x, y)
 
 
-def mentions_in(text):
-    # @name mentions, as the node reads them: normalized, at most 32.
-    out = []
-    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)", text):
-        name = m.group(1).rstrip(".-").lower()
-        if re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) and name != "all" \
-                and name not in out and len(out) < 32:
-            out.append(name)
-    return out
-
-
 def room_id(ident, name, create=False):
     # A room you create is YOU/NAME. Elsewhere a bare NAME is your room YOU/NAME if you have one, else the open room
     # (thread) NAME; creator/name and DM ids are used as given.
-    name = norm_field(name)
+    name = name.strip()
     if "/" in name or name.startswith("dm:"):
         return name
     mine = "%s/%s" % (ident["name"], name)
@@ -786,21 +718,10 @@ def upload(ident, paths):
     return files
 
 
-def meta_json(meta):
-    # The exact text the digest signs; the node parses it and keeps it as sent.
-    return json.dumps(meta, separators=(",", ":"), sort_keys=True)
-
-
-def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=False, grant=None):
-    # Post in a room: the node says where it goes (to, mode, exact keys) for this room and event; we sign that.
-    text, room = norm_text(text), norm_field(room)
-    extra = {"grant": grant, "mentions": mentions_in(text), "reply_to": reply_to, "event": event}
-    raw = meta_json({"room": room, **{k: v for k, v in extra.items() if v}})
-    q = {"room": room}
-    if event:
-        q["event"] = meta_json(event)
-    plan = api(ident, "GET", "/api/recipients?" + urllib.parse.urlencode(q))
-    r = post(ident, plan["to"], room, text, upload(ident, paths), plan["mode"], raw, plan["keys"])
+def room_post(ident, room, text, paths=None, reply_to=None, quiet=False):
+    # Post in a room: the node decides where it goes (to, mode, keys) from the room's membership.
+    body = {"room": room, "text": text, "files": [f["id"] for f in upload(ident, paths)], "reply_to": reply_to}
+    r = api(ident, "POST", "/api/messages", body)
     m, who = r["message"], r.get("reaches")
     if not quiet:
         print("posted %s in %s%s" % (m["id"], room_label(ident, room), " for " + name_list(who) if who else ""), flush=True)
@@ -833,54 +754,11 @@ def room_info(ident, room):
     return api(ident, "GET", "/api/room?" + urllib.parse.urlencode({"id": room}))["room"]
 
 
-def room_vouch(ident, room, quiet=True):
-    # The creator vouches for its members' keys and home nodes, so a host that trusts only some of those nodes takes
-    # the others' mail in this room (README: rooms across nodes that do not trust each other). Others: nothing.
-    if "/" not in room or _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
-        return None
-    entries = api(ident, "GET", "/api/room-vouch?" + urllib.parse.urlencode({"room": room}))["members"]
-    m = None
-    if entries:
-        text = "vouched for the nodes of " + ", ".join(e["name"] for e in entries)
-        m = room_post(ident, room, text, event={"op": "vouch", "members": entries}, quiet=quiet)
-    if room_info(ident, room).get("kind") == "open":
-        grant_events(ident, room)
-    return m
-
-
-def grant_events(ident, room):
-    # An open CREATOR/NAME room: the content keys of its membership events, in one grant posted in the room (so it
-    # reaches every host our node trusts now). Each event was sealed to the hosts trusted when it was sent; a host
-    # trusted later has no slot for the create event, and no room, until it gets this. Posts are not granted.
-    try:
-        keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
-    except Fail:
-        return 0
-    for i in range(0, len(keys), 500):
-        chunk = keys[i:i + 500]
-        room_post(ident, room, "key grant: %d membership events of %s" % (len(chunk), room), grant=chunk, quiet=True)
-    return len(keys)
-
-
 def cmd_room_vouch(a):
     ident = load_identity(a.as_)
     room = room_id(ident, a.name)
-    if "/" not in room or _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
-        raise Fail("only the room's creator vouches for its members")
-    m = room_vouch(ident, room)
-    print("vouched in %s (%s)" % (room, m["id"]) if m else "nothing to vouch for in %s" % room)
-
-
-def grant_history(ident, room, names):
-    # Re-wrap the room's earlier content keys to each new member (and its home nodes): grant messages only they can
-    # open, sent like mail. Their nodes can then read the history; no message bodies are sent again.
-    keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
-    for name in names:
-        for i in range(0, len(keys), 500):
-            chunk = keys[i:i + 500]
-            text = "key grant: %d earlier messages of %s" % (len(chunk), room)  # never shown: grants are hidden
-            post(ident, name, room, text, [], "private", meta_json({"grant": chunk}))
-    return len(keys)
+    room_op(ident, "vouch", room=room)
+    print("vouched in %s" % room)
 
 
 def cmd_room_add(a):
@@ -889,25 +767,13 @@ def cmd_room_add(a):
     print("added %s to %s%s" % (", ".join(a.names), room, room_add(ident, room, a.names)))
 
 
-def room_add(ident, room, names, grants=True):
-    names = [n.lstrip("@") for n in names if n.lstrip("@")]
-    info = room_info(ident, room)
-    room_post(ident, room, "added " + ", ".join("@" + n for n in names), event={"op": "add", "members": names}, quiet=True)
-    room_vouch(ident, room)
-    note = ""
-    if info["kind"] == "private" and not grants:
-        note = "; their agent is not known here yet, so they see only messages from now on"
-    elif info["kind"] == "private":
-        # Full history: every earlier message; since-join: only the membership events, so they know the room.
-        n = grant_history(ident, room, names)
-        if info.get("history") == "full":
-            note = "; they can read its %d earlier messages" % n
-        else:
-            note = "; they see only messages from now on"
-    elif info["kind"] == "open" and "/" in room and _addr(room.split("/", 1)[0]) != _addr(ident["name"]):
-        # The creator's vouch sends these; another member's add sends them itself (see grant_events).
-        grant_events(ident, room)
-    return note
+def room_add(ident, room, names):
+    return room_op(ident, "add", room=room, members=[n.lstrip("@") for n in names if n.lstrip("@")])["note"]
+
+
+def room_op(ident, op, **body):
+    # Room membership, signed by the node as this agent: new, add, remove, leave, vouch (node.rs room_op).
+    return api(ident, "POST", "/api/room-ops", dict(body, op=op))
 
 
 # ---- joining: invite (signed by our node), join (their node trusts ours, answers with a reply), accept ----
@@ -1022,7 +888,8 @@ def first_run(config, inv, a):
              "relays": [r for r in inv["relay"] if r != "n0"],
              "nodes": [{"name": inv["names"][0], "key": key, "addrs": addrs, "names": inv["names"]}]}
     cfg = {"data_dir": "data", "api_listen": a.api, "iroh_port": port, "relay": ["n0"] if "n0" in inv["relay"] else [],
-           "node_key_file": "node.seed", "members_file": "members.json"}
+           "node_key_file": "node.seed", "members_file": "members.json",
+           "identities_dir": os.path.join(DIR, "identities")}  # the node signs posts with these keys
     for name, obj in (("members.json", trust), ("config.json", cfg)):
         # Owner-only whatever the umask: the node refuses a config or trust file other users can write.
         fd = os.open(os.path.join(folder, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -1158,26 +1025,16 @@ def cmd_accept(a):
     print("this node now trusts node %r (%s) for exactly %s; trust file seq %d"
           % (out["node"]["name"], out["node"]["key"], name.replace(",", ", "), out["seq"]))
     if out.get("room"):
-        complete_joins(_load_identity(a.as_, create=False), wait=60)
+        print("this node adds them to %s once their agent's key arrives" % out["room"])
 
 
-def complete_joins(ident, wait=0):
-    # Nodes that joined with this agent's invites: one line each, and the invite's room add, which only this agent can
-    # sign. A private room's history needs their agent's key, which arrives once the two nodes sync.
+def complete_joins(ident):
+    # Nodes that joined with this agent's invites: one line each. The node itself adds them to the invite's room once
+    # their agent's key arrives.
     for r in api(ident, "GET", "/api/invites/joined")["joined"]:
-        names = r["name"].split(",")
-        line = "%s joined with your invite (node %s)" % (", ".join(names), r["node"])
+        line = "%s joined with your invite (node %s)" % (r["name"].replace(",", ", "), r["node"])
         if r["room"]:
-            for _ in range(max(1, wait)):
-                known = {_addr(x["name"]) for x in api(ident, "GET", "/api/agents")["agents"]}
-                if all(_addr(n) in known for n in names):
-                    break
-                if wait:
-                    time.sleep(1)
-            else:
-                sys.stderr.write("islandmail: %s; they are added to %s once their key arrives\n" % (line, r["room"]))
-                continue
-            line += "; added to %s%s" % (r["room"], room_add(ident, r["room"], names))
+            continue
         api(ident, "POST", "/api/invites/joined", {"nonce": r["nonce"]})
         sys.stderr.write("islandmail: %s\n" % line)
 
@@ -1185,15 +1042,14 @@ def complete_joins(ident, wait=0):
 def cmd_room_leave(a):
     ident = load_identity(a.as_)
     room = room_id(ident, a.name)
-    room_post(ident, room, "left the room", event={"op": "leave"}, quiet=True)
+    room_op(ident, "leave", room=room)
     print("left %s" % room)
 
 
 def cmd_room_remove(a):
     ident = load_identity(a.as_)
     room = room_id(ident, a.name)
-    room_post(ident, room, "removed " + ", ".join(a.names), event={"op": "remove", "members": a.names}, quiet=True)
-    room_vouch(ident, room)
+    room_op(ident, "remove", room=room, members=a.names)
     print("removed %s from %s" % (", ".join(a.names), room))
 
 
@@ -1301,7 +1157,7 @@ def cmd_reply(a):
     # alone, in your DM room.
     ident = load_identity(a.as_)
     m = message(ident, a.id)
-    text = norm_text(sys.stdin.read() if a.text == "-" else a.text)
+    text = sys.stdin.read() if a.text == "-" else a.text
     if a.dm:
         if _addr(m["from"]) == _addr(ident["name"]):
             raise Fail("that is your own message; --dm answers its author")
@@ -1316,10 +1172,7 @@ def cmd_reply(a):
     to = [x for x in [m["from"]] + m["to"].replace(",", " ").split()
           if _addr(x) != me and not (m["mode"] == "members" and _addr(x) in ("all", "*"))]
     to = ",".join(dict.fromkeys(to)) or ident["name"]
-    meta = {"reply_to": m["env"]}
-    if mentions_in(text):
-        meta["mentions"] = mentions_in(text)
-    r = post(ident, to, m["thread"], text, upload(ident, a.file), m["mode"], meta_json(meta))["message"]
+    r = post(ident, to, m["thread"], text, upload(ident, a.file), m["mode"], m["env"])["message"]
     print("replied %s to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
 
 
@@ -1339,19 +1192,10 @@ def cmd_ui(a):
 def cmd_room_new(a):
     # One line to a group chat: a private room YOU/NAME with these members, full history for anyone added later.
     ident = load_identity(a.as_)
-    room = room_id(ident, a.name, create=True)
     want = [w.lstrip("@") for x in a.members for w in re.split(r"[,\s]+", x) if w.lstrip("@")]
-    known = {_addr(x["name"]): x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])}
-    members = list(dict.fromkeys(known[_addr(w)] for w in want if _addr(w) in known and _addr(w) != _addr(ident["name"])))
-    outside = [w for w in want if _addr(w) not in known]
-    event = {"op": "create", "private": not a.open, "history": "full", "members": members}
-    if a.topic:
-        event["topic"] = norm_field(a.topic)
-    text = "created this %s room" % ("open" if a.open else "private")
-    if members:
-        text += " with " + ", ".join("@" + w for w in members)
-    room_post(ident, room, text, event=event, quiet=True)
-    room_vouch(ident, room)
+    r = room_op(ident, "new", name=a.name.strip(), members=want, topic=a.topic or "", open=a.open)
+    room, outside = r["room"], r["unknown"]
+    members = [w for w in want if _addr(w) not in map(_addr, outside) and _addr(w) != _addr(ident["name"])]
     print("created %s%s" % (room, " with " + ", ".join("@" + w for w in members) if members else ""))
     for w in outside:
         try:
@@ -2132,10 +1976,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("selftoken", help="print one single-use agent token for the node (signed by your own key)")
-    p.add_argument("--ttl", type=int, default=STREAM_TTL, help="seconds it stays valid, at most 86400 (default 3600)")
-    p.add_argument("--node-key", help="the node's key (default: ask the node)")
-    p.set_defaults(fn=cmd_selftoken)
     sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
     p = sub.add_parser("join", help="join a network with an invite: sets up this host's node if there is none")
     p.add_argument("invite")

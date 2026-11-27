@@ -47,7 +47,8 @@ def main():
                  "nodes": [{"name": n, "key": pub[n], "addrs": ["127.0.0.1:%d" % udp[n]], "names": names[n]} for n in trusts[h]]}
         with open(os.path.join(work, "trust-%s.json" % h), "w") as f:
             json.dump(trust, f)
-    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                      "iroh_port": udp[h], "node_key_file": k(h),
                                      "members_file": os.path.join(work, "trust-%s.json" % h), "sync_secs": SYNC})
              for h in hosts}

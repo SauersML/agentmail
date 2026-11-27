@@ -39,6 +39,17 @@ def client_module():
     return _CLIENT[0]
 
 
+def agent_token(client_dir, port, name=None, ttl=600):
+    # A single-use agent token for NAME's identity in CLIENT_DIR (the only one when None), for the node at PORT.
+    folder = os.path.join(client_dir, "identities")
+    name = name or [f[:-5] for f in os.listdir(folder) if f.endswith(".json")][0]
+    with open(os.path.join(folder, name + ".json")) as f:
+        ident = json.load(f)
+    with urllib.request.urlopen("http://127.0.0.1:%d/api/node" % port, timeout=10) as r:
+        key = json.load(r)["node"]
+    return client_module().agent_token(ident, key, ttl)
+
+
 def owner_only(path):
     # Mode 600 on POSIX; on Windows a protected access list with only this user.
     if not os.path.exists(path):
@@ -215,15 +226,6 @@ def main():
         check("node B starts", B.start())
         pa, pb = A.port, B.port
 
-        def has_peer_encryption_keys():
-            _, reply = req("GET", pa, "/api/recipients?to=all&mode=members", token("A", "alice"))
-            records = reply.get("node_encryption_keys", [])
-            actual = {r["node"]: r for r in records}
-            return all(actual.get(pub[key]) == req("GET", port, "/api/node")[1]["encryption_key"]
-                       for key, port in [("nodeA", pa), ("nodeB", pb)]) and len(actual) == 2
-        found, _ = wait_for(has_peer_encryption_keys)
-        check("senders obtain both nodes' current signed encryption records", found)
-
         # Auth, exactly like the old server.
         st, me = req("GET", pa, "/api/me", token("A", "alice"))
         check("GET /api/me", st == 200 and me.get("name") == "t.alice" and me.get("island") == roster["network"], json.dumps(me))
@@ -301,9 +303,6 @@ def main():
         check("islandmail.py whoami (A)", rc == 0 and "t.alice" in out, out)
         # bob waits on B for his next mail; alice sends it with islandmail.py on A.
         envb = dict(os.environ, ISLANDMAIL_URL="http://127.0.0.1:%d" % pb, ISLANDMAIL_DIR=os.path.join(work, "idsB"))
-        offline = subprocess.run([sys.executable, a.islandmail, "--as", "t.bob", "selftoken", "--node-key", pub["nodeA"]],
-                                 env=dict(envb, ISLANDMAIL_URL="http://127.0.0.1:1"), capture_output=True, timeout=10)
-        check("selftoken with an explicit audience works offline", offline.returncode == 0 and offline.stdout.startswith(b"v4.public."))
         def watch():
             return subprocess.Popen([sys.executable, a.islandmail, "--as", "t.bob", "watch", "--mine", "--until", "--name", "it"],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=envb)

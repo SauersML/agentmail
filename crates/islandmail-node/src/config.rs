@@ -22,8 +22,8 @@ pub struct Config {
     /// Hex seed file of this node's Ed25519 key (= its iroh endpoint id). Created on first run if missing.
     pub node_key_file: PathBuf,
     pub members_file: PathBuf,
-    /// Optional folder of islandmail.py identity files ({name, seed, …}) of the agents on this host. Their keys let
-    /// this node read "private" mail addressed to them. Seeds are read, never logged or copied.
+    /// The folder of islandmail.py identity files ({name, seed, …}) of the agents on this host (required): the node
+    /// signs their posts and reads their private mail with these keys. Seeds are read, never logged or copied.
     #[serde(default)]
     pub identities_dir: Option<PathBuf>,
     /// Seconds between anti-entropy rounds with every peer.
@@ -52,6 +52,9 @@ impl Config {
             tracing::warn!("config {}: ignoring unknown keys {}", path.display(), unknown.join(", "));
         }
         let mut c: Config = serde_json::from_value(v.into()).context("config is not valid")?;
+        anyhow::ensure!(c.identities_dir.is_some(), "config {} needs \"identities_dir\": the folder with this host's \
+                        agent identity files (~/.islandmail/identities); the node signs its agents' posts with them",
+                        path.display());
         let base = path.parent().unwrap_or(Path::new("."));
         let fix = |p: &mut PathBuf| if p.is_relative() { *p = base.join(&*p) };
         fix(&mut c.data_dir);
@@ -73,33 +76,6 @@ impl Config {
         Ok(list)
     }
 
-    /// (name, seed) of each identity file the node may hold: those whose sub is the one this host knows the name by
-    /// (its pin's, else agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known
-    /// here with another sub"), so it is refused here with a log line naming the file and the fix. Files that do not
-    /// parse, and files other users could read (group or world bits set), are skipped with a warning.
-    pub fn held(&self, members: &MemberList) -> Vec<(String, Seed)> {
-        let Some(dir) = &self.identities_dir else { return vec![] };
-        let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
-        let norm = islandmail_core::addr::norm;
-        let mut out = Vec::new();
-        for path in rd.flatten().map(|e| e.path()) {
-            if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
-            let raw = match read_private(&path) {
-                Ok(raw) => raw,
-                Err(e) => { tracing::warn!("skipping identity file: {e:#}"); continue; }
-            };
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-            let (Some(name), Some(Ok(seed))) = (v["name"].as_str(), v["seed"].as_str().map(Seed::from_hex)) else { continue };
-            let sub = v["sub"].as_str().unwrap_or("");
-            let pin = members.members.iter().find(|m| norm(&m.name) == norm(name));
-            let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(name), |m| m.sub.clone());
-            if sub == want { out.push((name.to_string(), seed)); continue; }
-            tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
-                            to {want:?} (the node re-reads identities_dir within seconds)", path.display());
-        }
-        out
-    }
-
     /// Names, sizes and modification times in identities_dir: a change means the files need reading again.
     pub fn identities_stamp(&self) -> Vec<(std::ffi::OsString, u64, Option<std::time::SystemTime>)> {
         let Some(dir) = &self.identities_dir else { return vec![] };
@@ -111,6 +87,34 @@ impl Config {
         v
     }
 }
+
+/// (name, seed) of each identity file the node may hold: those whose sub is the one this host knows the name by
+/// (its pin's, else agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known
+/// here with another sub"), so it is refused here with a log line naming the file and the fix. Files that do not
+/// parse, and files other users could read (group or world bits set), are skipped with a warning.
+pub fn held(dir: Option<&Path>, members: &MemberList) -> Vec<(String, Seed)> {
+    let Some(dir) = dir else { return vec![] };
+    let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+    let norm = islandmail_core::addr::norm;
+    let mut out = Vec::new();
+    for path in rd.flatten().map(|e| e.path()) {
+        if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+        let raw = match read_private(&path) {
+            Ok(raw) => raw,
+            Err(e) => { tracing::warn!("skipping identity file: {e:#}"); continue; }
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        let (Some(name), Some(Ok(seed))) = (v["name"].as_str(), v["seed"].as_str().map(Seed::from_hex)) else { continue };
+        let sub = v["sub"].as_str().unwrap_or("");
+        let pin = members.members.iter().find(|m| norm(&m.name) == norm(name));
+        let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(name), |m| m.sub.clone());
+        if sub == want { out.push((name.to_string(), seed)); continue; }
+        tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
+                        to {want:?} (the node re-reads identities_dir within seconds)", path.display());
+    }
+    out
+}
+
 
 /// Refuses a key file other users could read or write (see private_fs), or one that is not a regular file.
 pub fn read_private(path: &Path) -> Result<String> {
@@ -174,9 +178,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("islandmail-config-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         crate::private_fs::create_dir(&dir).unwrap();
         let path = dir.join("config.json");
-        std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m", "certify": "open"}"#).unwrap();
+        std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m", "identities_dir": "i", "certify": "open"}"#).unwrap();
         let c = Config::load(&path).unwrap();
         assert_eq!((c.data_dir, c.sync_secs), (dir.join("d"), 30));
+        std::fs::write(&path, r#"{"data_dir": "d", "node_key_file": "k", "members_file": "m"}"#).unwrap();
+        assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("identities_dir"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

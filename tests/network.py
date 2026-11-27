@@ -24,7 +24,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import http.client  # noqa: E402
-from two_nodes import RESULTS, Node, check, client_module, free_port, owner_only, req, run, wait_for, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, agent_token, check, client_module, free_port, owner_only, req, run, wait_for, work_directory  # noqa: E402
 
 
 def stream_until_closed(port, token, out):
@@ -74,7 +74,8 @@ def main():
 
     nodes = {}
     for h in hosts:
-        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                         "iroh_port": udp[h], "node_key_file": k(h), "members_file": trust(h), "sync_secs": 3})
 
     def cl(h, *args, user="agent", timeout=60, client_dir=None):
@@ -142,8 +143,8 @@ def main():
         check("resumed watch gets the second home's certificate", rc == 0 and "> " in out, out[-160:])
         rc, out = cl("pod", "whoami")
         check("alice signs in at its second home", rc == 0 and "alice" in out, out[-200:])
-        homes = lambda: [x["homes"] for x in req("GET", api["ops"], "/api/agents", token=cl(
-            "ops", "selftoken", "--ttl", "60", user="bob")[1])[1].get("agents", []) if x["name"] == "alice"]
+        homes = lambda: [x["homes"] for x in req("GET", api["ops"], "/api/agents", token=agent_token(
+            os.path.join(work, "client-ops"), api["ops"], "ops.bob"))[1].get("agents", []) if x["name"] == "alice"]
         got, t = wait_for(lambda: [sorted(h) for h in homes()] == [["mac", "pod"]], timeout=15)
         check("ops's host sees alice with two homes", bool(got), "%.1fs" % t)
         rc, out = cl("ops", "send", "--to", "alice", "for alice only", user="bob")
@@ -164,7 +165,7 @@ def main():
         check("islandmail-node revoke", p.returncode == 0 and "revoked ops.temp" in p.stdout, (p.stdout + p.stderr)[-160:])
         rc, out = cl("ops", "--as", "ops.temp", "whoami", user="temp")
         check("the revoked agent cannot sign in", rc != 0 and "403" in out, out[-160:])
-        tok = lambda: cl("mac", "selftoken", "--ttl", "60")[1]
+        tok = lambda: agent_token(os.path.join(work, "client-mac"), api["mac"], "alice")
         gone, t = wait_for(lambda: not [x for x in req("GET", api["mac"], "/api/agents", token=tok())[1].get("agents", [])
                                         if x["name"] == "ops.temp"], timeout=15)
         check("the revocation replicates", bool(gone), "%.1fs" % t)
@@ -173,7 +174,7 @@ def main():
         # stream of s.idle at the mac ends within seconds.
         rc, out = cl("mac", "--as", "s.idle", "whoami")
         check("s.idle on the mac", rc == 0, out[-120:])
-        rc, token = cl("mac", "--as", "s.idle", "selftoken", "--ttl", "600")
+        token = agent_token(os.path.join(work, "client-mac"), api["mac"], "s.idle")
         events = []
         reader = threading.Thread(target=stream_until_closed, args=(api["mac"], token, events), daemon=True)
         reader.start()

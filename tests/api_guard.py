@@ -97,7 +97,7 @@ def main():
 
     write(trust_path, trust)
     write(cfg_path, {"data_dir": "data", "api_listen": "127.0.0.1:%d" % port, "iroh_port": 0,
-                     "node_key_file": "node.seed", "members_file": "members.json"})
+                     "node_key_file": "node.seed", "members_file": "members.json", "identities_dir": "identities"})
     log_path = os.path.join(work, "node.log")
 
     def limit():

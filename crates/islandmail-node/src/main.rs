@@ -111,7 +111,7 @@ async fn run(path: &Path) -> Result<()> {
         bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));
     }
     let mut stamp = cfg.identities_stamp();
-    let identities = cfg.held(&members);
+    let identities = config::held(cfg.identities_dir.as_deref(), &members);
     tracing::info!(
         "node {} ; member list seq {} ({} members, {} nodes); {} local identities",
         fmt_key(&seed.public()),
@@ -124,6 +124,7 @@ async fn run(path: &Path) -> Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel(32);
     let opts = node::Opts {
         identities: std::sync::RwLock::new(identities),
+        identities_dir: cfg.identities_dir.clone(),
         public_url: format!("http://{}", cfg.api_listen),
         members_file: Some(cfg.members_file.clone()),
         relay: cfg.relay.clone(),
@@ -143,12 +144,7 @@ async fn run(path: &Path) -> Result<()> {
             let now = held_cfg.identities_stamp();
             if now == stamp { continue; }
             stamp = now;
-            let ids = held_cfg.held(&held_node.members.read().unwrap());
-            let n = ids.len();
-            if held_node.set_identities(ids) {
-                tracing::info!("identities_dir changed: {n} local identities");
-                held_node.certify_identities();
-            }
+            held_node.reload_identities();
         }
     });
 

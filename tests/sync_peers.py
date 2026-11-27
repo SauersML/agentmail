@@ -54,7 +54,8 @@ def main():
         path = os.path.join(work, "trust-%s.json" % h)
         with open(path, "w") as f:
             json.dump(trust, f)
-        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+        nodes[h] = Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                         "iroh_port": udp[h], "node_key_file": seed[h], "members_file": path, "sync_secs": 2})
 
     def cl(h, *args):

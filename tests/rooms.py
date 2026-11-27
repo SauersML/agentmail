@@ -25,7 +25,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from two_nodes import RESULTS, Node, check, free_port, req, run, wait_for, work_directory  # noqa: E402
+from two_nodes import RESULTS, Node, agent_token, check, free_port, req, run, wait_for, work_directory  # noqa: E402
 
 SYNC = 2
 
@@ -51,7 +51,8 @@ def main():
              "nodes": [{"name": h, "key": pub[h], "addrs": ["127.0.0.1:%d" % udp[h]], "names": names[h]} for h in hosts]}
     with open(os.path.join(work, "trust.json"), "w") as f:
         json.dump(trust, f)
-    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "api_listen": "127.0.0.1:%d" % api[h],
+    nodes = {h: Node(bin_, work, h, {"data_dir": os.path.join(work, "data-" + h), "identities_dir": os.path.join(work, "client-" + h, "identities"),
+                  "api_listen": "127.0.0.1:%d" % api[h],
                                      "iroh_port": udp[h], "node_key_file": k(h),
                                      "members_file": os.path.join(work, "trust.json"), "sync_secs": SYNC})
              for h in hosts}
@@ -79,7 +80,7 @@ def main():
             return None
 
     def token(agent):
-        return cl(agent, "selftoken", "--ttl", "600")[1]
+        return agent_token(os.path.join(work, "client-" + home[agent]), api[home[agent]], agent)
 
     def texts(agent, room):
         r = js(agent, "room", "read", room, "--latest", "200")

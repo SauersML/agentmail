@@ -402,7 +402,7 @@ impl Conn {
                 let room = params["channelId"].as_str().and_then(|c| c.strip_prefix("room:")).unwrap_or("").to_string();
                 let text: Vec<&str> = params["content"].as_array().map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
                     .unwrap_or_default();
-                match self.node.room_send(&self.who, &room, &text.join("\n"), params["replyTo"].as_str(), None) {
+                match self.node.room_send(&self.who, &room, &text.join("\n"), params["replyTo"].as_str(), None, &[]) {
                     Ok(row) => reply(self, json!({ "delivered": true, "messageId": islandmail_core::short_id(&row.env_id) })),
                     Err(e) => fail(self, -32603, e.message),
                 }
@@ -532,7 +532,7 @@ impl Conn {
             "room_new" => {
                 let members: Vec<String> = args["members"].as_array()
                     .map(|a| a.iter().filter_map(|m| m.as_str().map(String::from)).collect()).unwrap_or_default();
-                let (room, unknown) = n.new_room(me, args["name"].as_str().unwrap_or(""), &members, args["topic"].as_str().unwrap_or(""))?;
+                let (room, unknown) = n.new_room(me, args["name"].as_str().unwrap_or(""), &members, args["topic"].as_str().unwrap_or(""), false)?;
                 let mut out = format!("Created private room {room}; post with room_send.");
                 if !unknown.is_empty() {
                     out += &format!(" Not on this network yet (invite them, then add them): {}.", unknown.join(", "));
@@ -542,7 +542,7 @@ impl Conn {
             "room_send" => {
                 let room = args["room"].as_str().unwrap_or("").to_string();
                 let reply_to = args["reply_to"].as_str();
-                let row = n.room_send(me, &room, args["text"].as_str().unwrap_or(""), reply_to, None)?;
+                let row = n.room_send(me, &room, args["text"].as_str().unwrap_or(""), reply_to, None, &[])?;
                 Ok(format!("Posted {} in room {}.", islandmail_core::short_id(&row.env_id), room))
             }
             "get" => {

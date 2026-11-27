@@ -53,7 +53,6 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/node", get(node_info))
         .route("/api/me", get(me))
-        .route("/api/recipients", get(recipients))
         .route("/api/agents", get(agents).post(certify))
         .route("/api/revocations", axum::routing::post(revoke))
         .route("/api/invites", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::invite)))
@@ -64,8 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/messages/{id}", get(one))
         .route("/api/rooms", get(rooms))
         .route("/api/room", get(room))
-        .route("/api/room-keys", get(room_keys))
-        .route("/api/room-vouch", get(room_vouch))
+        .route("/api/room-ops", axum::routing::post(room_ops))
         .route("/api/room-read", axum::routing::post(room_read))
         .route("/api/ui-sessions", axum::routing::post(ui_session))
         .route("/ui", get(crate::ui::page))
@@ -294,35 +292,6 @@ pub fn node_proof_statement(nonce: &str, ts: &str) -> String {
     format!("islandmail-node-proof|v1|{nonce}|{ts}")
 }
 
-/// Return the exact key set the local node would use. A trust-file change before posting invalidates the signature.
-async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    let p = params(&raw);
-    if let Some(room) = p.get("room") {
-        // A room post: the node says where it goes (to, mode) and the exact keys, given the optional event.
-        let event = match p.get("event") {
-            Some(e) => Some(serde_json::from_str::<islandmail_core::room::Event>(e)
-                .map_err(|e| ApiError::new(400, format!("invalid event: {e}")))?),
-            None => None,
-        };
-        let members = s.node.members.read().unwrap().clone();
-        let agents = s.node.agents();
-        let plan = s.node.room_plan(room, &who.name, event.as_ref(), &members, &agents)?;
-        let node_keys = s.node.recipient_node_keys(&members, &plan.keys)?;
-        return Ok(json_resp(json!({ "keys": plan.keys.iter().map(|k| islandmail_core::b64u(k)).collect::<Vec<_>>(),
-            "node_encryption_keys": node_keys, "to": plan.to, "mode": plan.mode.as_str(), "names": plan.names }), 200));
-    }
-    let to = p.get("to").ok_or_else(|| ApiError::new(400, "missing to"))?;
-    let mode = match p.get("mode").map(String::as_str) {
-        Some("private") => islandmail_core::Mode::Private,
-        Some("members") => islandmail_core::Mode::Members,
-        _ => return Err(ApiError::new(400, "specify members or private mode")),
-    };
-    let members = s.node.members.read().unwrap().clone();
-    let keys = Node::recipients(&members, &s.node.agents(), to, &who.name, mode)?;
-    let node_keys = s.node.recipient_node_keys(&members, &keys)?;
-    Ok(json_resp(json!({ "keys": keys.iter().map(|k| islandmail_core::b64u(k)).collect::<Vec<_>>(), "node_encryption_keys": node_keys }), 200))
-}
-
 pub async fn blocking<T: Send + 'static>(node: &Arc<Node>, f: impl FnOnce(&Node) -> Result<T, ApiError> + Send + 'static)
                                         -> Result<T, ApiError> {
     let node = node.clone();
@@ -433,7 +402,16 @@ async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
 
 async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = json_object(&headers, &body, 1024 * 1024)?;
-    let p = blocking(&s.node, move |n| n.post(&who, &v)).await?;
+    let p = blocking(&s.node, move |n| match v["room"].as_str().filter(|_| v.get("to").is_none()) {
+        // {room, text, files?, reply_to?}: a room post, where the room's plan decides recipients and mode.
+        Some(room) => {
+            let files: Vec<String> = v["files"].as_array().map(|a| a.iter().filter_map(|f| f.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let row = n.room_send(&who, room, v["text"].as_str().unwrap_or(""), v["reply_to"].as_str(), None, &files)?;
+            Ok(crate::node::Posted { reaches: n.room_reaches(room, &who.name), row, repeated: false })
+        }
+        None => n.post(&who, &v),
+    }).await?;
     let mut out = json!({ "message": p.row.to_message(), "reaches": p.reaches });
     if p.repeated {
         out["repeated"] = json!(true);
@@ -484,23 +462,9 @@ async fn room(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
     Ok(json_resp(json!({ "room": s.node.room_view(&who, id)? }), 200))
 }
 
-async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    let p = params(&raw);
-    let id = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
-    let keys = blocking(&s.node, move |n| n.room_keys(&who, &id)).await?;
-    Ok(json_resp(json!({ "keys": keys }), 200))
-}
-
-/// GET /api/room-vouch?room=: what the room's creator vouches for now (its current members' keys and home nodes),
-/// for the creator's client to sign and post as a vouch event.
-async fn room_vouch(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
-    let p = params(&raw);
-    let id = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
-    if !islandmail_core::room::creator_of(&id).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
-        return Err(ApiError::new(403, "only the room's creator vouches for its members"));
-    }
-    let members = blocking(&s.node, move |n| n.vouch_entries(&id)).await?;
-    Ok(json_resp(json!({ "members": members }), 200))
+async fn room_ops(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
+    let v = parse_json(&body)?;
+    Ok(json_resp(blocking(&s.node, move |n| n.room_op(&who, &v)).await?, 200))
 }
 
 /// POST /api/room-read {room, seq}: the caller has read the room up to local seq `seq`.

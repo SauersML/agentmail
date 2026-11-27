@@ -20,7 +20,7 @@ fuzz_target!(|data: &[u8]| {
     e.sig = islandmail_core::b64u(&world::node_b().sign(&e.signing_bytes()));
     let _ = e.check(&l, now);
     for key in &keys {
-        if let Ok(Some(o)) = e.open(key) {
+        if let Ok(Some(o)) = e.open_for([key]) {
             let _ = e.verify_opened(&o, &l, &agents);
             let _ = e.check_body(&o.header, &o.body);
             let _ = islandmail_core::room::Meta::parse(&o.body.meta);

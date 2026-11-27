@@ -63,8 +63,9 @@ pub struct Posted {
 
 #[derive(Default)]
 pub struct Opts {
-    /// Held identities (identities_dir), re-read while the node runs (Node::set_identities).
+    /// Held identities: the files in identities_dir, re-read while the node runs (Node::reload_identities).
     pub identities: RwLock<Vec<(String, Seed)>>,
+    pub identities_dir: Option<std::path::PathBuf>,
     pub public_url: String,
     /// The trust file this node may edit for invite, join and accept (none in unit tests).
     pub members_file: Option<std::path::PathBuf>,
@@ -198,20 +199,6 @@ impl Node {
     pub fn current_encryption_key(&self) -> Option<islandmail_core::node_key::NodeEncryptionKey> {
         let epoch = now_millis().div_euclid(islandmail_core::node_key::ROTATION_MS);
         self.encryption_key.read().unwrap().as_ref().filter(|k| k.epoch == epoch).cloned()
-    }
-
-    /// Signed current-interval records for the node identities in the requested audience.
-    pub fn recipient_node_keys(&self, members: &MemberList, audience: &[PublicKey]) -> Result<Vec<islandmail_core::node_key::NodeEncryptionKey>> {
-        let now = now_millis();
-        let nodes: HashSet<_> = members.nodes.iter().map(|n| n.key.as_str()).collect();
-        let pins: Vec<_> = audience.iter().map(fmt_key).filter(|key| nodes.contains(key.as_str())).collect();
-        let mut records = self.store.peer_encryption_keys(&pins, now.div_euclid(islandmail_core::node_key::ROTATION_MS))?;
-        records.extend(self.current_encryption_key().filter(|k| pins.contains(&k.node)));
-        for record in &records {
-            anyhow::ensure!(pins.contains(&record.node), "encryption key outside requested audience");
-            record.verify(&parse_key(&record.node)?, &members.network, now)?;
-        }
-        Ok(records)
     }
 
     /// The X25519 keys a message for `audience` is wrapped to (forward secrecy where possible): each node in the
@@ -551,11 +538,10 @@ impl Node {
         let members = self.members.read().unwrap().clone();
         let agents = self.agents();
         let me_agent = self.agent_of(&agents, who)?;
-        // Room fields: the signed JSON a client sends, or (when the node signs) built from room/reply_to/event.
+        // Room fields: built from room/reply_to/event, or (grants, which the node itself sends) the exact JSON.
         let meta_raw = match body.get("meta") {
             Some(Value::String(m)) => m.clone(),
-            Some(Value::Null) | None if body.get("signed").is_none() => build_meta(body, &text, &thread)?,
-            Some(Value::Null) | None => String::new(),
+            Some(Value::Null) | None => build_meta(body, &text, &thread)?,
             Some(_) => return Err(ApiError::new(400, "meta must be the JSON text of the room fields")),
         };
         let meta = islandmail_core::room::Meta::parse(&meta_raw).map_err(|e| ApiError::new(400, format!("{e}")))?;
@@ -584,61 +570,27 @@ impl Node {
                 Self::recipients(&members, &agents, &to, &who.name, mode)?
             }
         };
-        let repeated = |row: Row| Ok(Posted { reaches: self.reaches(&row.recipient, &who.sub), row, repeated: true });
-        let signed = body.get("signed");
-        let (t, ts, salt, local) = match signed {
-            Some(s) => {
-                let raw_thread = body.get("thread").and_then(|t| t.as_str()).unwrap_or("general");
-                if body["to"].as_str() != Some(to.as_str()) || raw_thread != thread || body["text"].as_str() != Some(text.as_str()) {
-                    return Err(ApiError::new(400, "signed post: to, thread and text must be sent already normalized (NFC, no control or format characters, \\n line ends)"));
-                }
-                let ts = s["ts"].as_str().unwrap_or("").to_string();
-                let t = islandmail_core::parse_ts(&ts).ok_or_else(|| ApiError::new(400, "signed post: ts must be YYYY-MM-DDTHH:MM:SS.mmmZ"))?;
-                if (t - now_millis()).abs() > 300_000 {
-                    return Err(ApiError::new(400, "signed post: ts is more than 5 minutes from the node's clock"));
-                }
-                let salt = s["salt"].as_str().and_then(islandmail_core::b64u_decode).filter(|b| b.len() == 16)
-                    .ok_or_else(|| ApiError::new(400, "signed post: salt must be 16 bytes, base64url"))?;
-                (t, ts, salt, None)
+        // The node signs with the caller's agent key, which it holds (identities_dir) or was lent (/ui), so the envelope
+        // carries a signature instead of the caller's bearer token (README.md, Security).
+        let (key, seed) = self.local_key(who).ok_or_else(|| ApiError::new(400, format!(
+            "this node does not hold {}'s agent key: add identities_dir to its config (the folder with the identity files)",
+            who.name)))?;
+        if file_ids.is_empty() && meta.event.is_none() && meta.grant.is_empty() {
+            let since = ts_from_millis(now_millis() - REPEAT_MS);
+            if let Some(row) = self.store.repeat(who, &since, &to, &thread, &text)?
+                .filter(|r| r.mode == mode.as_str() && r.visible_to(who) && r.sealed_to(&recipients)) {
+                return Ok(Posted { reaches: self.reaches(&row.recipient, &who.sub), row, repeated: true });
             }
-            // The node holds the caller's own agent key (identities_dir) and it is the caller's key on the member list:
-            // sign for it, so the envelope carries a signature instead of the caller's bearer token (README.md, Security).
-            None => {
-                let local = self.local_key(who).ok_or_else(|| ApiError::new(400,
-                    "sign the post with your agent key or configure identities_dir on this node"))?;
-                if file_ids.is_empty() && meta.event.is_none() && meta.grant.is_empty() {
-                    let since = ts_from_millis(now_millis() - REPEAT_MS);
-                    if let Some(row) = self.store.repeat(who, &since, &to, &thread, &text)?
-                        .filter(|r| r.mode == mode.as_str() && r.visible_to(who) && r.sealed_to(&recipients)) {
-                        return repeated(row);
-                    }
-                }
-                // Bound to this node: no other node can seal the signed message again as its own.
-                let t = now_millis();
-                (t, ts_from_millis(t), islandmail_core::envelope::bound_salt(&self.seed.public()).to_vec(), Some(local))
-            }
-        };
+        }
+        // Bound to this node: no other node can seal the signed message again as its own.
+        let t = now_millis();
+        let (ts, salt) = (ts_from_millis(t), islandmail_core::envelope::bound_salt(&self.seed.public()).to_vec());
         let digest = islandmail_core::envelope::post_digest_meta(&salt, &text, &files, &meta_raw)?;
         let st = PostStatement {
             from: &who.name, sub: &me_agent.sub, to: &to, thread: &thread, mode,
             ts: &ts, digest: &digest, blobs: &file_ids, recipients: &recipients,
         }.signing_bytes(&members);
-        let (key, sig) = match local {
-            Some((key, seed)) => (key, islandmail_core::b64u(&seed.sign(&st))),
-            None => {
-                let sig = signed.and_then(|s| s["sig"].as_str()).unwrap_or("");
-                let Some(sig) = islandmail_core::b64u_decode(sig).filter(|b| islandmail_core::keys::verify(&me_agent.key, &st, b)) else {
-                    return Err(ApiError::new(401, format!("signed post: signature does not verify against {}'s key", who.name)));
-                };
-                // Canonical encoding (the one every node dedupes by); a client resending the same signed post gets
-                // the first copy back instead of a second envelope.
-                let sig = islandmail_core::b64u(&sig);
-                if let Some(row) = self.store.by_agent_sig(&sig)?.filter(|row| row.visible_to(who)) {
-                    return repeated(row);
-                }
-                (fmt_key(&me_agent.key), sig)
-            }
-        };
+        let sig = islandmail_core::b64u(&seed.sign(&st));
         let attest = Attest { key, digest, sig, cert: self.carried(&me_agent, t) };
         let parents = self.store.heads(&thread)?;
         let b = Body { text: text.clone(), files: files.clone(), salt: islandmail_core::b64u(&salt), meta: meta_raw.clone() };
@@ -693,10 +645,11 @@ impl Node {
     /// The caller's agent key, if this node holds it: an identity named like the caller with the caller's key
     /// (which the token check already tied to the pin or certificate). (key string, seed)
     pub fn local_key(&self, who: &Caller) -> Option<(String, Seed)> {
-        let held = self.held()
-            .into_iter()
+        let find = || self.held().into_iter()
             .find(|(n, s)| islandmail_core::addr::same(n, &who.name) && fmt_key(&s.public()) == who.key)
-            .map(|(_, s)| (who.key.clone(), s.clone()));
+            .map(|(_, s)| (who.key.clone(), s));
+        // A file written a moment ago (a new identity's first command) is read now, not at the next poll.
+        let held = find().or_else(|| self.reload_identities().then(find).flatten());
         held.or_else(|| {
             let mut lent = self.lent.lock().unwrap();
             let now = now_millis();
@@ -719,10 +672,11 @@ impl Node {
     /// Post as `who` in a room, signed by this node with the caller's held or lent key: the room's plan decides the
     /// recipients and mode. `reply_to` is a message id prefix or envelope hash; `event` a membership event.
     pub fn room_send(&self, who: &Caller, room: &str, text: &str, reply_to: Option<&str>,
-                     event: Option<&islandmail_core::room::Event>) -> Result<crate::store::Row, ApiError> {
+                     event: Option<&islandmail_core::room::Event>, files: &[String]) -> Result<crate::store::Row, ApiError> {
         let members = self.members.read().unwrap().clone();
         let plan = self.room_plan(room, &who.name, event, &members, &self.agents())?;
-        let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true });
+        let mut body = json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": true,
+                               "files": files });
         if let Some(id) = reply_to.filter(|r| !r.is_empty()) {
             body["reply_to"] = json!(crate::api::resolve(self, id, who)?.env_id);
         }
@@ -742,9 +696,69 @@ impl Node {
         Ok(row)
     }
 
-    /// A new private room `who/name` (history full) with `members` that this host knows; returns the room id and the
-    /// names it does not know (to invite).
-    pub fn new_room(&self, who: &Caller, name: &str, members: &[String], topic: &str)
+    /// POST /api/room-ops {op, ...}: new {name, members, topic, open}, add/remove {room, members}, leave {room}, vouch {room}.
+    pub fn room_op(&self, who: &Caller, v: &Value) -> Result<Value, ApiError> {
+        use islandmail_core::room::Event;
+        let room = v["room"].as_str().unwrap_or("");
+        let members: Vec<String> = v["members"].as_array().map(|a| a.iter().filter_map(|m| m.as_str())
+            .map(|m| m.trim_start_matches('@').to_string()).filter(|m| !m.is_empty()).collect()).unwrap_or_default();
+        let at = members.iter().map(|m| format!("@{m}")).collect::<Vec<_>>().join(", ");
+        match v["op"].as_str().unwrap_or("") {
+            "new" => {
+                let (room, unknown) = self.new_room(who, v["name"].as_str().unwrap_or(""), &members,
+                                                    v["topic"].as_str().unwrap_or(""), v["open"] == true)?;
+                Ok(json!({ "room": room, "unknown": unknown }))
+            }
+            "add" => Ok(json!({ "note": self.room_add(who, room, &members)? })),
+            "remove" => self.room_send(who, room, &format!("removed {at}"), None, Some(&Event::Remove { members }), &[])
+                .map(|_| json!({})),
+            "leave" => self.room_send(who, room, "left the room", None, Some(&Event::Leave {}), &[]).map(|_| json!({})),
+            "vouch" => {
+                if !islandmail_core::room::creator_of(room).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
+                    return Err(ApiError::new(403, "only the room's creator vouches for its members"));
+                }
+                self.send_vouch(who, room).map(|_| json!({}))
+            }
+            _ => Err(ApiError::new(400, "op must be new, add, remove, leave or vouch")),
+        }
+    }
+
+    /// Adds `names` to a room as `who`: the membership event, the grants of a private room's history, then the
+    /// creator's vouch (or, in another member's open room, the grant of its membership events). Returns a note.
+    pub fn room_add(&self, who: &Caller, room: &str, names: &[String]) -> Result<String, ApiError> {
+        use islandmail_core::{room::Event, Mode};
+        let ev = Event::Add { members: names.to_vec() };
+        let (members, agents) = (self.members.read().unwrap().clone(), self.agents());
+        let plan = self.room_plan(room, &who.name, Some(&ev), &members, &agents)?;
+        let text = format!("added {}", names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", "));
+        self.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": ev }))?;
+        let mut note = String::new();
+        if plan.mode == Mode::Private {
+            let full = self.room_state(room)?.is_some_and(|s| s.history == islandmail_core::room::History::Full);
+            let keys = self.room_keys(who, room)?;
+            for n in names {
+                for chunk in keys.chunks(500) {
+                    let meta = serde_json::to_string(&json!({ "grant": chunk })).expect("JSON");
+                    self.post(who, &json!({ "to": n, "thread": room, "mode": "private", "meta": meta,
+                                            "text": format!("key grant: {} earlier messages of {room}", chunk.len()) }))?;
+                }
+            }
+            note = if full { format!("; they can read its {} earlier messages", keys.len()) }
+                   else { "; they see only messages from now on".into() };
+        }
+        if islandmail_core::room::creator_of(room).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
+            if let Err(e) = self.send_vouch(who, room) {
+                tracing::warn!("{room}: could not post the creator's vouch: {}", e.message);
+            }
+        } else if plan.mode != Mode::Private {
+            self.grant_open_events(who, room)?;
+        }
+        Ok(note)
+    }
+
+    /// A new room `who/name` (private with full history, or open) with `members` that this host knows; returns the
+    /// room id and the names it does not know (to invite).
+    pub fn new_room(&self, who: &Caller, name: &str, members: &[String], topic: &str, open: bool)
                     -> Result<(String, Vec<String>), ApiError> {
         let room = format!("{}/{}", norm(&who.name), name.trim());
         let ok = |c: char| c.is_alphanumeric() || "._-".contains(c);
@@ -760,13 +774,13 @@ impl Node {
             .filter(|m| !m.is_empty() && !islandmail_core::addr::same(m, &who.name))
             .partition(|m| agents.iter().any(|a| islandmail_core::addr::same(&a.name, m)));
         let event = islandmail_core::room::Event::Create {
-            private: true, history: islandmail_core::room::History::Full, topic: topic.trim().to_string(), members: known.clone(),
+            private: !open, history: islandmail_core::room::History::Full, topic: topic.trim().to_string(), members: known.clone(),
         };
-        let mut text = "created this private room".to_string();
+        let mut text = format!("created this {} room", if open { "open" } else { "private" });
         if !known.is_empty() {
             text += &format!(" with {}", known.iter().map(|m| format!("@{m}")).collect::<Vec<_>>().join(", "));
         }
-        self.room_send(who, &room, &text, None, Some(&event))?;
+        self.room_send(who, &room, &text, None, Some(&event), &[])?;
         Ok((room, unknown))
     }
 
@@ -1150,15 +1164,18 @@ impl Node {
         self.opts.identities.read().unwrap().clone()
     }
 
-    /// Adopts a new reading of identities_dir; true when it changed (new names then get certificates).
-    pub fn set_identities(&self, ids: Vec<(String, Seed)>) -> bool {
+    /// Reads identities_dir again; true when it changed (new names then get certificates).
+    pub fn reload_identities(&self) -> bool {
+        let ids = crate::config::held(self.opts.identities_dir.as_deref(), &self.members.read().unwrap());
         let key = |v: &[(String, Seed)]| v.iter().map(|(n, s)| (n.clone(), fmt_key(&s.public()))).collect::<Vec<_>>();
         let mut cur = self.opts.identities.write().unwrap();
         if key(&cur) == key(&ids) { return false; }
+        tracing::info!("identities_dir: {} local identities", ids.len());
         *cur = ids;
         drop(cur);
         // New keys may open envelopes refused before.
         self.trust.send_modify(|g| *g += 1);
+        self.certify_identities();
         true
     }
 
@@ -1244,7 +1261,7 @@ impl Node {
         let entries = self.vouch_entries(room)?;
         if !entries.is_empty() {
             let text = format!("vouched for the nodes of {}", entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>().join(", "));
-            self.room_send(who, room, &text, None, Some(&islandmail_core::room::Event::Vouch { members: entries }))?;
+            self.room_send(who, room, &text, None, Some(&islandmail_core::room::Event::Vouch { members: entries }), &[])?;
         }
         self.grant_open_events(who, room)?;
         Ok(())
@@ -1305,7 +1322,7 @@ impl Node {
     }
 
     /// Who a room post reaches: the members (private) or the room's participants, not the sender.
-    fn room_reaches(&self, room: &str, from: &str) -> Vec<String> {
+    pub fn room_reaches(&self, room: &str, from: &str) -> Vec<String> {
         let state = self.room_state(room).ok().flatten();
         let mut out: Vec<String> = match state {
             Some(s) if s.private() || !s.members.is_empty() => s.members.keys().cloned().collect(),
@@ -1569,7 +1586,9 @@ mod tests {
         };
         let path = std::env::temp_dir().join(format!("islandmail-node-test-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let (tx, rx) = mpsc::channel(32);
-        let opts = Opts { public_url: "http://x".into(), ..Default::default() };
+        // The node holds alice's key (identities_dir), so it signs her posts.
+        let held = RwLock::new(vec![("a.alice".to_string(), Seed::from_bytes(*alice.bytes()))]);
+        let opts = Opts { public_url: "http://x".into(), identities: held, ..Default::default() };
         let store = Store::open(&path).unwrap();
         store.bind_roster(&node_a.public(), &list).unwrap();
         let node = Node::new(store, list.clone(), node_a, opts, tx);
@@ -1765,22 +1784,6 @@ mod tests {
     }
 
     #[test]
-    fn resending_a_signed_post_returns_the_first_copy() {
-        let (node, alice, _b, _l, _rx) = setup();
-        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let f = node.upload(&who, "a.txt", "text/plain", b"bytes").unwrap();
-        let id = f["id"].as_str().unwrap().to_string();
-        let ts = now_ts();
-        let post = json!({ "to": "all", "mode": "members", "thread": "t", "text": "with file", "files": [id],
-                           "signed": signed(&_l, &alice, "all", "t", "with file", std::slice::from_ref(&f), &ts) });
-        let p1 = node.post(&who, &post).unwrap();
-        let p2 = node.post(&who, &post).unwrap();
-        assert!(!p1.repeated && p2.repeated);
-        assert_eq!(p1.row.env_id, p2.row.env_id);
-        assert_eq!(node.store.count().unwrap(), 1);
-    }
-
-    #[test]
     fn a_wrong_key_for_a_blob_does_not_shadow_the_real_one() {
         let (node, agent, node_b, mut list, _rx) = setup();
         let bob_key = fmt_key(&Seed::generate().public());
@@ -1801,8 +1804,7 @@ mod tests {
         let opened = decoy.open_for([&node.seed]).unwrap().unwrap();
         let read = Read { header: &opened.header, v: &v, ck: &opened.ck };
         node.store.insert_with(&decoy, Some(read), Some("decoy"), &wrong.to_string(), None, now_millis(), &Default::default()).unwrap().unwrap();
-        node.post(&alice, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
-            "signed": signed(&list, &agent, "all", "t", "see file", std::slice::from_ref(&f), &now_ts()) })).unwrap();
+        node.post(&alice, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id] })).unwrap();
         // Another reader (built directly: this test is about attachment keys, not the member-list sign-in check).
         let bob = Caller { key: bob_key, name: "a.bob".into(), sub: "agent:bob@t".into(), exp_ms: i64::MAX };
         let (_, bytes) = node.download(&id, &bob).unwrap();
@@ -1866,46 +1868,11 @@ mod tests {
         assert_eq!(out.id, p.row.env_id);
         let p2 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "hi" })).unwrap();
         assert!(p2.repeated, "identical resend is answered with the first");
-        for invalid in [json!({"to":"all", "mode": "members","thread":"t","text":"hi","signed":null}),
-                        json!({"to":"all","thread":"t","text":"hi","mode":false})] {
-            assert!(node.post(&who, &invalid).is_err());
-        }
+        assert!(node.post(&who, &json!({"to":"all","thread":"t","text":"hi","mode":false})).is_err());
         let p3 = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "next" })).unwrap();
         assert_eq!(rx.try_recv().unwrap().open_for([&node.seed]).unwrap().unwrap().header.parents, vec![p.row.env_id.clone()],
                    "parents = thread heads");
         assert!(p3.row.id > p.row.id);
-    }
-
-    fn signed(list: &MemberList, alice: &Seed, to: &str, thread: &str, text: &str, files: &[Value], ts: &str) -> Value {
-        let salt = islandmail_core::random_bytes::<16>();
-        let digest = islandmail_core::envelope::post_digest_meta(&salt, text, files, "").unwrap();
-        let ids: Vec<_> = files.iter().map(|f| f["id"].as_str().unwrap().to_owned()).collect();
-        let st = PostStatement {
-            from: "a.alice", sub: "agent:alice@t", to, thread, mode: Mode::Members,
-            ts, digest: &digest, blobs: &ids, recipients: &list.all_keys(),
-        }.signing_bytes(list);
-        json!({ "ts": ts, "salt": islandmail_core::b64u(&salt), "sig": islandmail_core::b64u(&alice.sign(&st)) })
-    }
-
-    #[test]
-    fn signed_post_path() {
-        let (node, alice, _b, _l, mut rx) = setup();
-        let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
-        let ts = now_ts();
-        let _ = node
-            .post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "signed", "signed": signed(&_l, &alice, "all", "t", "signed", &[], &ts) }))
-            .unwrap();
-        let e = rx.try_recv().unwrap();
-        assert_eq!(e.ts, ts);
-        // A signature over other text, or by another key, is refused.
-        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "changed", "signed": signed(&_l, &alice, "all", "t", "orig", &[], &ts) }));
-        assert_eq!(bad.err().unwrap().status, 401);
-        let mallory = Seed::generate();
-        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "x", "signed": signed(&_l, &mallory, "all", "t", "x", &[], &ts) }));
-        assert_eq!(bad.err().unwrap().status, 401);
-        let old = ts_from_millis(now_millis() - 3_600_000);
-        let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "y", "signed": signed(&_l, &alice, "all", "t", "y", &[], &old) }));
-        assert_eq!(bad.err().unwrap().status, 400);
     }
 
     #[test]
@@ -1935,11 +1902,7 @@ mod tests {
         let who = node.verify(&agent_token(&alice, &node.seed.public())).unwrap();
         let f = node.upload(&who, "a.txt", "text/plain", b"attached bytes").unwrap();
         let id = f["id"].as_str().unwrap().to_string();
-        let ts = now_ts();
-        let p = node
-            .post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id],
-                                 "signed": signed(&_l, &alice, "all", "t", "see file", std::slice::from_ref(&f), &ts) }))
-            .unwrap();
+        let p = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "see file", "files": [id] })).unwrap();
         let e = rx.try_recv().unwrap();
         let o = e.open_for([&node.seed]).unwrap().unwrap();
         for (field, replacement) in [("name", json!("different.txt")), ("type", json!("application/json")), ("size", json!(1))] {
@@ -1977,11 +1940,9 @@ mod tests {
         let stranger = islandmail_core::agent_token::mint(&eve, "a.eve", "agent:eve@t", &me, now_millis(), 600);
         assert_eq!(node.verify(&stranger).err().unwrap().status, 403, "not on the member list");
 
-        // This node does not hold alice's key: an unsigned post is refused, a post signed by her key goes out.
+        // The node signs with alice's key; the envelope carries no token.
         let who = node.verify(&agent_token(&alice, &me)).unwrap();
-        let e = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "unsigned" })).err().unwrap();
-        assert_eq!(e.status, 400, "{}", e.message);
-        let _ = node.post(&who, &json!({"to":"all", "mode": "members", "thread":"t", "text":"signed", "signed":signed(&_list, &alice, "all", "t", "signed", &[], &now_ts())})).unwrap();
+        let _ = node.post(&who, &json!({"to":"all", "mode": "members", "thread":"t", "text":"signed"})).unwrap();
         let env = rx.try_recv().unwrap();
         assert!(!serde_json::to_string(&env).unwrap().contains(paseto_header()), "no token in the envelope");
     }

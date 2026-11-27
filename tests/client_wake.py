@@ -45,7 +45,8 @@ def main():
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "mac", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["alice", "s."]}]}, f)
-    node = Node(bin_, work, "mac", {"data_dir": os.path.join(work, "data"), "api_listen": "127.0.0.1:%d" % port,
+    node = Node(bin_, work, "mac", {"data_dir": os.path.join(work, "data"), "identities_dir": os.path.join(work, "client", "identities"),
+                  "api_listen": "127.0.0.1:%d" % port,
                                     "iroh_port": udp, "node_key_file": seed, "members_file": trust, "sync_secs": 3})
     client_dir = os.path.join(work, "client")
     env = dict(os.environ, ISLANDMAIL_DIR=client_dir, ISLANDMAIL_URL="http://127.0.0.1:%d" % port)

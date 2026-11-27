@@ -89,7 +89,8 @@ def main():
         json.dump({"v": 1, "network": network, "seq": 1, "members": [], "relays": [RELAY],
                    "nodes": [{"name": "a", "key": a_key, "addrs": ["127.0.0.1:%d" % a_udp], "names": ["alice"]}]}, f)
     node_a = Node(bin_, adir, "config", {"data_dir": "data", "api_listen": "127.0.0.1:%d" % a_api, "iroh_port": a_udp,
-                                         "node_key_file": "node.seed", "members_file": "members.json", "sync_secs": 3})
+                                         "node_key_file": "node.seed", "members_file": "members.json", "sync_secs": 3,
+                                         "identities_dir": os.path.join(work, "a", "client", "identities")})
     a_cfg = os.path.join(adir, "config.json")
 
     # Hosts B and C: nothing yet. Their node folders and client folders are made by join.
@@ -192,12 +193,10 @@ def main():
               and b_ent[0]["addrs"] == ["127.0.0.1:%d" % fresh["b"][1]], json.dumps(at["nodes"]))
         b_key = b_ent[0]["key"] if b_ent else ""
 
-        # The inviter's lines: alice's next command (which also does the room add), and one in her inbox from bob.
+        # A's node, which holds alice's key, adds bob to alice/plan; alice gets an inbox line from bob.
         # Bounds are generous (sync under a loaded CI host can take a while); each wait ends as soon as the line is there.
-        said = []
-        got, t = wait_for(lambda: said.append(cl("a", "rooms")) or "; added to alice/plan" in said[-1][2], timeout=120, every=1)
-        check("alice's next command says bob joined and adds bob to alice/plan", got,
-              "%.1fs %s" % (t, said[-1][2][-300:] if said else ""))
+        got, t = wait_for(lambda: [r for r in js("b", "rooms") or [] if r.get("id") == "alice/plan"], timeout=120)
+        check("A's node adds bob to alice/plan", got, "%.1fs" % t)
         got, t = wait_for(lambda: [m for m in js("a", "read", "--to-me") or [] if "joined with your invite" in m.get("text", "")],
                           timeout=120)
         check("alice gets a line in her inbox about the join", got and got[0]["from"] == "bob", "%.1fs" % t)
@@ -292,10 +291,7 @@ def main():
         rc, out, err = cl("a", "accept", reply, "--config", a_cfg)
         check("accepting the same reply again changes nothing", rc == 0 and len(a_trust_now()["nodes"]) == 3, err[-200:])
 
-        # Key-bound, two names, and the room add made by A's node, which now holds alice's key (identities_dir).
-        node_a.stop()
-        node_a.cfg["identities_dir"] = os.path.join(work, "a", "client", "identities")
-        check("A's node restarts holding alice's key", node_a.start())
+        # Key-bound, two names, and the room add made by A's node.
         d_cfg = fresh["d"][0]
         rc, d_key, err = cl("d", "nodekey", "--config", d_cfg, "--bin", bin_)
         check("a fresh host prints its node key before it has a node", rc == 0 and d_key.startswith("ed25519:")
