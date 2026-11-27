@@ -11,21 +11,3 @@ pub mod world;
 pub fn sync_answer(node: &node::Node, peer: &[u8; 32], req: &[u8]) -> anyhow::Result<Vec<u8>> {
     net::answer(node, peer, req)
 }
-
-/// `net::trust_message`: a gossiped certificate or revocation; None for anything else.
-pub fn gossip_trust(node: &node::Node, raw: &[u8]) -> Option<anyhow::Result<bool>> {
-    net::trust_message(node, raw)
-}
-
-/// Marks every invite of `node` unspent again (fuzz targets reset between inputs).
-pub fn unspend_invites(node: &node::Node) {
-    node.store.conn().execute("UPDATE join_invites SET spent_by = NULL, spent_ms = NULL", []).unwrap();
-}
-
-/// Every stored row as (env_id, mode, sender, thread, text), by env_id: what a node holds, for comparing nodes.
-pub fn rows(node: &node::Node) -> Vec<(String, String, String, String, Option<String>)> {
-    let db = node.store.conn();
-    let mut st = db.prepare("SELECT env_id, mode, sender, thread, text FROM messages ORDER BY env_id").unwrap();
-    st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap()
-        .collect::<rusqlite::Result<_>>().unwrap()
-}

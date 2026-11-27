@@ -43,7 +43,6 @@ pub fn list(seq: u64) -> MemberList {
                         names: vec!["c.".into()] },
             NodeEntry { name: "nb".into(), key: fmt_key(&node_b().public()), addrs: vec![], names: vec!["d.".into()] },
         ],
-        homes: vec![],
         relays: vec![],
     }
 }

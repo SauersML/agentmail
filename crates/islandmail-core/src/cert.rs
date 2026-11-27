@@ -26,9 +26,9 @@ pub fn valid_name(name: &str) -> bool {
         && !name.eq_ignore_ascii_case("all")
 }
 
-/// A name a certificate may carry: an agent name, or a home name `local@domain` (see `home`).
+/// A name a certificate may carry.
 pub fn valid_agent_name(name: &str) -> bool {
-    valid_name(name) || crate::home::split_name(name).is_some()
+    valid_name(name)
 }
 
 /// A namespace entry in a trust file: an exact agent name, or a prefix ending in '.' (e.g. "ops.").
@@ -92,9 +92,6 @@ pub struct Cert {
     pub node: String,
     pub issued: String,
     pub sig: String,
-    /// For a home name: the home's token and the agent's proof of possession, which every peer re-checks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub home: Option<crate::home::HomeProof>,
 }
 
 /// A node's statement that it no longer vouches for `key`, from `ts` on. It counts only against that node's certs.
@@ -131,17 +128,11 @@ fn check_signed(v: u32, name: &str, key: &str, node: &str, ts: &str, sig: &str, 
 impl Cert {
     pub fn issue(node: &Seed, name: &str, key: &PublicKey, issued: &str) -> Cert {
         let mut c = Cert { v: VERSION, name: name.into(), key: fmt_key(key), node: fmt_key(&node.public()),
-                           issued: issued.into(), sig: String::new(), home: None };
+                           issued: issued.into(), sig: String::new() };
         c.sig = b64u(&node.sign(&c.signing_bytes()));
         c
     }
 
-    /// A certificate for a home name, carrying the home's token and the agent's proof of possession.
-    pub fn issue_home(node: &Seed, name: &str, key: &PublicKey, issued: &str, proof: crate::home::HomeProof) -> Cert {
-        let mut c = Cert { home: Some(proof), ..Cert::issue(node, name, key, issued) };
-        c.sig = b64u(&node.sign(&c.signing_bytes()));
-        c
-    }
 
     pub fn signing_bytes(&self) -> Vec<u8> {
         signed_json(CERT_CONTEXT, &Cert { sig: String::new(), ..self.clone() })

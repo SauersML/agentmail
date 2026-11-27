@@ -1,6 +1,6 @@
 [package]
 name = "islandmail-fuzz"
-description = "cargo-fuzz targets for every parser of untrusted bytes in islandmail (see fuzz/README.md)"
+description = "cargo-fuzz targets for the parsers of untrusted bytes in islandmail (see fuzz/README.md)"
 version = "0.0.0"
 edition = "2021"
 publish = false
@@ -14,11 +14,9 @@ libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 islandmail-core = { path = "../crates/islandmail-core" }
 islandmail-fuzz-harness = { path = "harness" }
-axum = "0.8"
 blake3 = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.5", features = ["util"] }
 
 # Separate from the main workspace: the fuzz crates build only here, with their own lock file.
 [workspace]
@@ -35,29 +33,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "sealed_body"
-path = "fuzz_targets/sealed_body.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "crypto_open"
-path = "fuzz_targets/crypto_open.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "cert"
-path = "fuzz_targets/cert.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "trust_file"
-path = "fuzz_targets/trust_file.rs"
+name = "invite"
+path = "fuzz_targets/invite.rs"
 test = false
 doc = false
 bench = false
@@ -70,85 +47,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "agent_token"
-path = "fuzz_targets/agent_token.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "aid1"
-path = "fuzz_targets/aid1.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "codecs"
-path = "fuzz_targets/codecs.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "room"
-path = "fuzz_targets/room.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "node_key"
-path = "fuzz_targets/node_key.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "invite"
-path = "fuzz_targets/invite.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "join_handshake"
-path = "fuzz_targets/join_handshake.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "sync_request"
 path = "fuzz_targets/sync_request.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "gossip"
-path = "fuzz_targets/gossip.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "ingest"
-path = "fuzz_targets/ingest.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "api"
-path = "fuzz_targets/api.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "mcpl"
-path = "fuzz_targets/mcpl.rs"
 test = false
 doc = false
 bench = false

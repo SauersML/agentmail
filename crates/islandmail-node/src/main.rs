@@ -11,7 +11,6 @@
 mod api;
 mod config;
 mod encryption_keys;
-mod homes;
 mod invite;
 mod mcpl;
 

@@ -294,22 +294,11 @@ def _while_open_elsewhere(fn, *args):
             time.sleep(0.05)
 
 
-HOME_NAME = r"[A-Za-z0-9._-]{1,48}@[a-z0-9.-]{1,64}"
-
-
-def is_home_name(name):
-    # local@domain, as the node reads it: a local name and two or more lowercase DNS labels, at most 64 characters.
-    local, _, domain = name.partition("@")
-    labels = domain.split(".")
-    return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,47}", local) and not local.endswith(".")
-                and local.lower() != "all" and len(domain) <= 64 and len(labels) >= 2
-                and all(re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", x) for x in labels))
 
 
 def safe_name(name):
-    # A local name, or a home name (name@home-suffix) vouched for by an identity home's aid1 token.
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name) and not re.fullmatch(HOME_NAME, name):
-        raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens (optionally @home-suffix)")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
+        raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens")
     return name
 
 
@@ -406,50 +395,6 @@ def certify(ident):
     return http("POST", MAIL + "/api/agents", body)["cert"]
 
 
-# ---- homes: enroll a home name with a key-bound aid1 token from that home ----
-
-
-def pending_path(name):
-    return os.path.join(DIR, "pending", safe_name(name) + ".json")
-
-
-def aid1_payload(token):
-    # Read (not verify: the node does) the token's payload for its iss, aud and cnf.
-    parts = token.split(".")
-    if len(parts) != 3 or parts[0] != "aid1":
-        raise Fail("not an aid1 token")
-    try:
-        return json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except ValueError as e:
-        raise Fail("aid1 payload is not JSON") from e
-
-
-def enroll(ident, token, old=None):
-    # Proof of key for this node, plus a proof of possession of the token (archipelago-present|v1); with `old`, the
-    # old identity's signature handing the name to this key.
-    payload = aid1_payload(token)
-    node, ts = node_key(), canon_ts()
-    seed = bytes.fromhex(ident["seed"])
-    kid = "ed25519:" + b64u(ed25519_public(seed))
-    jti = b64u(os.urandom(16))
-    statement = "islandmail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, node, ts)
-    present = "archipelago-present|v1|%s|%s|%s|%s|%s" % (
-        payload.get("iss"), payload.get("aud"), ts, jti, b64u(hashlib.sha256(token.encode()).digest()))
-    body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode())),
-            "aid1": token, "jti": jti, "pop": b64u(ed25519_sign(seed, present.encode()))}
-    if old:
-        rekey = "islandmail-rekey|v1|%s|%s|%s" % (ident["name"].lower(), old["id"], kid)
-        body["rekey"] = {"key": old["id"], "sig": b64u(ed25519_sign(bytes.fromhex(old["seed"]), rekey.encode()))}
-    return http("POST", MAIL + "/api/agents", body)["cert"]
-
-
-def read_token(arg):
-    if arg == "-":
-        return sys.stdin.read().strip()
-    if arg.startswith("aid1."):
-        return arg.strip()
-    with open(arg, encoding="utf-8") as f:
-        return f.read().strip()
 
 
 # Windows has neither flag; there the access list check below does the work of mode 600.
@@ -757,53 +702,6 @@ def cmd_newkey(a):
     print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
 
 
-def home_token(ident, home):
-    # Today's archipelago-home: POST /token with a key proof over archipelago-token|v1|<iss>|<aud>|<ts> mints a token
-    # for any audience. The home's principal is this key; ask for 10 minutes, the longest a node accepts.
-    home = checked_node_url(home.rstrip("/")) if "://" in home else checked_node_url("https://" + home)
-    iss = http("GET", home + "/.well-known/mcpl-identity").get("domain")
-    if not isinstance(iss, str) or not iss:
-        raise Fail("%s does not publish its domain at /.well-known/mcpl-identity" % home)
-    aud = "islandmail:" + node_info()["network"]
-    ts = canon_ts()
-    seed = bytes.fromhex(ident["seed"])
-    proof = ed25519_sign(seed, ("archipelago-token|v1|%s|%s|%s" % (iss, aud, ts)).encode())
-    body = {"id": ident["id"], "audience": aud, "timestamp": ts, "proof": b64u(proof), "ttl": "10m"}
-    return http("POST", home + "/token", body)["token"]
-
-
-def cmd_enroll(a):
-    name = a.as_ or os.environ.get("ISLANDMAIL_AS")
-    if not name or "@" not in name:
-        raise Fail("enroll needs --as NAME@HOME-SUFFIX (make its key first with: newkey NAME@HOME-SUFFIX)")
-    ident = load_identity(name, create=False)
-    nxt = _read_identity(name, pending_path(name)) if os.path.exists(pending_path(name)) else None
-    if (a.token is None) == (a.home is None):
-        raise Fail("give a token (or a file holding one, or -), or --home URL to ask the home for one")
-    # A pending key (rekey) enrolls in place of the current one, which signs the handover.
-    key = nxt or ident
-    token = home_token(key, a.home) if a.home else read_token(a.token)
-    cnf = aid1_payload(token).get("cnf")
-    if cnf not in (None, key["id"]):
-        raise Fail("the token is bound to %s, not to the key being enrolled (%s)" % (cnf, key["id"]))
-    if nxt:
-        enroll(nxt, token, old=ident)
-        _while_open_elsewhere(os.replace, pending_path(name), ident_path(name))
-        print("enrolled %s with its new key %s (handed over by %s)" % (name, nxt["id"], ident["id"]))
-    else:
-        enroll(ident, token)
-        print("enrolled %s with key %s" % (name, ident["id"]))
-
-
-def cmd_rekey(a):
-    name = a.as_ or os.environ.get("ISLANDMAIL_AS")
-    ident = load_identity(name, create=False)
-    if "@" not in ident["name"]:
-        raise Fail("rekey is for home names (name@home-suffix)")
-    nxt = new_identity(ident["name"], path=pending_path(ident["name"]))
-    sys.stderr.write("new key saved in %s; once your home has it, run enroll (its old key signs the handover)\n"
-                     % pending_path(ident["name"]))
-    print(nxt["id"])
 
 
 def cmd_selftoken(a):
@@ -912,12 +810,9 @@ def dm_id(a, b):
 def mentions_in(text):
     # @name mentions, as the node reads them: normalized, at most 32.
     out = []
-    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)(@[A-Za-z0-9.-]+)?", text):
+    for m in re.finditer(r"(?<![A-Za-z0-9_@])@([A-Za-z0-9_][A-Za-z0-9_.-]*)", text):
         name = m.group(1).rstrip(".-").lower()
-        home = (m.group(1) + (m.group(2) or "")).rstrip(".-").lower()
-        if m.group(2) and is_home_name(home):
-            name = home  # @local@domain: a home name
-        if (re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) or is_home_name(name)) and name != "all" \
+        if re.fullmatch(r"[a-z0-9_][a-z0-9._-]{0,47}", name) and name != "all" \
                 and name not in out and len(out) < 32:
             out.append(name)
     return out
@@ -2802,11 +2697,7 @@ def main():
     p.add_argument("reply")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_accept)
-    p = sub.add_parser("enroll", help="have the node certify NAME@HOME with an aid1 token from that home")
-    p.add_argument("token", nargs="?", help="the aid1 token, a file holding it, or - for stdin")
-    p.add_argument("--home", help="ask this home (its URL or domain) for the token, signing with your key")
-    p.set_defaults(fn=cmd_enroll)
-    sub.add_parser("rekey", help="make a new key for a home name; enroll then hands the name to it").set_defaults(fn=cmd_rekey)
+
     p = sub.add_parser("send")
     p.add_argument("--to", required=True)
     p.add_argument("--thread", help="default general; to one agent with no thread: your DM room")

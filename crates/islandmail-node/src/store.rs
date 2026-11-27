@@ -328,7 +328,7 @@ impl Store {
         use rusqlite::functions::FunctionFlags;
         db.create_scalar_function("addressed_to", 2, FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
             |c| Ok(islandmail_core::addr::addressed_to(c.get_raw(0).as_str()?, &[c.get_raw(1).as_str()?])))?;
-        crate::homes::init(&db)?;
+
         crate::invite::init(&db)?;
         Ok(Store { db: Mutex::new(db), _exclusive: exclusive })
     }
@@ -1203,7 +1203,7 @@ mod tests {
         let key = islandmail_core::keys::Seed::generate().public();
         let mut list = islandmail_core::MemberList { v: 1, network: islandmail_core::b64u(&islandmail_core::random_bytes::<32>()),
             seq: 1, members: vec![], nodes: vec![islandmail_core::NodeEntry { name: "me".into(),
-                    key: islandmail_core::keys::fmt_key(&key), addrs: vec![], names: vec![] }], homes: vec![], relays: vec![] };
+                    key: islandmail_core::keys::fmt_key(&key), addrs: vec![], names: vec![] }], relays: vec![] };
         let path = std::env::temp_dir().join(format!("islandmail-node-store-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let store = Store::open(&path).unwrap();
         assert!(Store::open(&path).is_err(), "a second live node must not share the same store");

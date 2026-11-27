@@ -661,8 +661,6 @@ pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
 
 /// At most `max` events per key in the last minute.
 fn allow(key: &str, max: usize) -> bool {
-    // The fuzz targets (fuzz/) drive the handshake far past any real rate.
-    if cfg!(fuzzing) { return true; }
     static SEEN: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Vec<i64>>>> = std::sync::OnceLock::new();
     let now = now_millis();
     let mut m = SEEN.get_or_init(Default::default).lock().unwrap();
@@ -799,7 +797,7 @@ mod tests {
 
     fn node_on(network: [u8; 32], names: &[&str]) -> Node {
         let seed = islandmail_core::keys::Seed::generate();
-        let list = MemberList { v: 1, network: b64u(&network), seq: 1, members: vec![], homes: vec![], relays: vec![],
+        let list = MemberList { v: 1, network: b64u(&network), seq: 1, members: vec![], relays: vec![],
             nodes: vec![NodeEntry { name: "a".into(), key: fmt_key(&seed.public()), addrs: vec!["192.0.2.7:4433".into()],
                                     names: names.iter().map(|n| n.to_string()).collect() }] };
         let tag = b64u(&islandmail_core::random_bytes::<9>());

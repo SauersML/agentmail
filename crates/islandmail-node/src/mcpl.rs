@@ -213,22 +213,6 @@ async fn run(socket: WebSocket, node: Arc<Node>, who: Caller, mut replaced: ones
     }
 }
 
-/// For the fuzz targets (fuzz/): frames from a signed-in agent, handled as `run` handles them, minus the socket.
-/// Returns the text frames the node would send.
-#[cfg(fuzzing)]
-pub fn fuzz_frames(node: Arc<Node>, who: Caller, frames: &[&str]) -> Vec<String> {
-    let mut c = Conn { node, who, out: Vec::new(), mcpl: false, version: None, grant: None, ready: false, pending: None,
-                       closed: false, channels: Default::default(), open: Default::default(), registering: None,
-                       registered: false };
-    for f in frames {
-        c.frame(f);
-        c.sync_channels();
-        c.flush_backlog();
-        if c.closed { break; }
-    }
-    c.out.iter().filter_map(|m| match m { Message::Text(t) => Some(t.to_string()), _ => None }).collect()
-}
-
 impl Conn {
     fn send(&mut self, v: Value) {
         self.out.push(Message::Text(v.to_string().into()));

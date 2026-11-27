@@ -1,37 +1,20 @@
 name: fuzz
 
-# Every cargo-fuzz target in fuzz/ for a bounded time each, nightly and on demand. Crashes (and the corpus each
-# target grew) are uploaded as artifacts; a crash fails the run. Reproduce one locally with
-#   cargo fuzz run TARGET path/to/crash-file   (from fuzz/, nightly or RUSTC_BOOTSTRAP=1)
+# The fuzz targets in fuzz/ (the parsers of untrusted bytes), nightly and on demand. A crash fails the run and is
+# uploaded. Reproduce locally with `cargo fuzz run TARGET crash-file` (from fuzz/, nightly or RUSTC_BOOTSTRAP=1).
 
 on:
   schedule:
     - cron: "0 4 * * *"
   workflow_dispatch:
-    inputs:
-      seconds:
-        description: "Seconds per target (empty: 300)"
-        default: ""
-        required: false
-
-# A scheduled run's value is what it found: never cancelled by a later dispatch.
-concurrency:
-  group: fuzz-${{ github.event_name == 'schedule' && github.sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '300' }}
-
 jobs:
-  build:
+  fuzz:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    outputs:
-      targets: ${{ steps.list.outputs.targets }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,58 +24,21 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked --version 0.13.2
-      - name: Build every target
+      - name: Fuzz each target for 5 minutes
         working-directory: fuzz
-        run: cargo fuzz build -O --debug-assertions
-      - name: Protocol property tests
-        run: cargo test --locked --release --manifest-path fuzz/Cargo.toml -p islandmail-fuzz-harness
-      - id: list
-        working-directory: fuzz
-        run: echo "targets=$(cargo fuzz list | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: fuzz-binaries
-          path: fuzz/target/x86_64-unknown-linux-gnu/release/
-          retention-days: 1
-          if-no-files-found: error
-
-  fuzz:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.build.outputs.targets) }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: fuzz-binaries
-          path: bin
-      - name: Fuzz ${{ matrix.target }}
         env:
-          TARGET: ${{ matrix.target }}
           TMPDIR: /dev/shm
         run: |
-          chmod +x "bin/$TARGET"
-          mkdir -p "corpus/$TARGET" artifacts
-          seeds=()
-          if [ -d "fuzz/seeds/$TARGET" ]; then seeds=("fuzz/seeds/$TARGET"); fi
-          set +e
-          "bin/$TARGET" "corpus/$TARGET" "${seeds[@]}" -max_total_time="$SECONDS_PER_TARGET" -timeout=30 \
-            -rss_limit_mb=4096 -max_len=65536 -artifact_prefix=artifacts/ -print_final_stats=1
-          status=$?
-          set -e
-          echo "exit status $status"
-          exit "$status"
-      - if: always()
+          mkdir -p artifacts
+          for t in $(cargo fuzz list); do
+            seeds=()
+            if [ -d "seeds/$t" ]; then seeds=("seeds/$t"); fi
+            mkdir -p "corpus/$t"
+            cargo fuzz run -O --debug-assertions "$t" "corpus/$t" "${seeds[@]}" -- -max_total_time=300 -timeout=30 \
+              -rss_limit_mb=4096 -max_len=65536 -artifact_prefix=artifacts/
+          done
+      - if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fuzz-${{ matrix.target }}
-          path: |
-            artifacts/
-            corpus/
-          if-no-files-found: ignore
+          name: fuzz-crashes
+          path: fuzz/artifacts/

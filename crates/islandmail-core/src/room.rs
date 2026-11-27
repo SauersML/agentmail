@@ -253,18 +253,7 @@ pub fn mentions_in(text: &str) -> Vec<String> {
             while j < chars.len() && (word(chars[j]) || chars[j] == '.' || chars[j] == '-') {
                 j += 1;
             }
-            let mut name: String = chars[i + 1..j].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
-            // A home name, @local@domain, when the part after the second '@' makes one.
-            if j < chars.len() && chars[j] == '@' {
-                let mut k = j + 1;
-                while k < chars.len() && (chars[k].is_ascii_alphanumeric() || chars[k] == '.' || chars[k] == '-') {
-                    k += 1;
-                }
-                let home = chars[i + 1..k].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
-                if crate::home::split_name(&home).is_some() {
-                    (name, j) = (home, k);
-                }
-            }
+            let name: String = chars[i + 1..j].iter().collect::<String>().trim_end_matches(['.', '-']).to_lowercase();
             if crate::cert::valid_agent_name(&name) && !out.contains(&name) && out.len() < MAX_MENTIONS {
                 out.push(name);
             }
@@ -454,10 +443,8 @@ mod tests {
     #[test]
     fn mentions() {
         assert_eq!(mentions_in("hi @Alice and @ops.bob. mail a@b.c @@x @a_1-"), vec!["alice", "ops.bob", "a_1"]);
-        assert_eq!(mentions_in("@Fable@id.test. and @nell@x then @bob@"), vec!["fable@id.test", "nell", "bob"]);
-        assert_eq!(dm_pair(&dm_id("p.bob", "fable@id.test")), Some(("fable@id.test".into(), "p.bob".into())));
-        assert_eq!(creator_of("fable@id.test/plan"), Some("fable@id.test"));
-        assert_eq!(room_to("fable@id.test/plan"), "room:fable@id.test/plan");
+        assert_eq!(dm_pair(&dm_id("p.bob", "fable")), Some(("fable".into(), "p.bob".into())));
+        assert_eq!(creator_of("fable/plan"), Some("fable"));
     }
 
     #[test]

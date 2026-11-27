@@ -166,7 +166,7 @@ impl Node {
         let list = self.members.read().unwrap();
         let mut roster = self.roster.write().unwrap();
         // Serialize snapshot publication so a slow refresh cannot reinstate a revoked certificate.
-        *roster = match self.store.certs_at(None, i64::MAX).and_then(|c| crate::homes::current(&self.store, c, i64::MAX)) {
+        *roster = match self.store.certs_at(None, i64::MAX) {
             Ok(certs) => list.agents(&certs, &|_| None, i64::MAX),
             Err(e) => {
                 tracing::error!("reading certificate state: {e:#}");
@@ -276,8 +276,7 @@ impl Node {
     /// after it. Keeps the carried certificate.
     fn verify_read(&self, env: &Envelope, o: &Opened, members: &MemberList) -> Result<islandmail_core::Verified> {
         let h = &o.header;
-        let carried = h.attest.cert.as_ref().filter(|c| members.accepts(c)
-            && crate::homes::admit(&self.store, c, true).is_ok_and(|r| r.is_ok())).cloned();
+        let carried = h.attest.cert.as_ref().filter(|c| members.accepts(c)).cloned();
         let ts = env.ts_ms();
         let mut certs = self.store.certs_at(Some(&h.from), ts)?;
         if let Some(c) = &carried {
@@ -285,7 +284,6 @@ impl Node {
                 certs.push(c.clone());
             }
         }
-        let certs = crate::homes::current(&self.store, certs, ts)?;
         let at = members.agents(&certs, &|_| None, ts);
         let v = env.verify_opened(o, members, &at)?;
         anyhow::ensure!(o.body.text.encode_utf16().count() <= MAX_TEXT as usize, "message exceeds text limit");
@@ -390,9 +388,7 @@ impl Node {
         let me = self.me();
         let k = islandmail_core::cert::check_issuance(name, key, f("ts"), f("sig"), &me, now_millis())
             .map_err(|e| ApiError::new(400, format!("certificate request refused: {e}")))?;
-        if islandmail_core::home::is_home_name(name) || body.get("aid1").is_some() {
-            return self.certify_home(body, name, key, k);
-        }
+
         let _guard = self.issuance.lock().unwrap();
         let list = self.members.read().unwrap().clone();
         let mine = list.node_by_key(&me).ok_or_else(|| ApiError::new(503, "this node is not in its own trust file"))?;
@@ -430,71 +426,6 @@ impl Node {
         Ok((201, json!({ "cert": cert })))
     }
 
-    /// POST /api/agents with an `aid1` token: certify a home name (`local@suffix`) whose home this host trusts. Body
-    /// {name, key, ts, sig, aid1, jti, pop, rekey?}: `sig` as for local names; `pop` is the agent key's proof of
-    /// possession of the token at `ts` (`aid1::present_statement`); `rekey` {key, sig} hands the name over from its
-    /// pinned key. The certificate carries the token and proof, so peers check it against their own trust file.
-    fn certify_home(&self, body: &Value, name: &str, key: &str, k: PublicKey) -> Result<(u16, Value), ApiError> {
-        use islandmail_core::home::{HomeProof, Rekey};
-        let f = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !islandmail_core::home::is_home_name(name) {
-            return Err(ApiError::new(400, "an aid1 token enrolls only a home name (name@home-suffix); local names need none"));
-        }
-        if body.get("aid1").is_none() {
-            return Err(ApiError::new(403, format!(
-                "{name} is under a home's suffix: enroll with a key-bound aid1 token from that home (islandmail.py enroll)")));
-        }
-        let rekey = match body.get("rekey") {
-            None | Some(Value::Null) => None,
-            Some(v) => Some(serde_json::from_value::<Rekey>(v.clone()).map_err(|_| ApiError::new(400, "rekey must be {key, sig}"))?),
-        };
-        let proof = HomeProof { aid1: f("aid1"), ts: f("ts"), jti: f("jti"), pop: f("pop"), rekey };
-        let now = now_millis();
-        let me = self.me();
-        let _guard = self.issuance.lock().unwrap();
-        let list = self.members.read().unwrap().clone();
-        let homes: Vec<_> = list.homes.iter().filter(|h| h.covers(name)).collect();
-        if homes.is_empty() {
-            return Err(ApiError::new(403, format!("no home in this host's trust file vouches for {name}")));
-        }
-        let mut why = String::new();
-        let aud = islandmail_core::home::audience(&list.network);
-        let Some(token) = homes.iter().find_map(|h| h.check(name, key, &proof, &aud, now).map_err(|e| why = format!("{e:#}")).ok()) else {
-            tracing::warn!("enrollment of {name} refused: {why}");
-            return Err(ApiError::new(403, format!("enrollment refused: {why}")));
-        };
-        // Peers refuse a certificate dated before the token's iat; a home clock slightly ahead dates it at iat.
-        let issued = now.max((token.iat * 1000.0).ceil() as i64);
-        if self.store.revoked_at(&fmt_key(&me), key)?.is_some() {
-            return Err(ApiError::new(403, "this node revoked that key; make a new one"));
-        }
-        if !list.permits_agent_key(name, &k) {
-            return Err(ApiError::new(409, "agent name, subject or key conflicts with a pin in this host's trust file"));
-        }
-        if let Some(c) = self.store.cert(&fmt_key(&me), key)? {
-            if !islandmail_core::addr::same(&c.name, name) {
-                return Err(ApiError::new(409, format!("this key is already certified here as {}", c.name)));
-            }
-            return Ok((200, json!({ "cert": c })));
-        }
-        let cert = Cert::issue_home(&self.seed, name, &k, &ts_from_millis(issued), proof);
-        if !list.accepts(&cert) {
-            return Err(ApiError::new(403, "enrollment refused: the certificate would not verify under this trust file"));
-        }
-        if let Err(why) = crate::homes::admit(&self.store, &cert, false)? {
-            return Err(ApiError::new(409, format!("{name} is pinned to another key here: {why}")));
-        }
-        if !self.store.use_token(name, &format!("pop:{}", cert.home.as_ref().map_or("", |p| &p.jti)), now + 600_000, now)? {
-            return Err(ApiError::new(401, "proof of possession already used; sign a fresh one"));
-        }
-        self.rate("node", "certificate", 60)?;
-        let _ = crate::homes::admit(&self.store, &cert, true)?;
-        self.store.put_cert(&cert)?;
-        self.refresh();
-        let _ = self.trust_out.send(json!({ "cert": cert }).to_string());
-        tracing::info!("certified {name} {} with a token from its home", fmt_key(&k));
-        Ok((201, json!({ "cert": cert })))
-    }
 
     /// POST /api/revocations: the host owner (holding the node key) revokes this node's certificates for a name.
     /// Body {name, ts, sig}: sig is the node key's signature over `revoke_statement`.
@@ -522,9 +453,7 @@ impl Node {
     /// A certificate from a peer: kept if this host trusts its node for the name. Ok(true) when new here.
     pub fn take_cert(&self, c: &Cert) -> Result<bool> {
         anyhow::ensure!(self.members.read().unwrap().accepts(c), "certificate for {:?} from a node not trusted for that name", c.name);
-        if let Err(why) = crate::homes::admit(&self.store, c, true)? {
-            anyhow::bail!("certificate for {:?} refused: {why}", c.name);
-        }
+
         let new = self.store.put_cert(c)?;
         if new { self.refresh(); }
         Ok(new)
@@ -1680,7 +1609,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| NodeEntry { name: format!("n{i}"), key: fmt_key(&s.public()), addrs: vec![], names: vec![] })
                 .collect(),
-            homes: vec![], relays: vec![],
+            relays: vec![],
         };
         let path = std::env::temp_dir().join(format!("islandmail-node-test-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let (tx, rx) = mpsc::channel(32);
@@ -2122,7 +2051,7 @@ mod tests {
             nodes: [&mac, &pod, &ops].iter().zip(names).enumerate()
                 .map(|(i, (s, names))| NodeEntry { name: ["mac", "pod", "ops"][i].into(), key: fmt_key(&s.public()), addrs: vec![], names })
                 .collect(),
-            homes: vec![], relays: vec![],
+            relays: vec![],
         };
         list.validate().unwrap();
         let mk = |seed: Seed| {

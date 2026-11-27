@@ -888,7 +888,7 @@ mod tests {
         std::fs::create_dir(&dir)?;
         let key = Seed::generate();
         let list = islandmail_core::MemberList {
-            v: 1, network: islandmail_core::b64u(&islandmail_core::random_bytes::<32>()), seq: 1, members: vec![], homes: vec![], relays: Default::default(),
+            v: 1, network: islandmail_core::b64u(&islandmail_core::random_bytes::<32>()), seq: 1, members: vec![], relays: Default::default(),
             nodes: vec![NodeEntry { name: "n0".into(), key: fmt_key(&key.public()), addrs: vec![], names: vec![] }],
         };
         let (tx, _rx) = mpsc::channel(4);
@@ -946,7 +946,7 @@ mod tests {
         let me = Seed::generate();
         let list = islandmail_core::MemberList { v: 1, network: islandmail_core::b64u(&[1u8; 32]), seq: 1, members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
-            homes: vec![], relays: vec![custom.into()] };
+            relays: vec![custom.into()] };
         assert_eq!(relay_entries(&list, &[]), vec![custom.to_string()]);
         assert_eq!(relay_entries(&list, &["n0".into(), custom.into()]), vec![custom.to_string(), "n0".into()]);
         // The relay's allowlist names each node by its iroh endpoint id.
@@ -973,7 +973,7 @@ mod tests {
             nodes: keys.iter().enumerate().map(|(i, key)| NodeEntry {
                 name: format!("n{i}"), key: fmt_key(&key.public()), addrs: vec![], names: vec![format!("a{i}")]
             }).collect(),
-            homes: vec![], relays: vec![],
+            relays: vec![],
         };
         // The relay is the network's, in the trust file, not in either node's config. Node 0 starts with it; node 1
         // starts without and picks it up when its trust file gains it.
@@ -1062,7 +1062,7 @@ mod tests {
             seq: 1,
             members: vec![],
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
-            homes: vec![], relays: vec![],
+            relays: vec![],
         };
         let path = std::env::temp_dir().join(format!("islandmail-node-net-{}.sqlite", islandmail_core::b64u(&islandmail_core::random_bytes::<9>())));
         let (tx, _rx) = mpsc::channel(32);
@@ -1124,7 +1124,7 @@ mod tests {
                 vec![islandmail_core::Member { name: "a.alice".into(), sub: "agent:a.alice".into(), key: fmt_key(&alice.public()) }]
             } else { vec![] },
             nodes: vec![NodeEntry { name: "n".into(), key: fmt_key(&me.public()), addrs: vec![], names: vec![] }],
-            homes: vec![], relays: vec![],
+            relays: vec![],
         };
         std::fs::write(&file, serde_json::to_vec(&list(1, true)).unwrap()).unwrap();
         let cfg: Config = serde_json::from_value(serde_json::json!({
