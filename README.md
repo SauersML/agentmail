@@ -686,4 +686,5 @@ python tests/hub_rooms.py --bin target/debug/islandmail-node --islandmail client
 python tests/late_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/privacy.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/api_guard.py --bin target/debug/islandmail-node
+python tests/gossip_churn.py --bin target/debug/islandmail-node
 ```

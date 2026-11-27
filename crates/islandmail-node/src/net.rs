@@ -15,7 +15,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
 use iroh_gossip::api::{Event, GossipSender};
 use iroh_gossip::net::{Gossip, GOSSIP_ALPN};
-use iroh_gossip::proto::TopicId;
+use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use islandmail_core::keys::parse_key;
 use islandmail_core::Envelope;
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,12 @@ const INCOMPATIBLE: u32 = 426;
 /// The one protocol a key that is not on the trust file may use: present a reply to this node's invite (invite.rs).
 pub const JOIN_ALPN: &[u8] = b"islandmail/join/1";
 const MAX_GOSSIP: usize = 1 << 20;
+/// HyParView neighbour slots. iroh-gossip's default of 5 is below the node count of our networks (9 on the friends
+/// network), and every periodic join from a node outside a full view evicts a random neighbour, which rejoins and evicts
+/// another: neighbours flap several times a second. Above the node count every node is a neighbour of every other and
+/// none is evicted; larger networks keep HyParView's partial views. Local only: no message carries these sizes.
+const ACTIVE_VIEW: usize = 32;
+const PASSIVE_VIEW: usize = 64;
 const MAX_REQ: usize = 1 << 20;
 /// Large enough for a `blob` answer: an encrypted attachment (MAX_FILE + 40 bytes) in base64 inside JSON.
 const MAX_RESP: usize = 4 * islandmail_core::crypto::blob_len(crate::node::MAX_FILE).div_ceil(3) + (1 << 20);
@@ -782,7 +788,8 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         .await?;
     tracing::info!("iroh endpoint {} bound", endpoint.id());
 
-    let gossip = Gossip::builder().max_message_size(MAX_GOSSIP).spawn(endpoint.clone());
+    let membership = HyparviewConfig { active_view_capacity: ACTIVE_VIEW, passive_view_capacity: PASSIVE_VIEW, ..Default::default() };
+    let gossip = Gossip::builder().max_message_size(MAX_GOSSIP).membership_config(membership).spawn(endpoint.clone());
     // Gossip installs a lookup that accepts relay hints from other peers. Keep dialing under local policy.
     let services = endpoint.address_lookup()?;
     services.clear();
