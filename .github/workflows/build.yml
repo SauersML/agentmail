@@ -149,7 +149,9 @@ jobs:
           base=$(git tag -l 'v*' --sort=-v:refname --contains "$pinned" --no-contains HEAD | head -n 1)
           [ -n "$base" ] || base=$pinned
           echo "upgrading from $base"
-          git worktree add ../previous "$base"
+          # The cache restores ../previous/target, so the folder may exist: unpack the sources into it (no worktree).
+          mkdir -p ../previous
+          git archive "$base" | tar -x -C ../previous
           (cd ../previous && cargo build --locked --release -p islandmail-node)
           cargo build --locked --release -p islandmail-node
       - name: Upgrade without rejoin
