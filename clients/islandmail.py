@@ -3,6 +3,7 @@
 it; nothing else to set up.
 
   python3 islandmail.py join im1…             (join a network from an invite; sets up this host's node if needed)
+  python3 islandmail.py invite-check im1… --expect-network ID --expect-node ed25519:…   (offline: from the node you expect?)
   python3 islandmail.py send --to alice "hi"     (first use: a key for the host's first name, certified, then sent)
   python3 islandmail.py newkey ops.bob           (a key to pin by hand in trust files instead)
   python3 islandmail.py whoami
@@ -1296,6 +1297,93 @@ def cmd_invite(a):
                      "islandmail.py accept REPLY).\n"
                      % (a.name, " (joins room %s)" % a.room if a.room else "",
                         ", only for node %s" % a.key if a.key else "", out["exp"]))
+
+
+# ---- invite-check: compare an invite with a network and node keys the caller got out of band (offline) ----
+
+INVITE_CHECK_CODES = {"match": 0, "network_mismatch": 1, "node_mismatch": 1, "invalid_invite": 2, "invalid_binding": 2}
+
+
+def _id32(s, what):
+    # A network ID or the base64url part of a node key: 32 bytes, padding optional. Back in the canonical form.
+    if not isinstance(s, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}=?", s.strip()):
+        raise ValueError("%s is not 32 bytes of base64url: %r" % (what, s if isinstance(s, str) else type(s).__name__))
+    return b64u(base64.urlsafe_b64decode(s.strip().rstrip("=") + "="))
+
+
+def _node_key(s):
+    if not isinstance(s, str) or not s.strip().startswith("ed25519:"):
+        raise ValueError("node key must look like ed25519:<base64url>: %r" % (s if isinstance(s, str) else type(s).__name__))
+    return "ed25519:" + _id32(s.strip()[len("ed25519:"):], "node key")
+
+
+def invite_binding(network=None, nodes=(), path=None):
+    # {network, nodes, source} from --expect-network/--expect-node, or from a binding file
+    # {"v":1,"network":ID,"nodes":[KEY,...]} ("node": KEY for one). ValueError when it is not one.
+    if path:
+        if network or nodes:
+            raise ValueError("give either --binding or --expect-network/--expect-node, not both")
+        try:
+            with open(path, encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValueError("cannot read binding %s: %s" % (path, e))
+        if not isinstance(rec, dict) or rec.get("v") != 1:
+            raise ValueError("binding %s is not version 1 (it needs \"v\": 1)" % path)
+        if "nodes" in rec and "node" in rec:
+            raise ValueError("binding %s has both node and nodes; use one" % path)
+        nodes = rec.get("nodes", [rec["node"]] if "node" in rec else [])
+        if not isinstance(nodes, list) or not nodes:
+            raise ValueError("binding %s names no node (\"nodes\": [\"ed25519:...\"])" % path)
+        network, source = rec.get("network"), "binding file %s" % path
+    else:
+        source = "the command line"
+    if network is None:
+        raise ValueError("no network to compare with: pass --expect-network ID or --binding FILE")
+    return {"network": _id32(network, "network ID"), "nodes": [_node_key(k) for k in nodes], "source": source}
+
+
+def invite_check(inv, want):
+    # (result, message) for a checked invite (invite-info's JSON) against a binding.
+    got_net, got_key = inv["network"], inv["node"]["key"]
+    if got_net != want["network"]:
+        return "network_mismatch", "network mismatch: the invite is for network %s, expected %s" % (got_net, want["network"])
+    if want["nodes"] and got_key not in want["nodes"]:
+        return "node_mismatch", "node mismatch: the invite was issued by node %s, expected %s" % (
+            got_key, " or ".join(want["nodes"]))
+    return "match", "match: network %s, issued by node %s%s" % (
+        got_net, got_key, "" if want["nodes"] else " (no node key given, so any node of the network matches)")
+
+
+def cmd_invite_check(a):
+    inv, want = None, None
+    try:
+        want = invite_binding(a.expect_network, a.expect_node or [], a.binding)
+    except ValueError as e:
+        result, msg = "invalid_binding", "invalid binding: %s" % e
+    else:
+        try:
+            inv = read_invite(node_exe(a), a.invite)
+        except (Fail, ValueError, KeyError) as e:
+            result, msg = "invalid_invite", "invalid invite: %s" % e
+        else:
+            result, msg = invite_check(inv, want)
+    note = ("compared with values from %s; nothing was looked up, so how far they hold is how far you trust where they "
+            "came from. A match is not admission: the invite may be spent already, and join decides."
+            % (want["source"] if want else "you"))
+    if a.json:
+        print(json.dumps({"result": result, "message": msg, "note": note, "expected": want,
+                          "invite": inv and {"network": inv["network"], "node": inv["node"]["key"],
+                                             "names": inv.get("names"), "exp": inv.get("exp")}}, indent=1))
+    elif result == "match":
+        print(msg)
+        print("  for %s, valid until %s" % (", ".join(inv.get("names") or [inv.get("name", "?")]), inv.get("exp")))
+        print("  " + note)
+    else:
+        sys.stderr.write("islandmail: invite-check: %s\n" % msg)
+        if result.endswith("mismatch"):
+            sys.stderr.write("  do not join with this invite until whoever sent it explains the difference\n")
+    sys.exit(INVITE_CHECK_CODES[result])
 
 
 def cmd_join(a):
@@ -2789,6 +2877,16 @@ def main():
     p.add_argument("--ttl", type=int, default=0, help="seconds it stays valid (default: 7 days with --key, else 1 day)")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_invite)
+    p = sub.add_parser("invite-check", help="offline: does an invite come from the network (and node) you expect? "
+                       "exit 0 match, 1 mismatch, 2 invalid invite or binding")
+    p.add_argument("invite")
+    p.add_argument("--expect-network", metavar="ID", help="the network ID you got from the network's owner")
+    p.add_argument("--expect-node", metavar="ed25519:KEY", action="append",
+                   help="a node key allowed to issue the invite (repeat for several; default: any node of the network)")
+    p.add_argument("--binding", metavar="FILE", help='instead: a JSON file {"v":1,"network":ID,"nodes":[KEY,...]}')
+    p.add_argument("--bin", help="the islandmail-node binary that checks the invite (default: on PATH)")
+    p.add_argument("--json", action="store_true", help="the result as JSON (result, message, note, expected, invite)")
+    p.set_defaults(fn=cmd_invite_check)
     p = sub.add_parser("nodekey", help="this host's node key (made now on a fresh host), for an invite bound to it")
     p.add_argument("--config", help="the node's config (default ~/.islandmail/node/config.json)")
     p.add_argument("--bin", help="fresh host: the islandmail-node binary (default: on PATH)")
