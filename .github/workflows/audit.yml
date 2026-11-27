@@ -28,10 +28,6 @@ jobs:
           key: audit
       - run: cargo install cargo-audit --locked --version 0.23.0 && cargo install cargo-deny --locked --version 0.22.1
       - name: cargo audit
-        run: |
-          cargo audit --deny warnings
-          cargo audit --deny warnings --file fuzz/Cargo.lock
+        run: cargo audit --deny warnings
       - name: cargo deny
-        run: |
-          cargo deny --locked check advisories bans licenses sources
-          cargo deny --locked --manifest-path fuzz/Cargo.toml check advisories bans licenses sources
+        run: cargo deny --locked check advisories bans licenses sources

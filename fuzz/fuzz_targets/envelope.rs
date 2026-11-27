@@ -2,7 +2,7 @@
 //! and after opening.
 #![no_main]
 use islandmail_core::Envelope;
-use islandmail_fuzz_harness::world;
+use islandmail_fuzz as world;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

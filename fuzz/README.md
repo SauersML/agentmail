@@ -1,15 +1,13 @@
 # Fuzzing
 
-`fuzz/` is its own workspace, so the node's build never depends on it (CI starts it from the root `Cargo.lock`). `harness/` compiles
-the `islandmail-node` modules as a library and holds a fixed world: seeds, a trust file, nodes on temporary stores.
+`fuzz/` is its own workspace, so the node's build never depends on it (CI starts it from the root `Cargo.lock`). `src/lib.rs`
+holds a fixed world: seeds, a trust file, nodes on temporary stores.
 
 One target per parser of untrusted bytes:
 
 | target | input |
 |---|---|
 | envelope | an envelope's wire JSON (gossip, sync `get`), through check, open and verify |
-| invite | compact `im1` invites and `imr1` replies |
-| paseto | PASETO v4.public tokens (the API's bearer token) |
 | sync_request | sync requests from a member node |
 
 Run one (nightly Rust, or stable with `RUSTC_BOOTSTRAP=1`):

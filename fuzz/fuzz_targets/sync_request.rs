@@ -3,7 +3,8 @@
 #![no_main]
 use std::sync::OnceLock;
 
-use islandmail_fuzz_harness::{node::Node, world};
+use islandmail_fuzz as world;
+use islandmail_node::node::Node;
 use libfuzzer_sys::fuzz_target;
 
 fn node() -> &'static Node {
@@ -25,10 +26,10 @@ fn node() -> &'static Node {
 fuzz_target!(|data: &[u8]| {
     let n = node();
     let peer = world::node_b().public();
-    if let Ok(resp) = islandmail_fuzz_harness::sync_answer(n, &peer, data) {
+    if let Ok(resp) = islandmail_node::net::answer(n, &peer, data) {
         let v: serde_json::Value = serde_json::from_slice(&resp).unwrap();
         assert!(v.is_object());
     }
     // Only member nodes get answers.
-    assert!(islandmail_fuzz_harness::sync_answer(n, &world::alice().public(), data).is_err());
+    assert!(islandmail_node::net::answer(n, &world::alice().public(), data).is_err());
 });

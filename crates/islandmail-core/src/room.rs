@@ -91,31 +91,6 @@ impl Event {
             Event::Leave {} | Event::Remove { .. } => 2,
         }
     }
-
-    /// One line for people: "created the room", "added alice, bob".
-    pub fn describe(&self) -> String {
-        match self {
-            Event::Create { private, history, topic, members } => {
-                let mut s = format!("created this {} room", if *private { "private" } else { "open" });
-                if *private && *history == History::SinceJoin {
-                    s.push_str(" (new members see only later messages)");
-                }
-                if !members.is_empty() {
-                    s.push_str(&format!(" with {}", members.join(", ")));
-                }
-                if !topic.is_empty() {
-                    s.push_str(&format!("; topic: {topic}"));
-                }
-                s
-            }
-            Event::Add { members } => format!("added {}", members.join(", ")),
-            Event::Leave {} => "left the room".into(),
-            Event::Remove { members } => format!("removed {}", members.join(", ")),
-            Event::Topic { topic } => format!("set the topic: {topic}"),
-            Event::Vouch { members } => format!("vouched for the nodes of {}",
-                members.iter().map(|m| m.name.as_str()).collect::<Vec<_>>().join(", ")),
-        }
-    }
 }
 
 /// One re-wrapped content key: the envelope it opens and the key (b64url, 32 bytes).

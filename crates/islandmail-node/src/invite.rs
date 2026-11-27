@@ -962,6 +962,35 @@ mod tests {
     fn node() -> Node {
         node_on([7u8; 32], &["alice"])
     }
+
+    #[test]
+    fn malformed_invites_and_replies_are_refused_without_panicking() {
+        let n = node();
+        let now = now_millis();
+        let inv = make(&n, "bob", "alice/plan");
+        let rep = reply_of(&n, &inv, "bob");
+        // Every cut and every flags byte of a payload signed by the key it names, so parsing gets past the signature.
+        let sign = |ctx: &[u8], prefix: &str, p: &[u8]| format!("{prefix}{}", b58(&[p, &n.seed.sign(&[ctx, p].concat())].concat()));
+        for (s, prefix, ctx) in [(&inv, "im1", INVITE_CTX), (&rep, "imr1", REPLY_CTX)] {
+            let raw = b58_decode(&s[prefix.len()..]).unwrap();
+            let payload = &raw[..raw.len() - 64];
+            let mut tries: Vec<Vec<u8>> = (0..payload.len()).map(|cut| payload[..cut].to_vec()).collect();
+            tries.extend((0..=255u8).map(|f| [&[f][..], &payload[1..]].concat()));
+            tries.push([payload, &[0xff; 9][..]].concat());
+            for p in tries {
+                let t = sign(ctx, prefix, &p);
+                if let Ok(i) = read_invite(&t, now) {
+                    assert!(i.exp > now && split_names(&i.name).is_ok() && i.node.key == fmt_key(&n.seed.public()));
+                }
+                if let Ok(r) = read_reply(&t) {
+                    assert!(split_names(&r.name).is_ok() && r.node.names.is_empty());
+                }
+            }
+        }
+        for junk in ["", "im1", "imr1", "im10OIl", "imr1zzzz", &format!("im1{}", "z".repeat(600))] {
+            assert!(read_invite(junk, now).is_err() && read_reply(junk).is_err(), "{junk}");
+        }
+    }
     #[test]
     fn invites_round_trip_and_refuse_tampering_and_expiry() {
         let n = node();

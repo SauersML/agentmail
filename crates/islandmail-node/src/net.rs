@@ -241,7 +241,7 @@ impl std::fmt::Debug for Node {
 }
 
 /// `peer`: the asking node's key (its iroh endpoint id is its Ed25519 node key).
-pub(crate) fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
+pub fn answer(node: &Node, peer: &[u8; 32], req: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(node.members.read().unwrap().is_node(peer), "peer removed from membership");
     let (network, req): (String, Req) = serde_json::from_slice(req).context("bad sync request")?;
     anyhow::ensure!(network == node.members.read().unwrap().network, "different network");

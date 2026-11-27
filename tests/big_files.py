@@ -94,7 +94,7 @@ def main():
 
         over = blob("over.bin", LIMIT + 1)
         rc, out = cl("a", "send", "--open", "--to", "bob", "--file", over, "too big")
-        check("the client refuses one byte over 100 MiB", rc != 0 and "exceeds 100 MiB" in out, out[-200:])
+        check("a send one byte over 100 MiB fails (the node's 413)", rc != 0 and "413" in out, out[-200:])
         rc, token = cl("a", "selftoken", "--ttl", "120")
         with open(over, "rb") as f:
             body = f.read()

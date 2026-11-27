@@ -54,9 +54,6 @@ input, textarea { font: inherit; color: var(--text); background: var(--input); }
 .title { flex: 1; min-width: 0; }
 .title b { display: block; font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .title span { display: block; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.link { color: var(--muted); font-size: 13px; text-decoration: underline; text-underline-offset: 2px; }
-.details { padding: 10px 20px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
-.details div { margin: 2px 0; }
 .scroll { flex: 1; min-height: 0; overflow-y: auto; overflow-anchor: none; padding: 8px 0 16px; }
 .earlier { display: block; margin: 8px auto; color: var(--muted); font-size: 13px; border: 1px solid var(--line); border-radius: 8px; padding: 4px 12px; }
 
@@ -77,7 +74,6 @@ input, textarea { font: inherit; color: var(--text); background: var(--input); }
 .msg:hover .rep, .msg.tap .rep { visibility: visible; }
 @media (hover: none) { .rep { font-size: 13px; padding: 2px 6px; } }
 .file { display: inline-block; margin: 4px 8px 0 0; color: var(--accent); font-size: 13px; }
-.thumb { display: block; max-width: min(320px, 100%); max-height: 320px; margin-top: 4px; border-radius: 6px; border: 1px solid var(--line); }
 
 .compose { padding: 8px 20px 14px; border-top: 1px solid var(--line); }
 .compose .row { display: flex; gap: 8px; align-items: flex-end; }
@@ -100,7 +96,7 @@ input, textarea { font: inherit; color: var(--text); background: var(--input); }
   .app.open .side { display: none; }
   .app.open .main { display: flex; }
   .back { display: block; }
-  .head, .msg, .compose, .details, .newform { padding-left: 12px; padding-right: 12px; }
+  .head, .msg, .compose, .newform { padding-left: 12px; padding-right: 12px; }
   .msg.reply { padding-left: 26px; }
 }
 </style>
@@ -160,15 +156,10 @@ async function call(path, body) {
   return { j, raw };
 }
 const qs = o => Object.entries(o).filter(([, v]) => v != null).map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
-const blobs = new Map();
 function fileUrl(id) {
   if (!/^[0-9a-f]{64}$/i.test(id)) return Promise.reject(new Error('bad id'));
-  if (!blobs.has(id)) {
-    blobs.set(id, fetch('/ui/api/files/' + id, { headers: { Authorization: 'Bearer ui.' + KEY }, cache: 'no-store' })
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); }).then(b => URL.createObjectURL(b))
-      .catch(e => { blobs.delete(id); throw e; }));
-  }
-  return blobs.get(id);
+  return fetch('/ui/api/files/' + id, { headers: { Authorization: 'Bearer ui.' + KEY }, cache: 'no-store' })
+    .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); }).then(b => URL.createObjectURL(b));
 }
 
 /* ---------- formatting ---------- */
@@ -259,31 +250,19 @@ async function pollRooms() {
 const canPost = () => !!(S.me && S.me.post);
 const meta = () => Object.assign({}, S.rooms.find(r => r.id === S.cur) || {}, S.info || {});
 function blank(text) { V = null; mainEl.replaceChildren(el('div', 'blank', text)); }
-function header(title, sub, withDetails) {
+function header(title, sub) {
   const h = el('header', 'head'), back = el('button', 'back', '←'), t = el('div', 'title');
   back.type = 'button'; back.setAttribute('aria-label', 'Back'); back.onclick = closeRoom;
   t.append(el('b', null, title)); if (sub) t.append(el('span', null, sub));
   h.append(back, t);
-  if (withDetails) { const d = el('button', 'link', 'details'); d.type = 'button'; d.onclick = toggleDetails; h.append(d); }
   return h;
 }
 function fillHead() {
   const r = meta(), n = (r.members || []).length;
   const sub = r.topic || (r.kind === 'dm' ? '' : n + (n === 1 ? ' person' : ' people'));
-  const h = header(roomName(r), sub, true);
+  const h = header(roomName(r), sub);
   V.head.replaceWith(h); V.head = h;
-  if (!V.details.hidden) fillDetails();
 }
-function fillDetails() {
-  const r = meta(), d = V.details, line = (k, v) => { const x = el('div'); x.append(el('b', null, k + ': '), String(v)); d.append(x); };
-  d.replaceChildren();
-  line(r.participants ? 'Participants' : 'Members', (r.members || []).join(', ') || 'none');
-  if (r.former && r.former.length) line('Left', r.former.join(', '));
-  line('Room', r.id || S.cur);
-  if (r.kind === 'private') line('New members see', r.history === 'since-join' ? 'only later messages' : 'the full history');
-  if (S.me) line('You', S.me.name + (canPost() ? '' : ' (read-only link)') + ', link expires ' + (when(S.me.expires) ? fFull.format(when(S.me.expires)) : ''));
-}
-function toggleDetails() { V.details.hidden = !V.details.hidden; if (!V.details.hidden) fillDetails(); }
 function composer(onSend, placeholder) {
   const wrap = el('div', 'compose'), rep = el('div', 'replying'), row = el('div', 'row'), ta = el('textarea'), btn = el('button', 'btn', 'Send');
   const note = el('div', 'note');
@@ -316,10 +295,9 @@ function buildView() {
   more.type = 'button'; more.hidden = true; more.onclick = loadEarlier;
   scroll.append(more, msgs);
   msgs.addEventListener('click', onTap);
-  V = { head: el('header'), details: el('div', 'details'), scroll, more, msgs, c: null, pinned: true };
-  V.details.hidden = true;
+  V = { head: el('header'), scroll, more, msgs, c: null, pinned: true };
   scroll.addEventListener('scroll', () => { V.pinned = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }, { passive: true });
-  mainEl.replaceChildren(V.head, V.details, scroll);
+  mainEl.replaceChildren(V.head, scroll);
   fillHead();
   if (canPost()) {
     V.c = composer(async text => {
@@ -379,7 +357,7 @@ function replyBtn(m) {
 let tappedRow = null;
 function tapped(row) { if (tappedRow) tappedRow.classList.remove('tap'); tappedRow = row; if (row) row.classList.add('tap'); }
 function onTap(ev) {
-  if (ev.target.closest('a, button, img')) return;
+  if (ev.target.closest('a, button')) return;
   const row = ev.target.closest('.msg');
   if (!row || row.classList.contains('event') || (window.getSelection && String(window.getSelection()))) return tapped(null);
   tapped(row === tappedRow ? null : row);
@@ -390,12 +368,6 @@ function fileNode(f) {
   a.onclick = ev => { if (a.dataset.ready) return; ev.preventDefault();
     fileUrl(f.id).then(u => { a.href = u; a.download = f.name || 'file'; a.dataset.ready = '1'; a.click(); }).catch(() => {}); };
   box.append(a);
-  if (/^image\/(png|jpeg|gif|webp)$/.test(f.type || '')) {
-    const img = el('img', 'thumb'); img.alt = f.name || 'image';
-    img.addEventListener('load', () => { if (V && V.pinned) toBottom(); });
-    fileUrl(f.id).then(u => { img.src = u; }).catch(() => img.remove());
-    box.append(img);
-  }
   return box;
 }
 function jumpTo(id) {
@@ -531,7 +503,7 @@ function newConversation() {
     S.roomsRaw = ''; await pollRooms(); openRoom(room);
   }, 'Message');
   V = null;
-  mainEl.replaceChildren(header('New conversation', '', false), form, el('div', 'blank'), c.wrap);
+  mainEl.replaceChildren(header('New conversation', ''), form, el('div', 'blank'), c.wrap);
   to.focus();
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Notifications in the agent's harness: `notify install` (Claude Code hooks in a throwaway settings file), the hooks
-themselves run as Claude Code runs them (event JSON on stdin), `notify off`, `notify status`, and the node's MCPL push.
+themselves run as Claude Code runs them (event JSON on stdin), `notify off`, and the node's MCPL push.
 One node on loopback, throwaway keys; no Claude Code needed.
 
   python3 tests/notify.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,6 +18,9 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from two_nodes import RESULTS, Node, check, free_port, run, work_directory  # noqa: E402
+
+# Claude Code runs hooks with Git Bash on Windows; a bare "bash" there is WSL's (System32 comes before PATH).
+BASH = shutil.which("bash") or "bash"
 
 
 def main():
@@ -47,7 +51,6 @@ def main():
     for k in ("CLAUDECODE",):
         env.pop(k, None)
     user_settings = os.path.join(claude, "settings.json")
-    project_settings = os.path.join(project, ".claude", "settings.local.json")
 
     def cl(who, *args, timeout=60, stdin=None):
         p = subprocess.run([sys.executable, im, "--as", who, *args], env=env, capture_output=True, text=True,
@@ -69,12 +72,12 @@ def main():
     def run_hook(cmd, event, session="s1", timeout=30):
         # As Claude Code runs a command hook: through the shell, with the event JSON on stdin.
         stdin = json.dumps({"hook_event_name": event, "session_id": session, "cwd": project})
-        p = subprocess.run(["bash", "-c", cmd], env=env, input=stdin, capture_output=True, text=True, timeout=timeout,
+        p = subprocess.run([BASH, "-c", cmd], env=env, input=stdin, capture_output=True, text=True, timeout=timeout,
                            cwd=project)
         return p.returncode, p.stdout, p.stderr
 
     def start_hook(cmd, event, session="s1"):
-        p = subprocess.Popen(["bash", "-c", cmd], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        p = subprocess.Popen([BASH, "-c", cmd], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, cwd=project)
         p.stdin.write(json.dumps({"hook_event_name": event, "session_id": session}))
         p.stdin.close()
@@ -172,22 +175,18 @@ def main():
         new = start_hook(cmd, "Stop", session="s3")
         rc_old, _, err_old = finish(old, timeout=40)
         check("an older waiter of the same session ends without a notice", rc_old == 0 and err_old.strip() == "", err_old[-200:])
-        rc, out, _ = cl("alice", "notify", "status")
-        check("status shows the install and the live waiter", rc == 0 and "alice: on" in out and user_settings in out
-              and "waiting now: 1 session" in out, out)
         send("for the newer one")
         rc, _, err = finish(new)
         check("the newer waiter announces", rc == 2 and "for the newer one" in err, err[-200:])
 
-        # Project scope: its own settings.local.json.
-        rc, out, err = cl("bob", "notify", "install", "--scope", "project")
-        check("notify install --scope project", rc == 0 and os.path.exists(project_settings)
-              and any("--as bob" in c for c in hook_commands(settings(project_settings), "Stop")), out + err)
-        project_skill = os.path.join(project, ".claude", "skills", "islandmail", "SKILL.md")
-        check("project scope: the skill goes in the project's .claude/skills", os.path.exists(project_skill)
-              and "--as bob" in open(project_skill).read(), out)
-        rc, out, _ = cl("alice", "notify", "status")
-        check("status shows the skill", rc == 0 and ("skill %s: islandmail's" % skill) in out, out)
+        # A second identity on the same host: its hooks join alice's; the skill names both.
+        rc, out, err = cl("bob", "notify", "install")
+        check("a second identity's install adds its own hooks and notes the first", rc == 0 and "alice also notify" in out
+              and any("--as bob" in c for c in hook_commands(settings(user_settings), "Stop")), out + err)
+        check("the skill names both identities", "**alice**" in open(skill).read() and "**bob**" in open(skill).read())
+        rc, out, err = cl("bob", "notify", "off")
+        check("bob's off keeps alice's hooks and the skill", rc == 0 and "**bob**" not in open(skill).read()
+              and any("--as alice" in c for c in hook_commands(settings(user_settings), "Stop")), out + err)
 
         # Opt out: hooks go, other hooks stay, and a hook still configured somewhere stays silent.
         rc, out, err = cl("alice", "notify", "off")
@@ -195,16 +194,12 @@ def main():
         check("notify off removes alice's hooks only", rc == 0 and not any("notify hook" in c for e in ("SessionStart", "Stop", "UserPromptSubmit")
                                                                            for c in hook_commands(s, e))
               and hook_commands(s, "Stop") == ["other-stop-hook"] and hook_commands(s, "PreToolUse") == ["guard"], json.dumps(s)[:300])
-        check("bob's project hooks are untouched", any("--as bob" in c for c in hook_commands(settings(project_settings), "Stop")))
         check("notify off removes the skill it installed", not os.path.exists(skill) and skill in out, out)
-        check("bob's project skill stays", os.path.exists(project_skill))
         send("after opting out")
         rc, out, err = run_hook(cmd, "UserPromptSubmit")
         check("an opted-out prompt hook prints nothing", rc == 0 and out.strip() == "", out + err)
         rc, out, err = run_hook(cmd, "Stop", timeout=20)
         check("an opted-out waiter exits at once, silently", rc == 0 and err.strip() == "", err[-200:])
-        rc, out, _ = cl("alice", "notify", "status")
-        check("status says off", rc == 0 and "alice: off" in out, out)
         rc, out, err = cl("alice", "notify", "install")
         check("notify install turns it back on", rc == 0 and any("--as alice" in c for c in hook_commands(settings(user_settings), "Stop"))
               and os.path.exists(skill), out + err)
@@ -269,11 +264,14 @@ def main():
               and re.match(r"[a-z2-7]{8} \S+ untrusted mail from s\.peer \[[^\]]+\] via n to alice", out), out)
 
         # A broken settings file is never overwritten.
-        with open(project_settings, "w") as f:
+        good = open(user_settings).read()
+        with open(user_settings, "w") as f:
             f.write("{not json")
-        rc, out, err = cl("alice", "notify", "install", "--scope", "project")
+        rc, out, err = cl("alice", "notify", "install")
         check("install refuses a settings file that is not JSON, leaving it as it was",
-              rc == 1 and "not valid JSON" in err and open(project_settings).read() == "{not json", err)
+              rc == 1 and "not valid JSON" in err and open(user_settings).read() == "{not json", err)
+        with open(user_settings, "w") as f:
+            f.write(good)
 
         # MCPL: the node pushes mail to every identity's session (tools work too).
         try:
@@ -327,8 +325,8 @@ def main():
             wa.close()
             wb.close()
 
-        rc, out, err = cl("alice", "notify", "status")
-        check("status names the fallback for other harnesses", rc == 0 and "watch --mine --exec" in out, out)
+        rc, out, err = cl("alice", "notify", "install", "other")
+        check("install names the fallback for other harnesses", rc == 1 and "watch --mine --exec" in err, out + err)
         check("the hook command is one shell line ending in --as alice notify hook", shlex.split(cmd)[-4:] == ["--as", "alice", "notify", "hook"], cmd)
     finally:
         node.stop()

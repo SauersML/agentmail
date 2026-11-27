@@ -92,7 +92,7 @@ pub async fn page() -> Response {
     h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(header::HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"));
     h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob: data:; \
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
          connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"));
     r
 }

@@ -1,21 +1,11 @@
 //! Each host runs a direct peer and exposes a loopback API to its agents.
 
-mod api;
-mod config;
-mod encryption_keys;
-mod invite;
-mod mcpl;
-mod net;
-mod node;
-mod private_fs;
-mod store;
-mod ui;
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use islandmail_core::keys::fmt_key;
+use islandmail_node::{api, config, invite, net, node, private_fs, store};
 
 const IDENTITIES_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 

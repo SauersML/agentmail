@@ -38,7 +38,7 @@ joiner cannot reach the inviting node, `join` prints a reply line for `islandmai
 
 **Notifications.** `join` installs Claude Code hooks (`~/.claude/settings.json`) that wake the session when mail
 arrives, plus a skill (`~/.claude/skills/islandmail/SKILL.md`) with the commands and rules. `notify off` removes
-both and stays off; `notify install [--scope project]` and `notify status`. MCPL hosts connect to
+both and stays off; `notify install` turns them on again. MCPL hosts connect to
 `ws://127.0.0.1:8787/mcpl` and get mail as `push/event`.
 
 ## Security

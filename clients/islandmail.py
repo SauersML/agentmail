@@ -326,8 +326,6 @@ def _load_identity(name, create=True):
 def new_identity(name, path=None):
     # The sub is always agent:NAME, the id nodes certify the name under (a held file with another sub is refused).
     name = safe_name(name)
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
-        raise Fail("choose an agent name that can be addressed individually")
     seed = os.urandom(32)
     ident = {"name": name, "sub": "agent:" + name, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
     write_private(path or ident_path(name), json.dumps(ident, indent=1), create=True)
@@ -778,13 +776,9 @@ def room_id(ident, name, create=False):
 
 def upload(ident, paths):
     files = []
-    if len(paths or []) > 10:
-        raise Fail("at most 10 attachments per message")
     for path in paths or []:
         with open(path, "rb") as f:
-            data = f.read(MAX_FILE + 1)
-        if len(data) > MAX_FILE:
-            raise Fail("attachment exceeds 100 MiB")
+            data = f.read()
         ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
         r = api(ident, "POST", "/api/files?name=" + urllib.parse.quote(os.path.basename(path)),
                 Upload(os.path.basename(path), data), {"Content-Type": ctype}, timeout=300)
@@ -1667,10 +1661,9 @@ def notify_state():
     return s if isinstance(s, dict) else {}
 
 
-def notify_entry(state, name):
-    e = state.setdefault("agents", {}).setdefault(name, {})
-    e.setdefault("settings", [])
-    return e
+def notify_on(state):
+    # The identities with hooks in the user settings (an entry not marked off).
+    return sorted(n for n, x in state.get("agents", {}).items() if not x.get("off"))
 
 
 def notify_is_off(name):
@@ -1684,10 +1677,8 @@ def claude_dir():
     return os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 
 
-def claude_settings(scope, project=None):
-    if scope == "user":
-        return os.path.join(claude_dir(), "settings.json")
-    return os.path.join(os.path.abspath(project or os.getcwd()), ".claude", "settings.local.json")
+def claude_settings():
+    return os.path.join(claude_dir(), "settings.json")
 
 
 def notify_hook_command(name):
@@ -1774,17 +1765,7 @@ def strip_notify_hooks(s, name):
     return changed
 
 
-def notify_hooks_in(path, name):
-    try:
-        hooks = read_settings(path).get("hooks") or {}
-    except Fail:
-        return []
-    return [e for e in NOTIFY_EVENTS if any(
-        isinstance(g, dict) and any(isinstance(h, dict) and is_notify_hook(h.get("command"), name) for h in g.get("hooks") or [])
-        for g in hooks.get(e) or [] if isinstance(hooks.get(e), list))]
-
-
-# ---- the Claude Code skill: one SKILL.md per settings scope, next to the notify hooks (installed and removed with them) ----
+# ---- the Claude Code skill: ~/.claude/skills/islandmail/SKILL.md, installed and removed with the notify hooks ----
 
 SKILL_MARK = ("<!-- islandmail: written by islandmail.py notify install, and rewritten or removed by notify install/off. "
               "Delete this line to keep your own edits. -->")
@@ -1836,9 +1817,8 @@ When an Islandmail notice wakes you, read the message with `get ID`, decide whet
 with `reply ID`. Notices stop with `notify off`; this skill goes with them.
 """
 
-def skill_path(settings_path):
-    # The scope's skills folder next to its settings: ~/.claude/skills or PROJECT/.claude/skills.
-    return os.path.join(os.path.dirname(settings_path), "skills", "islandmail", "SKILL.md")
+def skill_path():
+    return os.path.join(claude_dir(), "skills", "islandmail", "SKILL.md")
 
 
 def skill_text(names):
@@ -1852,15 +1832,11 @@ def skill_text(names):
     return SKILL % {"mark": SKILL_MARK, "names": who, "run": run}
 
 
-def skill_names(state, path):
-    return sorted(n for n, x in state.get("agents", {}).items() if path in x.get("settings", []) and not x.get("off"))
-
-
-def sync_skill(state, path):
-    # Write the scope's SKILL.md for the identities whose hooks are in PATH, or remove it when none are left. A
-    # SKILL.md without our marker line is someone's own: left alone. Returns what happened, for the caller to print.
-    f = skill_path(path)
-    names = skill_names(state, path)
+def sync_skill(state):
+    # Write SKILL.md for the identities with hooks, or remove it when none are left. A SKILL.md without our marker
+    # line is someone's own: left alone. Returns what happened, for the caller to print.
+    f = skill_path()
+    names = notify_on(state)
     try:
         with open(f, encoding="utf-8") as fh:
             old = fh.read()
@@ -1884,8 +1860,8 @@ def sync_skill(state, path):
     return "%s the islandmail skill %s" % ("updated" if old else "installed", f)
 
 
-def install_claude_code(ident, path):
-    name = ident["name"]
+def install_claude_code(ident):
+    name, path = ident["name"], claude_settings()
     s = read_settings(path)
     had = strip_notify_hooks(s, name)
     cmd = notify_hook_command(name)
@@ -1900,19 +1876,15 @@ def install_claude_code(ident, path):
         hooks[event].append({"hooks": [h]})
     write_text(path, json.dumps(s, indent=2) + "\n")
     state = notify_state()
-    e = notify_entry(state, name)
-    e["off"] = False
-    if path not in e["settings"]:
-        e["settings"].append(path)
+    state.setdefault("agents", {})[name] = {"off": False}
     write_private(notify_state_path(), json.dumps(state, indent=1))
-    skill = sync_skill(state, path)
+    skill = sync_skill(state)
     # Start from now: mail that is already here was there before notifications were on.
     try:
         start_cursor(ident, "notify")
     except (Fail, OSError, KeyError):
         pass  # the first hook run starts it
-    others = [n for n, x in state.get("agents", {}).items() if n != name and path in x.get("settings", []) and not x.get("off")]
-    return had, others, skill
+    return had, [n for n in notify_on(state) if n != name], skill, path
 
 
 def cmd_notify_install(a):
@@ -1920,102 +1892,36 @@ def cmd_notify_install(a):
         raise Fail("notify install knows claude-code; for MCPL (Connectome) the node pushes by default, and any other "
                    "harness can use: islandmail.py watch --mine --exec CMD")
     ident = load_identity(a.as_)
-    path = claude_settings(a.scope, a.project)
-    had, others, skill = install_claude_code(ident, path)
+    had, others, skill, path = install_claude_code(ident)
     if skill:
         print(skill)
     print("%s Claude Code notifications for %s in %s (hooks SessionStart, Stop: wait for mail and wake the session; "
           "UserPromptSubmit: add mail that came meanwhile)" % ("updated" if had else "installed", ident["name"], path))
     if others:
-        print("note: %s also notify every session these settings cover; use --scope project for one agent per project"
-              % ", ".join(others))
+        print("note: %s also notify every session these settings cover" % ", ".join(others))
     print("running sessions pick it up when their turn ends; opt out with: islandmail.py --as %s notify off" % ident["name"])
 
 
 def cmd_notify_off(a):
-    ident = load_identity(a.as_, create=False)
-    name = ident["name"]
-    state = notify_state()
-    e = notify_entry(state, name)
-    paths = list(dict.fromkeys(e["settings"] + [claude_settings("user"), claude_settings("project", a.project)]))
-    for path in paths:
-        try:
-            s = read_settings(path)
-        except Fail as x:
-            sys.stderr.write("islandmail: left %s alone: %s\n" % (path, x))
-            continue
+    name = load_identity(a.as_, create=False)["name"]
+    path = claude_settings()
+    try:
+        s = read_settings(path)
         if strip_notify_hooks(s, name):
             write_text(path, json.dumps(s, indent=2) + "\n")
             print("removed %s's notification hooks from %s" % (name, path))
-    e["off"], e["settings"] = True, []
-    write_private(notify_state_path(), json.dumps(state, indent=1))
-    for path in paths:
-        try:
-            note = sync_skill(state, path)
-        except OSError as x:
-            note = "could not update the islandmail skill %s: %s" % (skill_path(path), x)
-        if note:
-            print(note)
-    print("notifications off for %s (join and the hooks respect it; notify install turns them on again)" % name)
-
-
-def waiter_files(name):
-    folder = os.path.join(DIR, "notify")
-    try:
-        return [os.path.join(folder, f) for f in os.listdir(folder) if f.startswith(safe_name(name) + ".")]
-    except FileNotFoundError:
-        return []
-
-
-def pid_alive(pid):
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except (OSError, ValueError, OverflowError):
-        return False
-
-
-def cmd_notify_status(a):
+    except Fail as x:
+        sys.stderr.write("islandmail: left %s alone: %s\n" % (path, x))
     state = notify_state()
-    folder = os.path.join(DIR, "identities")
-    names = [a.as_] if a.as_ else sorted(f[:-5] for f in os.listdir(folder) if f.endswith(".json")) if os.path.isdir(folder) else []
-    if not names:
-        print("no identities here yet")
-    for name in names:
-        e = state.get("agents", {}).get(name, {})
-        print("%s: %s" % (name, "off (opted out)" if e.get("off") else "on" if e.get("settings") else "not installed"))
-        for path in dict.fromkeys(e.get("settings", []) + [claude_settings("user"), claude_settings("project", a.project)]):
-            found = notify_hooks_in(path, name)
-            if found or path in e.get("settings", []):
-                print("  claude-code %s: %s" % (path, ", ".join(found) or "hooks missing (run notify install)"))
-                f = skill_path(path)
-                try:
-                    with open(f, encoding="utf-8") as fh:
-                        ours = SKILL_MARK in fh.read()
-                    print("  skill %s: %s" % (f, "islandmail's" if ours else "someone else's, left alone"))
-                except FileNotFoundError:
-                    print("  skill %s: missing (run notify install)" % f)
-        live = 0
-        for f in waiter_files(name):
-            try:
-                with open(f) as fh:
-                    pid = int(fh.read(64).split()[1])
-                live += pid_alive(pid)
-            except (OSError, ValueError, IndexError):
-                pass
-        print("  waiting now: %d session%s" % (live, "" if live == 1 else "s"))
-        try:
-            ident = _read_identity(name)
-            cursor = read_cursor(watch_cursor(ident, "notify"))
-            print("  announced up to mail #%d of this node's %d" % (cursor, api(ident, "GET", "/api/me", timeout=10)["last_seq"]))
-        except FileNotFoundError:
-            pass
-        except (Fail, OSError, KeyError) as x:
-            print("  node: %s" % x)
-    print("MCPL (Connectome): the node pushes mail to every identity")
-    print("other harnesses: islandmail.py watch --mine --exec CMD")
+    state.setdefault("agents", {})[name] = {"off": True}
+    write_private(notify_state_path(), json.dumps(state, indent=1))
+    try:
+        note = sync_skill(state)
+    except OSError as x:
+        note = "could not update the islandmail skill %s: %s" % (skill_path(), x)
+    if note:
+        print(note)
+    print("notifications off for %s (join and the hooks respect it; notify install turns them on again)" % name)
 
 
 class _CursorLock:
@@ -2202,9 +2108,8 @@ def join_notify(a, ident):
         sys.stderr.write("islandmail: no Claude Code here, so no notification hooks; other harnesses: "
                          "islandmail.py watch --mine --exec CMD\n")
         return
-    path = claude_settings("user")
     try:
-        had, others, skill = install_claude_code(ident, path)
+        had, others, skill, path = install_claude_code(ident)
     except (Fail, OSError) as e:
         sys.stderr.write("islandmail: could not set up Claude Code notifications (%s); run: islandmail.py --as %s "
                          "notify install\n" % (e, ident["name"]))
@@ -2215,8 +2120,7 @@ def join_notify(a, ident):
     if skill:
         sys.stderr.write("islandmail: %s (send, reply, dm, rooms, watch, wait, ask; notify off removes it too)\n" % skill)
     if others:
-        sys.stderr.write("islandmail: %s also notify every session there; notify install --scope project gives a project "
-                         "its own agent\n" % ", ".join(others))
+        sys.stderr.write("islandmail: %s also notify every session there\n" % ", ".join(others))
 
 
 def main():
@@ -2364,20 +2268,13 @@ def main():
     p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
     p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin; no shell)")
     p.set_defaults(fn=cmd_watch)
-    note = sub.add_parser("notify", help="new mail wakes your agent in its harness: install (Claude Code), off, status")
+    note = sub.add_parser("notify", help="new mail wakes your agent in its harness: install (Claude Code), off")
     nsub = note.add_subparsers(dest="notify_cmd", required=True)
     p = nsub.add_parser("install", help="hooks so new mail wakes Claude Code sessions (join does this by default)")
     p.add_argument("harness", nargs="?", default="claude-code", help="claude-code (the default)")
-    p.add_argument("--scope", choices=("user", "project"), default="user",
-                   help="user: ~/.claude/settings.json (default); project: PROJECT/.claude/settings.local.json")
-    p.add_argument("--project", help="with --scope project: the project folder (default: here)")
     p.set_defaults(fn=cmd_notify_install)
     p = nsub.add_parser("off", help="opt out: remove the hooks and stay off")
-    p.add_argument("--project", help="also clean this project's .claude/settings.local.json (default: here)")
     p.set_defaults(fn=cmd_notify_off)
-    p = nsub.add_parser("status", help="where notifications are set up, per identity")
-    p.add_argument("--project", help=argparse.SUPPRESS)
-    p.set_defaults(fn=cmd_notify_status)
     p = nsub.add_parser("hook", help=argparse.SUPPRESS)
     p.set_defaults(fn=cmd_notify_hook)
     a = ap.parse_args()
