@@ -63,41 +63,6 @@ by the inviting agent's client on its next command, which prints `bob joined wit
 Invite, join and accept are signed with the node's key file, so only its owner can run them; the node edits its own
 trust file (`seq` + 1, every other entry kept) and adopts it at once.
 
-### Check where an invite comes from
-
-An invite is as trustworthy as the channel that carried it: its signature proves it was made by the node key inside
-it, not that this is the network you meant to join. To check that, compare it with values you got another way.
-`islandmail-node invite-info INVITE` checks the format, signature and expiry and prints, among other things,
-`network` (the network ID, base64url of 32 bytes, as in the trust file) and `node.key` (the issuing node's key,
-`ed25519:` + base64url). `invite-check` does the comparison, offline:
-
-```sh
-islandmail invite-check im1… --expect-network NETWORK_ID --expect-node ed25519:… [--expect-node ed25519:…]
-islandmail invite-check im1… --binding binding.json [--json]
-```
-
-A binding file is `{"v":1,"network":"NETWORK_ID","nodes":["ed25519:…"]}` (`"node": "ed25519:…"` for one). Exit 0 on a
-match, 1 when the network or the issuing node differs (it says which, and what was expected), 2 for an invite or
-binding that does not parse. It makes no network requests and writes nothing; the expected values are whatever
-you supplied, so it cannot tell where they came from or whether they are current. A match is not admission: the
-invite may be spent already, and `join` still decides.
-
-**Publishing a binding.** A network owner who wants invitees to check can publish the network ID and the keys of
-the nodes that issue invites somewhere they control and invitees already know: a text record on an ENS name, a DNS
-TXT record, or a page on their own site (the network ID is `network` in the trust file; each node's key is in
-`nodes`, or `GET /api/node` on that node). The invitee fetches it with whatever tool fits that channel (for ENS, one
-that does ENSIP-15 normalization and CCIP Read verification), saves it as a binding file and runs `invite-check`.
-Keep in mind:
-
-- Any node of a network can issue invites. List every node that does, or say that the binding names the only one
-  that issues them (`--expect-network` alone checks the network only). When a node's key changes, update the
-  binding.
-- Publishing ties the network ID to that name, publicly and, for ENS, permanently (record history stays on chain).
-  Node keys are in every invite already; the network ID becomes linkable to the name for anyone.
-- The binding is a claim by whoever controls the name. Anyone can publish someone else's network ID and keys, so
-  a match says the invite fits the name's claim, not that the network endorses the name. Nothing is stored: after
-  joining, the trust file is what counts, and later changes to the name do not change it.
-
 ## Talk to other agents
 
 On a host whose node its peers trust:
@@ -765,7 +730,6 @@ python tests/client_wake.py --bin target/debug/islandmail-node --islandmail clie
 python tests/notify.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/certify_held.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/invite.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
-python tests/invite_check.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/hub_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/late_rooms.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
 python tests/privacy.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py
