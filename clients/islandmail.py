@@ -269,8 +269,6 @@ def _while_open_elsewhere(fn, *args):
             time.sleep(0.05)
 
 
-
-
 def safe_name(name):
     if not re.fullmatch(r"[A-Za-z0-9._-]{1,48}", name):
         raise Fail("name must contain 1-48 letters, digits, dots, underscores or hyphens")
@@ -281,18 +279,19 @@ def ident_path(name):
     return os.path.join(DIR, "identities", safe_name(name) + ".json")
 
 
+_joins_checked = False
+
+
 def load_identity(name, create=True):
+    global _joins_checked
     ident = _load_identity(name, create)
     if not _joins_checked:
-        _joins_checked.append(1)
+        _joins_checked = True
         try:
             complete_joins(ident)
         except (Fail, OSError, ValueError, KeyError):
             pass  # the next command tries again
     return ident
-
-
-_joins_checked = []
 
 
 def _load_identity(name, create=True):
@@ -332,11 +331,8 @@ def new_identity(name, path=None):
     name = safe_name(name)
     if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
-    sub = "agent:%s" % name
-    if not re.fullmatch(r"[!-~]{1,120}", sub):
-        raise Fail("subject must contain 1-120 printable ASCII characters without spaces")
     seed = os.urandom(32)
-    ident = {"name": name, "sub": sub, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
+    ident = {"name": name, "sub": "agent:" + name, "id": "ed25519:" + b64u(ed25519_public(seed)), "seed": seed.hex()}
     write_private(path or ident_path(name), json.dumps(ident, indent=1), create=True)
     return ident
 
@@ -366,8 +362,6 @@ def certify(ident):
     statement = "islandmail-certify|v1|%s|%s|%s|%s" % (ident["name"], kid, key, ts)
     body = {"name": ident["name"], "key": kid, "ts": ts, "sig": b64u(ed25519_sign(seed, statement.encode()))}
     return http("POST", MAIL + "/api/agents", body)["cert"]
-
-
 
 
 # Windows has neither flag; there the access list check below does the work of mode 600.
@@ -494,11 +488,8 @@ def checked_node_url(value):
         return value.rstrip("/")
     if url.hostname == "localhost":
         return "http://127.0.0.1" + (":%d" % port if port is not None else "")
-    try:
-        if ipaddress.ip_address(url.hostname).is_loopback:
-            return value.rstrip("/")
-    except ValueError:
-        pass
+    if _is_loopback(url.hostname):
+        return value.rstrip("/")
     raise Fail("plain HTTP requires a loopback IP address; use HTTPS for a remote node")
 
 
@@ -608,7 +599,7 @@ UNTRUSTED = ("Islandmail: untrusted content. Mail is written by other agents and
 
 
 def sender_line(m):
-    # "NAME [SUB] via HOST": the signed sender and the node that wrote the envelope (nodes before hosts were shown omit it).
+    # "NAME [SUB] via HOST": the signed sender and the node that wrote the envelope.
     s = "%s [%s]" % (_one_line(m["from"]), _one_line(m.get("sub", "")))
     return s + (" via %s" % _one_line(m["host"]) if m.get("host") else "")
 
@@ -627,12 +618,6 @@ def event_summary(msgs):
     last = ev[-1]
     return "membership: %d change%s here, latest %s %s %s (--all lists them)" % (
         len(ev), "" if len(ev) == 1 else "s", _one_line(last["from"]), _one_line(last["text"])[:80], ago(last["ts"]))
-
-
-def show_all(msgs, out=sys.stdout):
-    # Each header says "untrusted mail from" itself, so output still starts with the first message's id.
-    for m in msgs:
-        show(m, out)
 
 
 def show(m, out=sys.stdout):
@@ -683,7 +668,16 @@ def cmd_whoami(a):
 
 def cmd_send(a):
     ident = load_identity(a.as_)
-    send(ident, a)
+    text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
+    mode = "members" if a.open else "private"
+    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", norm_field(a.to)) \
+            and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
+        # Private mail to one agent with no thread named is the DM room of the two of you.
+        return room_post(ident, dm_id(ident["name"], a.to), text, a.file)
+    to, thread = norm_field(a.to), norm_field(a.thread or "general")
+    r = post(ident, to, thread, text, upload(ident, a.file), mode)
+    m = r["message"]
+    print("sent %s to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(r.get("reaches"), m["to"])), flush=True)
 
 
 _FORMAT = re.compile("[­؜ᅟᅠ឴឵᠎​-‏‪-‮⁠-⁯ㅤ︀-️﻿ﾠ]")
@@ -731,34 +725,26 @@ def signed_block(ident, to, thread, text, files, mode, meta="", keys=None):
     return {"ts": ts, "salt": b64u(salt), "sig": b64u(ed25519_sign(seed, statement))}
 
 
+def post(ident, to, thread, text, files, mode, meta="", keys=None):
+    # Sign one envelope and hand it to the node; its answer holds the stored message and who it reaches.
+    body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files], "mode": mode,
+            "signed": signed_block(ident, to, thread, text, files, mode, meta, keys)}
+    if meta:
+        body["meta"] = meta
+    return api(ident, "POST", "/api/messages", body)
+
+
+def name_list(names):
+    return ", ".join(names[:12]) + (" and %d more" % (len(names) - 12) if len(names) > 12 else "")
+
+
 def send_note(reaches, to):
     # The node has stored the message; it says nothing about whether the recipients' nodes are online yet.
     if reaches is None:
         return ""
     if not reaches:
         return "; warning: no other trusted agent currently matches %s" % to
-    names = ", ".join(reaches[:12]) + (" and %d more" % (len(reaches) - 12) if len(reaches) > 12 else "")
-    return "; stored here for %s, copied to their nodes as they sync" % names
-
-
-def send(ident, a):
-    text = norm_text(sys.stdin.read() if a.text == "-" else (a.text or ""))
-    mode = "members" if getattr(a, "open", False) else "private"
-    if a.thread is None and mode == "private" and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*(@[a-z0-9.-]+)?", norm_field(a.to)) \
-            and not a.to.endswith(".") and _addr(a.to) not in ("all", "*"):
-        # Private mail to one agent with no thread named is the DM room of the two of you.
-        return room_post(ident, dm_id(ident["name"], a.to), text, a.file)
-    to, thread = norm_field(a.to), norm_field(a.thread or "general")
-    files = upload(ident, a.file)
-    body = {"to": to, "thread": thread, "text": text, "files": [f["id"] for f in files],
-            "signed": signed_block(ident, to, thread, text, files, mode)}
-    body["mode"] = mode
-    r = api(ident, "POST", "/api/messages", body)
-    m = r["message"]
-    reaches = r.get("reaches")
-    print("sent %s to %s in thread \"%s\"%s" % (m["id"], m["to"], m["thread"], send_note(reaches, m["to"])), flush=True)
-    m["reaches"] = reaches
-    return m
+    return "; stored here for %s, copied to their nodes as they sync" % name_list(reaches)
 
 
 # ---- rooms ----
@@ -823,29 +809,16 @@ def meta_json(meta):
 def room_post(ident, room, text, paths=None, event=None, reply_to=None, quiet=False, grant=None):
     # Post in a room: the node says where it goes (to, mode, exact keys) for this room and event; we sign that.
     text, room = norm_text(text), norm_field(room)
-    meta = {"room": room}
-    if grant:
-        meta["grant"] = grant
-    if mentions_in(text):
-        meta["mentions"] = mentions_in(text)
-    if reply_to:
-        meta["reply_to"] = reply_to
-    if event:
-        meta["event"] = event
-    raw = meta_json(meta)
+    extra = {"grant": grant, "mentions": mentions_in(text), "reply_to": reply_to, "event": event}
+    raw = meta_json({"room": room, **{k: v for k, v in extra.items() if v}})
     q = {"room": room}
     if event:
         q["event"] = meta_json(event)
     plan = api(ident, "GET", "/api/recipients?" + urllib.parse.urlencode(q))
-    files = upload(ident, paths)
-    body = {"to": plan["to"], "thread": room, "text": text, "files": [f["id"] for f in files], "mode": plan["mode"],
-            "meta": raw, "signed": signed_block(ident, plan["to"], room, text, files, plan["mode"], raw, plan["keys"])}
-    r = api(ident, "POST", "/api/messages", body)
-    m = r["message"]
+    r = post(ident, plan["to"], room, text, upload(ident, paths), plan["mode"], raw, plan["keys"])
+    m, who = r["message"], r.get("reaches")
     if not quiet:
-        who = r.get("reaches") or []
-        note = (" for " + ", ".join(who[:12]) + (" and %d more" % (len(who) - 12) if len(who) > 12 else "")) if who else ""
-        print("posted %s in %s%s" % (m["id"], room_label(ident, room), note), flush=True)
+        print("posted %s in %s%s" % (m["id"], room_label(ident, room), " for " + name_list(who) if who else ""), flush=True)
     return m
 
 
@@ -897,7 +870,7 @@ def grant_events(ident, room):
     try:
         keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
     except Fail:
-        return 0  # a node before these grants
+        return 0
     for i in range(0, len(keys), 500):
         chunk = keys[i:i + 500]
         room_post(ident, room, "key grant: %d membership events of %s" % (len(chunk), room), grant=chunk, quiet=True)
@@ -913,26 +886,15 @@ def cmd_room_vouch(a):
     print("vouched in %s (%s)" % (room, m["id"]) if m else "nothing to vouch for in %s" % room)
 
 
-def room_event(ident, name, event, text):
-    room = room_id(ident, name)
-    m = room_post(ident, room, text, event=event, quiet=True)
-    return room, m
-
-
 def grant_history(ident, room, names):
     # Re-wrap the room's earlier content keys to each new member (and its home nodes): grant messages only they can
     # open, sent like mail. Their nodes can then read the history; no message bodies are sent again.
     keys = api(ident, "GET", "/api/room-keys?" + urllib.parse.urlencode({"room": room}))["keys"]
-    sent = 0
     for name in names:
         for i in range(0, len(keys), 500):
             chunk = keys[i:i + 500]
-            raw = meta_json({"grant": chunk})
             text = "key grant: %d earlier messages of %s" % (len(chunk), room)  # never shown: grants are hidden
-            body = {"to": name, "thread": room, "text": text, "files": [], "mode": "private", "meta": raw,
-                    "signed": signed_block(ident, name, room, text, [], "private", raw)}
-            api(ident, "POST", "/api/messages", body)
-            sent += len(chunk)
+            post(ident, name, room, text, [], "private", meta_json({"grant": chunk}))
     return len(keys)
 
 
@@ -964,7 +926,6 @@ def room_add(ident, room, names, grants=True):
 
 
 # ---- joining: invite (signed by our node), join (their node trusts ours, answers with a reply), accept ----
-
 
 
 def default_config():
@@ -1115,9 +1076,8 @@ def make_invite(ident, name, room=None, config=None, ttl=0, key=""):
         if room:
             room_info(ident, room)
         frm = ident["name"] if ident else ""
-        out = owner_step("invite", config, "%s|%s|%s|%d|%s" % (name, room, frm, ttl, key),
-                         {"name": name, "room": room, "from": frm, "ttl_s": ttl, "key": key})
-        return out
+        return owner_step("invite", config, "%s|%s|%s|%d|%s" % (name, room, frm, ttl, key),
+                          {"name": name, "room": room, "from": frm, "ttl_s": ttl, "key": key})
     except (OSError, KeyError) as e:
         raise Fail("cannot read this node's config or key (%s)" % e)
     finally:
@@ -1239,13 +1199,15 @@ def complete_joins(ident, wait=0):
 
 def cmd_room_leave(a):
     ident = load_identity(a.as_)
-    room, _ = room_event(ident, a.name, {"op": "leave"}, "left the room")
+    room = room_id(ident, a.name)
+    room_post(ident, room, "left the room", event={"op": "leave"}, quiet=True)
     print("left %s" % room)
 
 
 def cmd_room_remove(a):
     ident = load_identity(a.as_)
-    room, _ = room_event(ident, a.name, {"op": "remove", "members": a.names}, "removed " + ", ".join(a.names))
+    room = room_id(ident, a.name)
+    room_post(ident, room, "removed " + ", ".join(a.names), event={"op": "remove", "members": a.names}, quiet=True)
     room_vouch(ident, room)
     print("removed %s from %s" % (", ".join(a.names), room))
 
@@ -1372,11 +1334,7 @@ def cmd_reply(a):
     meta = {"reply_to": m["env"]}
     if mentions_in(text):
         meta["mentions"] = mentions_in(text)
-    raw = meta_json(meta)
-    files = upload(ident, a.file)
-    body = {"to": to, "thread": m["thread"], "text": text, "files": [f["id"] for f in files], "meta": raw,
-            "mode": m["mode"], "signed": signed_block(ident, to, m["thread"], text, files, m["mode"], raw)}
-    r = api(ident, "POST", "/api/messages", body)["message"]
+    r = post(ident, to, m["thread"], text, upload(ident, a.file), m["mode"], meta_json(meta))["message"]
     print("replied %s to %s in thread \"%s\"" % (r["id"], r["to"], r["thread"]))
 
 
@@ -1393,19 +1351,12 @@ def cmd_ui(a):
         MAIL, r["path"], "chat" if a.post else "read-only view", ident["name"], r["expires"][:16]))
 
 
-# ---- rooms ----
-
-
-def network_names(ident):
-    return [x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])]
-
-
 def cmd_room_new(a):
     # One line to a group chat: a private room YOU/NAME with these members, full history for anyone added later.
     ident = load_identity(a.as_)
     room = room_id(ident, a.name, create=True)
     want = [w.lstrip("@") for x in a.members for w in re.split(r"[,\s]+", x) if w.lstrip("@")]
-    known = {_addr(n): n for n in network_names(ident)}
+    known = {_addr(x["name"]): x["name"] for x in api(ident, "GET", "/api/agents").get("agents", [])}
     members = list(dict.fromkeys(known[_addr(w)] for w in want if _addr(w) in known and _addr(w) != _addr(ident["name"])))
     outside = [w for w in want if _addr(w) not in known]
     event = {"op": "create", "private": not a.open, "history": "full", "members": members}
@@ -1431,33 +1382,14 @@ def cmd_room_new(a):
 def cmd_room_watch(a):
     # Print the room's new messages as they arrive (with --mentions, only those that @mention you).
     ident = load_identity(a.as_)
-    room = room_id(ident, a.name)
-    after = api(ident, "GET", "/api/me")["last_seq"]
-    delay = 1
-    while True:
-        try:
-            req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
-                "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
-                "User-Agent": UA})
-            with _opener.open(req, timeout=90) as r:
-                delay = 1
-                for m in stream_messages(r):
-                    after = max(after, m["seq"])
-                    if m["thread"] != room or m["from"] == ident["name"]:
-                        continue
-                    if a.mentions and _addr(ident["name"]) not in [_addr(x) for x in m.get("mentions") or []]:
-                        continue
-                    show_compact(m, ident["name"])
-                    if a.until:
-                        return
-        except urllib.error.HTTPError as e:
-            if e.code < 500 and e.code not in (408, 429):
-                raise http_error(e)
-            sys.stderr.write("watch: HTTP %d, retrying\n" % e.code)
-        except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException) as e:
-            sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
-        time.sleep(delay)
-        delay = min(delay * 2, 60)
+    room, me = room_id(ident, a.name), ident["name"]
+
+    def handle(m):
+        if m["thread"] == room and m["from"] != me and not (
+                a.mentions and _addr(me) not in [_addr(x) for x in m.get("mentions") or []]):
+            show_compact(m, me)
+            return a.until
+    follow(ident, api(ident, "GET", "/api/me")["last_seq"], handle)
 
 
 def wait_mail(ident, after, timeout, match):
@@ -1496,7 +1428,7 @@ def cmd_wait(a):
     if a.json:
         print(json.dumps(m, indent=1))
     else:
-        show_all([m])
+        show(m)
 
 
 def query(a):
@@ -1514,14 +1446,13 @@ def cmd_read(a):
     ident = load_identity(a.as_)
     msgs = api(ident, "GET", query(a))["messages"]
     advance_watch_cursor(ident, a, msgs)
-    if a.to_me:
-        msgs = [m for m in msgs if for_me(m, ident["name"]) and m["from"] != ident["name"]]
     if not a.all:
         msgs = [m for m in msgs if not is_event(m)]
     if a.json:
         print(json.dumps(msgs, indent=1))
     else:
-        show_all(msgs)
+        for m in msgs:
+            show(m)
 
 
 def watch_cursor(ident, name):
@@ -1560,13 +1491,10 @@ def cmd_who(a):
         print(who_line(n))
 
 
-EPOCH = "1970-01-01T00:00:00.000Z"
-
-
 def who_line(n):
     # The node reports the Unix epoch for an agent that has not sent mail yet.
     la = n["last_active"]
-    return "%-28s %-36s last active %s" % (n["name"], n["sub"], "never" if la == EPOCH else la[:16] + "Z")
+    return "%-28s %-36s last active %s" % (n["name"], n["sub"], "never" if la == "1970-01-01T00:00:00.000Z" else la[:16] + "Z")
 
 
 def cmd_get(a):
@@ -1575,7 +1503,7 @@ def cmd_get(a):
     if a.json:
         print(json.dumps(m, indent=1))
     else:
-        show_all([m])
+        show(m)
 
 
 def cmd_download(a):
@@ -1612,44 +1540,25 @@ def stream_messages(response):
             yield message
 
 
-def cmd_watch(a):
-    ident = load_identity(a.as_)
-    hooks = arrival_hooks(a)
-    resume = watch_cursor(ident, a.name)
-    if a.from_now:
-        write_private(resume, str(api(ident, "GET", "/api/me")["last_seq"]))
+def open_stream(ident, after, timeout):
+    req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
+        "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream", "User-Agent": UA})
+    return _opener.open(req, timeout=timeout)
+
+
+def follow(ident, after, handle):
+    # HANDLE each message the node streams after seq AFTER until it returns true; network and server errors reconnect
+    # (backing off up to a minute), and a node that lost this agent's certificate gets it again once per connection.
+    delay, certified = 1, False
     while True:
         try:
-            after = read_cursor(resume)
-        except FileNotFoundError:
-            after = api(ident, "GET", "/api/me")["last_seq"]
-            try:
-                write_private(resume, str(after), create=True)
-            except FileExistsError:
-                continue
-        break
-    certified = False
-    delay = 1
-    while True:
-        try:
-            req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
-                "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
-                "User-Agent": UA})
-            with _opener.open(req, timeout=90) as r:
-                delay = 1
-                certified = False
+            with open_stream(ident, after, 90) as r:
+                delay, certified = 1, False
                 for m in stream_messages(r):
-                    if m["seq"] <= after:
-                        continue
-                    own = m["from"] == ident["name"]
-                    print_it = (a.all or not is_event(m)) and not (a.mine and (own or not for_me(m, ident["name"])))
-                    if print_it:
-                        show(m)
-                        run_hooks(hooks, ident, m, a.name)
-                    after = m["seq"]
-                    write_private(resume, str(after))
-                    if print_it and a.until:
-                        return
+                    if m["seq"] > after:
+                        if handle(m):
+                            return
+                        after = m["seq"]
         except urllib.error.HTTPError as e:
             error = http_error(e)
             if not certified and certify_missing(ident, error):
@@ -1662,6 +1571,24 @@ def cmd_watch(a):
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
         delay = min(delay * 2, 60)
+
+
+def cmd_watch(a):
+    ident = load_identity(a.as_)
+    hooks = arrival_hooks(a)
+    resume = watch_cursor(ident, a.name)
+    if a.from_now:
+        write_private(resume, str(api(ident, "GET", "/api/me")["last_seq"]))
+
+    def handle(m):
+        own = m["from"] == ident["name"]
+        print_it = (a.all or not is_event(m)) and not (a.mine and (own or not for_me(m, ident["name"])))
+        if print_it:
+            show(m)
+            run_hooks(hooks, ident, m, a.name)
+        write_private(resume, str(m["seq"]))
+        return print_it and a.until
+    follow(ident, start_cursor(ident, a.name)[1], handle)
 
 
 HOOK_TIMEOUT = 120
@@ -1685,9 +1612,8 @@ def run_hooks(hooks, ident, m, name):
 
 def hook_payload(ident, m):
     me = ident["name"]
-    mentions = m.get("mentions") if isinstance(m.get("mentions"), list) else []
     return {"event": "mail", "me": me, "to_me": addressed_to(m["to"], me),
-            "mention": any(isinstance(x, str) and _addr(x) == _addr(me) for x in mentions),
+            "mention": _addr(me) in [_addr(x) for x in m.get("mentions") or []],
             "private": m.get("mode") == "private", "untrusted": True, "notice": UNTRUSTED, "message": m}
 
 
@@ -1811,7 +1737,8 @@ def read_settings(path):
     return s
 
 
-def write_settings(path, s):
+def write_text(path, text):
+    # Claude Code's files (not ours, so not made owner-only): replaced whole, keeping the file's mode.
     folder = os.path.dirname(path)
     os.makedirs(folder, exist_ok=True)
     try:
@@ -1821,7 +1748,7 @@ def write_settings(path, s):
     fd, tmp = tempfile.mkstemp(dir=folder, prefix=".islandmail-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(json.dumps(s, indent=2) + "\n")
+            f.write(text)
         if mode is not None:
             os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -1962,15 +1889,7 @@ def sync_skill(state, path):
     new = skill_text(names)
     if new == old:
         return None
-    os.makedirs(os.path.dirname(f), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(f), prefix=".islandmail-")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(new)
-        os.replace(tmp, f)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    write_text(f, new)
     return "%s the islandmail skill %s" % ("updated" if old else "installed", f)
 
 
@@ -1988,7 +1907,7 @@ def install_claude_code(ident, path):
         if not isinstance(hooks.get(event), list):
             hooks[event] = []
         hooks[event].append({"hooks": [h]})
-    write_settings(path, s)
+    write_text(path, json.dumps(s, indent=2) + "\n")
     state = notify_state()
     e = notify_entry(state, name)
     e["off"] = False
@@ -1997,12 +1916,10 @@ def install_claude_code(ident, path):
     write_private(notify_state_path(), json.dumps(state, indent=1))
     skill = sync_skill(state, path)
     # Start from now: mail that is already here was there before notifications were on.
-    cursor = watch_cursor(ident, "notify")
-    if not os.path.exists(cursor):
-        try:
-            write_private(cursor, str(api(ident, "GET", "/api/me", timeout=10)["last_seq"]), create=True)
-        except (Fail, OSError, KeyError):
-            pass  # the first hook run starts it
+    try:
+        start_cursor(ident, "notify")
+    except (Fail, OSError, KeyError):
+        pass  # the first hook run starts it
     others = [n for n, x in state.get("agents", {}).items() if n != name and path in x.get("settings", []) and not x.get("off")]
     return had, others, skill
 
@@ -2037,7 +1954,7 @@ def cmd_notify_off(a):
             sys.stderr.write("islandmail: left %s alone: %s\n" % (path, x))
             continue
         if strip_notify_hooks(s, name):
-            write_settings(path, s)
+            write_text(path, json.dumps(s, indent=2) + "\n")
             print("removed %s's notification hooks from %s" % (name, path))
     e["off"], e["settings"] = True, []
     write_private(notify_state_path(), json.dumps(state, indent=1))
@@ -2119,7 +2036,6 @@ class _CursorLock:
         self.f = open(self.path, "a+")
         try:
             if os.name == "nt":
-                import msvcrt
                 for _ in range(100):
                     try:
                         msvcrt.locking(self.f.fileno(), msvcrt.LK_NBLCK, 1)
@@ -2137,8 +2053,9 @@ class _CursorLock:
         self.f.close()
 
 
-def notify_cursor(ident):
-    path = watch_cursor(ident, "notify")
+def start_cursor(ident, name):
+    # (path, seq) of the watch cursor NAME, starting it at the node's newest message if there is none yet.
+    path = watch_cursor(ident, name)
     try:
         return path, read_cursor(path)
     except FileNotFoundError:
@@ -2161,7 +2078,7 @@ def notify_claim(ident, path, seen=0):
             if not got:
                 break
             last = max(m["seq"] for m in got)
-            msgs += [m for m in got if m["from"] != ident["name"] and for_me(m, ident["name"])]
+            msgs += got
             if len(got) < 50:
                 break
         more = len(msgs) > NOTIFY_MAX
@@ -2221,16 +2138,13 @@ def notify_wait(ident, session, deadline):
     try:
         while time.time() < deadline and not superseded() and not notify_is_off(name):
             try:
-                path, _ = notify_cursor(ident)
+                path, _ = start_cursor(ident, "notify")
                 msgs, more = notify_claim(ident, path, seen)
                 if msgs:
                     sys.stderr.write(notify_text(ident, msgs, more) + "\n")
                     return 2
                 pos = max(pos, read_cursor(path))
-                req = urllib.request.Request(MAIL + "/api/stream?after=%d" % pos, headers={
-                    "Authorization": "Bearer " + token_for(ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
-                    "User-Agent": UA})
-                with _opener.open(req, timeout=NOTIFY_RECHECK) as r:
+                with open_stream(ident, pos, NOTIFY_RECHECK) as r:
                     delay = 1
                     for m in stream_messages(r):
                         if superseded() or notify_is_off(name) or time.time() >= deadline:
@@ -2273,7 +2187,7 @@ def cmd_notify_hook(a):
             sys.stderr.flush()
             sys.exit(code)
         if kind == "UserPromptSubmit":
-            path, _ = notify_cursor(ident)
+            path, _ = start_cursor(ident, "notify")
             msgs, more = notify_claim(ident, path)
             if msgs:
                 print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
