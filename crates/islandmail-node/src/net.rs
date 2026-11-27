@@ -214,10 +214,7 @@ struct SyncProto {
 impl ProtocolHandler for SyncProto {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         loop {
-            let (mut send, mut recv) = match conn.accept_bi().await {
-                Ok(s) => s,
-                Err(_) => return Ok(()),
-            };
+            let Ok((mut send, mut recv)) = conn.accept_bi().await else { return Ok(()) };
             let node = self.node.clone();
             let peer = *conn.remote_id().as_bytes();
             // Membership is checked at the handshake; a node taken off a newer member list must also lose a
@@ -324,57 +321,9 @@ impl Net {
         // The dialer's endpoint holds the gate, which holds the node.
         self.node.dialer.lock().unwrap().take();
         self.router.shutdown().await?;
-        for t in &self.tasks {
-            t.abort();
-        }
-        for t in self.tasks {
-            let _ = t.await;
-        }
+        self.tasks.iter().for_each(|t| t.abort());
+        for t in self.tasks { let _ = t.await; }
         Ok(())
-    }
-}
-
-#[derive(Clone)]
-struct Ctx {
-    endpoint: Endpoint,
-    node: Arc<Node>,
-    lookup: MemoryLookup,
-    /// The relays in use (the trust file's, then config "relay"), followed as the trust file changes.
-    relays: Arc<std::sync::RwLock<RelayMap>>,
-    /// Config "relay": this node's own additions ("n0" opts in to iroh's public relays).
-    local_relay: Vec<String>,
-    sender: GossipSender,
-    gate: MemberGate,
-}
-
-impl Ctx {
-    fn peers(&self) -> Vec<EndpointId> {
-        let relays = self.relays.read().unwrap().urls::<Vec<_>>();
-        peers(&self.node, &self.lookup, &relays)
-    }
-
-    /// Follow the trust file's relays: the endpoint gains relays newly listed and drops ones no longer listed.
-    async fn refresh_relays(&self) {
-        let entries = relay_entries(&self.node.members.read().unwrap(), &self.local_relay);
-        let want = match relay_mode(&entries) {
-            Ok(mode) => mode.relay_map(),
-            Err(e) => return tracing::warn!("relays {entries:?} refused: {e:#}"),
-        };
-        let have = self.relays.read().unwrap().clone();
-        let (old, new) = (have.urls::<Vec<RelayUrl>>(), want.urls::<Vec<RelayUrl>>());
-        if old.iter().all(|u| want.contains(u)) && new.iter().all(|u| have.contains(u)) {
-            return;
-        }
-        for url in old.iter().filter(|u| !want.contains(u)) {
-            self.endpoint.remove_relay(url).await;
-        }
-        for url in new.iter().filter(|u| !have.contains(u)) {
-            if let Some(config) = want.get(url) {
-                self.endpoint.insert_relay(url.clone(), config).await;
-            }
-        }
-        tracing::info!("relays now {}", new.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
-        *self.relays.write().unwrap() = want;
     }
 }
 
@@ -413,7 +362,45 @@ fn take(node: &Node, env: Envelope, source: &str) -> Option<Arc<crate::store::Ro
     node.ingest(env).unwrap_or_else(|e| { node.note_refused(&id, source, &e); None })
 }
 
+#[derive(Clone)]
+struct Ctx {
+    endpoint: Endpoint,
+    node: Arc<Node>,
+    lookup: MemoryLookup,
+    /// The relays in use (the trust file's, then config "relay"), followed as the trust file changes.
+    relays: Arc<std::sync::RwLock<RelayMap>>,
+    /// Config "relay": this node's own additions ("n0" opts in to iroh's public relays).
+    local_relay: Vec<String>,
+    sender: GossipSender,
+    gate: MemberGate,
+}
+
 impl Ctx {
+    /// Follow the trust file's relays: the endpoint gains relays newly listed and drops ones no longer listed.
+    async fn refresh_relays(&self) {
+        let entries = relay_entries(&self.node.members.read().unwrap(), &self.local_relay);
+        let want = match relay_mode(&entries) {
+            Ok(mode) => mode.relay_map(),
+            Err(e) => return tracing::warn!("relays {entries:?} refused: {e:#}"),
+        };
+        let have = self.relays.read().unwrap().clone();
+        let (old, new) = (have.urls::<Vec<RelayUrl>>(), want.urls::<Vec<RelayUrl>>());
+        if old.iter().all(|u| want.contains(u)) && new.iter().all(|u| have.contains(u)) {
+            return;
+        }
+        for url in old.iter().filter(|u| !want.contains(u)) {
+            self.endpoint.remove_relay(url).await;
+        }
+        for url in new.iter().filter(|u| !have.contains(u)) {
+            if let Some(config) = want.get(url) {
+                self.endpoint.insert_relay(url.clone(), config).await;
+            }
+        }
+        tracing::info!("relays now {}", new.iter().map(|u| u.to_string()).collect::<Vec<_>>().join(", "));
+        *self.relays.write().unwrap() = want;
+    }
+
+
     async fn apply_trust(&self, trust: Resp, limit: usize) -> Result<()> {
         anyhow::ensure!(trust.certs.len() <= limit && trust.revocations.len() <= limit, "oversize certificate list");
         let node = self.node.clone();
@@ -754,7 +741,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 }
             }
             c.refresh_relays().await;
-            let peers = c.peers();
+            let peers = peers(&c.node, &c.lookup, &c.relays.read().unwrap().urls::<Vec<_>>());
             for &peer in &peers {
                 if !busy.insert(peer) { continue; }
                 let c = c.clone();
