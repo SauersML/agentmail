@@ -533,7 +533,7 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
     let list = edit_trust(node, |list, me| {
         // A fresh host (this node alone on its trust file) takes the inviter's relays: it has no others and may need
         // them to reach the inviter. An existing host keeps its own: an inviter must not route all of its traffic
-        // through relays of the inviter's choosing. Those it lacks are suggested (`islandmail.py relay add`).
+        // through relays of the inviter's choosing. Those it lacks are suggested.
         let fresh = list.nodes.iter().all(|n| n.key == me);
         for n in &names {
             if let Some(h) = holder(list, n, Some(me)) {
@@ -634,23 +634,6 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
                "node": { "name": name.split(',').next().unwrap_or(""), "key": r.node.key }, "seq": list.seq }))
 }
 
-/// POST /api/relays {add: [URL, ..], ts, sig} (arg: the URLs joined by spaces): add relays to this network's relays
-/// in the trust file, as the host owner decides (join only suggests an inviter's relays to an existing host).
-pub fn add_relays(node: &Node, body: &Value) -> Result<Value, ApiError> {
-    let add: Vec<String> = body.get("add").and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-    operator(node, body, "relay", &add.join(" "))?;
-    if add.is_empty() || !add.iter().all(|r| islandmail_core::members::valid_relay_url(r)) {
-        return Err(ApiError::new(400, "add must list relay origins such as https://relay.example.org"));
-    }
-    let list = edit_trust(node, |list, _| {
-        for r in &add {
-            if !list.relays.contains(r) { list.relays.push(r.clone()); }
-        }
-        Ok(())
-    })?;
-    Ok(json!({ "relays": list.relays, "seq": list.seq }))
-}
 
 /// POST /api/accepts {reply, ts, sig}: the inviting node could not be reached at join; the owner hands in the reply.
 pub fn accept(node: &Node, body: &Value) -> Result<Value, ApiError> {
@@ -960,13 +943,6 @@ mod tests {
         let out = join(&old, &make("dave"));
         assert!(old.members.read().unwrap().relays.is_empty());
         assert_eq!(out["relay"]["suggested"], json!([url]), "{out}");
-        // The owner adopts them on purpose.
-        let arg = url.clone();
-        let out = add_relays(&old, &signed(&old, "relay", &arg, json!({ "add": [url] }))).map_err(|e| e.message).unwrap();
-        assert_eq!(out["relays"], json!([url]));
-        assert_eq!(old.members.read().unwrap().relays, vec![url.clone()]);
-        // Not signed by this node's key: refused.
-        assert_eq!(add_relays(&old, &signed(&fresh, "relay", &arg, json!({ "add": [url] }))).unwrap_err().status, 401);
     }
 
     #[test]

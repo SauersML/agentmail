@@ -32,7 +32,7 @@ def main():
     with open(trust, "w") as f:
         json.dump({"v": 1, "network": run(bin_, "network-id"), "seq": 1, "members": [], "nodes": [
             {"name": "dev", "key": pub, "addrs": ["127.0.0.1:%d" % udp], "names": ["dev."]}]}, f)
-    operator, held = os.path.join(work, "operator"), os.path.join(work, "operator", "identities")
+    held = os.path.join(work, "operator", "identities")
     user_dir = os.path.join(work, "user")
 
     def cl(directory, *args):
@@ -42,14 +42,14 @@ def main():
         p = subprocess.run([sys.executable, im, *args], env=env, capture_output=True, text=True, timeout=60)
         return p.returncode, (p.stdout + p.stderr).strip()
 
-    # The operator makes dev.alice's key (no node needed) and keeps it in the node's identities_dir.
-    rc, out = cl(operator, "newkey", "dev.alice")
-    check("operator makes a key for dev.alice", rc == 0, out[-200:])
+    # The operator puts dev.alice's key file in the node's identities_dir and hands dev.alice a copy.
+    def held_key(name):
+        ident = {"name": name, "sub": "agent:" + name, "seed": os.urandom(32).hex()}
+        write_private_json(os.path.join(held, name + ".json"), ident)
+        return ident
+    os.makedirs(held, mode=0o700)
     os.makedirs(os.path.join(user_dir, "identities"), mode=0o700)
-    with open(os.path.join(held, "dev.alice.json")) as f:  # the operator hands dev.alice its key file
-        alice = json.load(f)
-        write_private_json(os.path.join(user_dir, "identities", "dev.alice.json"), alice)
-    check("newkey writes sub agent:NAME", alice.get("sub") == "agent:dev.alice", alice.get("sub"))
+    write_private_json(os.path.join(user_dir, "identities", "dev.alice.json"), held_key("dev.alice"))
     # A held file whose sub is not agent:NAME would get a certificate its tokens then fail; the node refuses it.
     carol = {"name": "dev.carol", "sub": "agent:dev.carol@elsewhere", "seed": os.urandom(32).hex()}
     write_private_json(os.path.join(held, "dev.carol.json"), carol)
@@ -89,10 +89,8 @@ def main():
         carol["sub"] = "agent:dev.carol"
         write_private_json(os.path.join(held, "dev.carol.json"), carol)
         write_private_json(os.path.join(work, "carol", "identities", "dev.carol.json"), carol)
-        rc, out = cl(operator, "newkey", "dev.erin")
         os.makedirs(os.path.join(work, "erin", "identities"), mode=0o700)
-        with open(os.path.join(held, "dev.erin.json")) as f:
-            write_private_json(os.path.join(work, "erin", "identities", "dev.erin.json"), json.load(f))
+        write_private_json(os.path.join(work, "erin", "identities", "dev.erin.json"), held_key("dev.erin"))
         pid = node.proc.pid
         for who in ("carol", "erin"):
             ok, t = wait_for(lambda: cl(os.path.join(work, who), "--as", "dev." + who, "whoami")[0] == 0, timeout=20)

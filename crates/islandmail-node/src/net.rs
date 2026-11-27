@@ -409,16 +409,6 @@ impl Ctx {
     }
 }
 
-/// An iroh-relay config line that serves only this trust file's nodes (iroh endpoint ids are the node keys, in hex).
-pub fn relay_allowlist(list: &islandmail_core::MemberList) -> String {
-    let ids: Vec<String> = list.nodes.iter().filter_map(|n| parse_key(&n.key).ok())
-        .map(|k| format!("  \"{}\", # {}\n", k.iter().map(|b| format!("{b:02x}")).collect::<String>(), n_name(list, &k))).collect();
-    format!("access.allowlist = [\n{}]\n", ids.concat())
-}
-
-fn n_name(list: &islandmail_core::MemberList, key: &[u8; 32]) -> String {
-    list.nodes.iter().find(|n| parse_key(&n.key).ok().as_ref() == Some(key)).map(|n| n.name.replace(['\n', '"'], " ")).unwrap_or_default()
-}
 
 /// The relays a node uses: its network's (trust file "relays"), then its own config "relay" ("n0" = iroh's public
 /// relays, only when the host opts in).
@@ -949,9 +939,7 @@ mod tests {
             relays: vec![custom.into()] };
         assert_eq!(relay_entries(&list, &[]), vec![custom.to_string()]);
         assert_eq!(relay_entries(&list, &["n0".into(), custom.into()]), vec![custom.to_string(), "n0".into()]);
-        // The relay's allowlist names each node by its iroh endpoint id.
-        let id = EndpointId::from_bytes(&me.public()).unwrap();
-        assert_eq!(relay_allowlist(&list), format!("access.allowlist = [\n  \"{id}\", # n\n]\n"));
+
     }
 
     #[tokio::test]

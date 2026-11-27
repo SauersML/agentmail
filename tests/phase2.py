@@ -179,8 +179,8 @@ def main():
         check("an unsigned post with an agent token is refused on A too (no bearer token goes into envelopes)",
               st == 400 and "sign" in r.get("error", ""), r.get("error", ""))
         rc, out = im(pc, "carol", "selftoken", "--ttl", "120")
-        st, r = req("GET", pc, "/api/threads", out) if rc == 0 else (0, {"error": out})
-        check("islandmail.py selftoken prints a token C accepts", st == 200 and "threads" in r, r.get("error", ""))
+        st, r = req("GET", pc, "/api/me", out) if rc == 0 else (0, {"error": out})
+        check("islandmail.py selftoken prints a token C accepts", st == 200 and r.get("name", "").endswith("carol"), json.dumps(r)[:200])
         rc, out = im(pc, "carol", "send", "--to", "t.alice", "--thread", "nohome-private", "private, no home")
         check("private send from C with only the agent key", rc == 0, out)
         rc, out = im(pc, "carol", "send", "--open", "--to", "t.alice", "--thread", "nohome", "sent with no home")

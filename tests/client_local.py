@@ -5,7 +5,6 @@ Run: python3 tests/client_local.py"""
 import importlib.util
 import json
 import os
-import sys
 import tempfile
 
 spec = importlib.util.spec_from_file_location("im", os.path.join(os.path.dirname(__file__), "..", "clients", "islandmail.py"))
@@ -48,14 +47,6 @@ assert note == "; stored here for t.bob, copied to their nodes as they sync" and
 assert im.send_note(["n%d" % i for i in range(14)], "n.").endswith("n11 and 2 more, copied to their nodes as they sync")
 assert "no other trusted agent" in im.send_note([], "t.nobody") and im.send_note(None, "t.bob") == ""
 print("ok: send confirmations say stored, not delivered")
-
-# ask takes --open like send (send() reads a.open); private is the default.
-seen = []
-im.cmd_ask = seen.append
-sys.argv = ["islandmail.py", "ask", "--open", "--to", "t.bob", "a question"]
-im.main()
-assert seen and seen[0].open and seen[0].to == "t.bob", seen
-print("ok: ask --open")
 
 # who: an agent that has not sent mail yet shows "never", not the Unix epoch.
 assert im.who_line({"name": "t.new", "sub": "agent:t.new", "last_active": "1970-01-01T00:00:00.000Z"}).endswith("last active never")

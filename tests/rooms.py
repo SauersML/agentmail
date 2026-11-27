@@ -89,20 +89,6 @@ def main():
     def rooms(agent):
         return {r["id"]: r for r in js(agent, "rooms") or []}
 
-    def chat(agent, *args, stdin="", timeout=60):
-        h = home[agent]
-        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
-                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
-        p = subprocess.run([sys.executable, im, "chat", *args], input=stdin, env=env, capture_output=True, text=True,
-                           timeout=timeout)
-        return p.returncode, (p.stdout + p.stderr).strip()
-
-    def chat_bg(agent, *args):
-        h = home[agent]
-        env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-" + h), USER=user[agent],
-                   ISLANDMAIL_URL="http://127.0.0.1:%d" % api[h], ISLANDMAIL_AS=agent)
-        return subprocess.Popen([sys.executable, im, "chat", *args], env=env, stdin=subprocess.PIPE,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     try:
         for h in hosts:
@@ -142,7 +128,7 @@ def main():
         check("rooms shows unread counts (read marks them read)", unread == 0, str(unread))
 
         # A private room; carol, added later, reads the earlier history through a key grant.
-        rc, out = cl("alice", "room", "create", "plan", "--with", "ops.bob", "--topic", "ship it")
+        rc, out = cl("alice", "room", "new", "plan", "@ops.bob", "--topic", "ship it")
         check("create a private room", rc == 0 and "alice/plan" in out, out[-160:])
         cl("alice", "room", "send", "alice/plan", "secret one")
         got, t = wait_for(lambda: "secret one" in texts("ops.bob", "alice/plan"), timeout=20)
@@ -174,17 +160,7 @@ def main():
         check("room state: members, topic, creator", info and info["members"] == ["alice", "dev.carol", "ops.bob"]
               and info["topic"] == "ship it" and info["creator"] == "alice", json.dumps(info)[:240])
 
-        # "since join": no grants, no history.
-        rc, out = cl("alice", "room", "create", "quiet", "--history", "since-join", "--with", "ops.bob")
-        cl("alice", "room", "send", "alice/quiet", "before carol")
-        rc, out = cl("alice", "room", "add", "alice/quiet", "dev.carol")
-        check("adding to a since-join room says so", rc == 0 and "only messages from now on" in out, out[-200:])
-        cl("alice", "room", "send", "alice/quiet", "after carol")
-        got, t = wait_for(lambda: "after carol" in texts("dev.carol", "alice/quiet"), timeout=20)
-        check("since-join: the joiner reads later messages", got, "%.1fs" % t)
-        time.sleep(SYNC * 2)
-        check("since-join: but none from before", "before carol" not in texts("dev.carol", "alice/quiet"),
-              str(texts("dev.carol", "alice/quiet")))
+        cl("alice", "room", "new", "quiet", "@ops.bob", "@dev.carol")
 
         # Leave and remove: nothing sent afterwards reaches them; only the creator removes others.
         rc, out = cl("dev.carol", "room", "remove", "alice/quiet", "alice")
@@ -249,7 +225,7 @@ def main():
         with open(owner_cfg, "w") as f:
             json.dump({"api_listen": "127.0.0.1:%d" % api["mac"], "node_key_file": k("mac"),
                        "members_file": os.path.join(work, "trust.json")}, f)
-        group_chat_checks(cl, js, req, api, chat, chat_bg, owner_cfg, bin_)
+        group_chat_checks(cl, js, req, api, owner_cfg, bin_)
         env = dict(os.environ, ISLANDMAIL_DIR=os.path.join(work, "client-mac"), USER="agent",
                    ISLANDMAIL_URL="https://mail.example.invalid", ISLANDMAIL_AS="alice")
         p = subprocess.run([sys.executable, im, "ui", "--post"], env=env, capture_output=True, text=True, timeout=60)
@@ -310,14 +286,13 @@ def b32(env):
     return base64.b32encode(bytes.fromhex(env)).decode().lower().rstrip("=")
 
 
-def group_chat_checks(cl, js, req, api, chat, chat_bg, owner_cfg, bin_):
-    """Rooms as a group chat: room new in one line, chat in a terminal (piped here), and posting from /ui."""
+def group_chat_checks(cl, js, req, api, owner_cfg, bin_):
+    """Rooms as a group chat: room new in one line, and posting from /ui."""
     rc, out = cl("alice", "room", "new", "crew", "@ops.bob", "dev.carol", "@nobody.here", "--topic", "ship it")
     check("room new NAME @a @b makes the room with its members", rc == 0
           and "created alice/crew with @ops.bob, @dev.carol" in out, out[-240:])
     check("without the node key, it prints the exact invite command for a name not on the network",
-          "@nobody.here is not on this network yet" in out and "islandmail.py invite --name nobody.here --room alice/crew" in out
-          and "chat: islandmail.py chat alice/crew" in out, out[-240:])
+          "@nobody.here is not on this network yet" in out and "islandmail.py invite --name nobody.here --room alice/crew" in out, out[-240:])
     rc, out = cl("alice", "room", "new", "crew2", "@ops.bob", "@ghost.x", "--config", owner_cfg)
     inv = next((w for w in out.split() if w.startswith("im1")), "")
     try:
@@ -334,56 +309,10 @@ def group_chat_checks(cl, js, req, api, chat, chat_bg, owner_cfg, bin_):
           and info.get("members") == ["alice", "dev.carol", "ops.bob"] and info.get("topic") == "ship it", json.dumps(info)[:200])
     wait_for(lambda: (js("ops.bob", "room", "info", "alice/crew") or {}).get("member"), timeout=20)
 
-    # A live chat that stays open while another member posts: the post scrolls in.
-    live = chat_bg("alice", "alice/crew", "--no-tty")
-    time.sleep(3)
     cl("dev.carol", "room", "send", "alice/crew", "carol here, posting from the CLI")
-    time.sleep(SYNC * 3)
-    try:
-        out, _ = live.communicate("/quit\n", timeout=30)
-    except subprocess.TimeoutExpired:
-        live.kill()
-        out, _ = live.communicate()
-    tail = out.split("/help for commands)", 1)[-1]
-    check("chat shows messages as they arrive", "dev.carol: carol here, posting from the CLI" in tail, out[-300:])
-    check("with the room, its members and topic on top", out.startswith("alice/crew \u00b7 private \u00b7 alice, dev.carol, ops.bob")
-          and "ship it" in out.splitlines()[1], out[:200])
-
-    # Piped input: each line is a message or a /command; @prefixes complete to member names.
-    first = [m for m in js("ops.bob", "room", "read", "alice/crew")["messages"] if m["text"].startswith("carol here")][0]
-    rc, out = chat("ops.bob", "alice/crew", stdin="hello crew @dev, tests are green\n/topic ship friday\n"
-                   "/reply %s seen it\n/members\n" % first["id"][:5])
-    check("chat posts typed lines and echoes them", rc == 0 and "ops.bob: hello crew @dev.carol, tests are green" in out, out[-400:])
-    check("/members lists the room", "members: alice, dev.carol, ops.bob" in out, out[-300:])
-    got, _ = wait_for(lambda: [m for m in js("alice", "room", "read", "alice/crew")["messages"] if m["from"] == "ops.bob"],
-                      timeout=20)
-    texts = [m["text"] for m in got or []]
-    hello = [m for m in got or [] if m["text"].startswith("hello crew")]
-    check("@dev completed to a real mention", hello and hello[0].get("mentions") == ["dev.carol"], json.dumps(hello)[:200])
-    check("/topic sets the topic", (js("alice", "room", "info", "alice/crew") or {}).get("topic") == "ship friday")
-    reply = [m for m in got or [] if m["text"] == "seen it"]
-    check("/reply ID answers in place", reply and reply[0].get("reply_to") == first["id"], str(texts))
-    rc, out = chat("alice", "alice/crew", stdin="")
-    lines = out.splitlines()
-    i = next((k for k, l in enumerate(lines) if ": seen it" in l), 0)
-    check("chat shows a reply under a \u21b3 line", i and lines[i - 1].strip().startswith("\u21b3 re %s dev.carol: carol here" % first["id"]),
-          "\n".join(lines[max(0, i - 2):i + 1]))
-
-    # /add (with the history) and /leave from the chat; chat @NAME is the DM.
-    cl("alice", "room", "new", "duo", "@ops.bob")
-    cl("alice", "room", "send", "alice/duo", "before carol")
-    rc, out = chat("alice", "alice/duo", stdin="/add dev.carol\n")
-    check("/add adds a member", rc == 0 and "added dev.carol" in out and "earlier messages" in out, out[-200:])
-    got, _ = wait_for(lambda: "before carol" in [m["text"] for m in (js("dev.carol", "room", "read", "alice/duo") or {}).get("messages", [])],
-                      timeout=30)
-    check("who then reads the history", got)
-    rc, out = chat("dev.carol", "alice/duo", stdin="/leave\n")
-    got, _ = wait_for(lambda: "dev.carol" in (js("alice", "room", "info", "alice/duo") or {}).get("former", []), timeout=30)
-    check("/leave leaves", rc == 0 and "you left alice/duo" in out and got, out[-200:])
-    rc, out = chat("dev.carol", "@alice", stdin="hi from the chat\n")
-    got, _ = wait_for(lambda: "hi from the chat" in [m["text"] for m in (js("alice", "room", "read", "dm:alice+dev.carol") or {})
-                                                      .get("messages", [])], timeout=30)
-    check("chat @agent is the DM, a two-person room", rc == 0 and got, out[-200:])
+    got, _ = wait_for(lambda: [m for m in (js("alice", "room", "read", "alice/crew") or {}).get("messages", [])
+                               if m["text"].startswith("carol here")], timeout=30)
+    first = got[0] if got else {"id": "x"}
 
     # /ui with a posting key: post, reply, start a room, clear unread; a read-only key cannot post.
     rc, out = cl("alice", "ui", "--post")
@@ -468,7 +397,7 @@ def issue12_checks(cl, js, req, api, token, bg, orig):
     check("--dm to your own message is refused", rc != 0, out[-120:])
 
     # Order: by signed time, replies right under their parent; watch still fires on arrival.
-    cl("alice", "room", "create", "order", "--open")
+    cl("alice", "room", "new", "order", "--open")
     cl("alice", "room", "send", "alice/order", "A first")
     cl("alice", "room", "send", "alice/order", "B second")
     a = [m for m in js("alice", "room", "read", "alice/order")["messages"] if m["text"] == "A first"][0]

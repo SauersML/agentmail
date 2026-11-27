@@ -106,7 +106,7 @@ def main():
         check("the hub knows north's agent", got, "%.1fs" % t)
 
         # The room is made while the hub trusts north only.
-        rc, out = cl("alice", "room", "create", "town", "--open")
+        rc, out = cl("alice", "room", "new", "town", "--open")
         check("alice makes the open room alice/town", rc == 0, out[-200:])
         rc, out = cl("alice", "room", "send", room, "early post")
         check("and posts in it", rc == 0, out[-200:])

@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""Waking agents: `watch --from-now`, `read` moving the default watch cursor, arrival hooks (`watch --exec`, `watch
---post`) and the upload progress line. One node on loopback, throwaway keys.
+"""Waking agents: `watch --from-now`, `read` moving the default watch cursor, arrival hooks (`watch --exec`) and the upload progress line. One node on loopback, throwaway keys.
 
   python3 tests/client_wake.py --bin target/debug/islandmail-node --islandmail clients/islandmail.py [--workdir DIR]
 """
 import argparse
 import hashlib
-import http.server
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
-import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -188,35 +185,6 @@ def main():
         with open(cursor("main"), "w") as f:
             f.write(str(seq(m_down)))  # the default watcher below starts after these
 
-        # --post: the same JSON to a loopback listener, with a bearer token from a file; other hosts refused.
-        posts = []
-
-        class H(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                body = self.rfile.read(int(self.headers["Content-Length"]))
-                posts.append((self.path, self.headers.get("Authorization"), self.headers.get("Content-Type"), json.loads(body)))
-                self.send_response(204)
-                self.end_headers()
-
-            def log_message(self, *args):
-                pass
-
-        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        token_file = os.path.join(work, "wake.token")
-        with open(token_file, "w") as f:
-            f.write("s3cret-token\n")
-        p = background_watch("--post", "http://127.0.0.1:%d/wake" % srv.server_port, "--post-token-file", token_file)
-        mid = send("post me", "wake")
-        rc, out, err = finish(p)
-        srv.shutdown()
-        check("--post delivered the message", rc == 0 and len(posts) == 1 and posts[0][0] == "/wake"
-              and posts[0][3]["message"]["id"] == mid and posts[0][3]["message"]["text"] == "post me", err[-200:])
-        check("with the bearer token and a JSON content type", posts and posts[0][1] == "Bearer s3cret-token"
-              and posts[0][2] == "application/json")
-        for url in ("http://example.com/wake", "http://10.0.0.1:9000/", "file:///etc/passwd", "http://user:pw@127.0.0.1/"):
-            rc, out, err = watch("--post", url, timeout=10)
-            check("--post refuses %s" % url, rc == 1 and "--post takes" in err, err[-160:])
 
         # Upload progress: a line for a big attachment, none for a small one; the file arrives intact.
         big = os.path.join(work, "big.bin")

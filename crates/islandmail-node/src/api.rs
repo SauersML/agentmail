@@ -59,7 +59,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/invites", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::invite)))
         .route("/api/joins", axum::routing::post(join))
         .route("/api/invites/joined", get(joined).post(joined_seen))
-        .route("/api/relays", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::add_relays)))
         .route("/api/accepts", axum::routing::post(|s: State<AppState>, h: HeaderMap, b: Bytes| owner_step(s, h, b, crate::invite::accept)))
         .route("/api/messages", get(list).post(post))
         .route("/api/messages/{id}", get(one))
@@ -76,7 +75,6 @@ pub fn router(state: AppState) -> Router {
         .route("/ui/api/rooms/new", axum::routing::post(crate::ui::new_room))
         .route("/ui/api/read", axum::routing::post(crate::ui::mark_read))
         .route("/ui/api/files/{id}", get(crate::ui::file))
-        .route("/api/threads", get(threads))
         .route("/api/names", get(names))
         .route("/api/stream", get(stream))
         .route(
@@ -584,10 +582,6 @@ async fn ui_session(State(s): State<AppState>, who: Caller, body: Bytes) -> Resu
         s.node.lend_key(&who, seed, exp)?;
     }
     Ok(json_resp(json!({ "key": key, "expires": islandmail_core::ts_from_millis(exp), "path": format!("/ui#k={key}") }), 201))
-}
-
-async fn threads(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
-    Ok(json_resp(json!({ "threads": s.node.store.thread_rows(&who, 500)? }), 200))
 }
 
 async fn names(State(s): State<AppState>, _: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {

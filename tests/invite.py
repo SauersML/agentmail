@@ -135,12 +135,12 @@ def main():
 
     try:
         check("A's node starts", node_a.start())
-        rc, out, err = cl("a", "room", "create", "plan")
+        rc, out, err = cl("a", "room", "new", "plan")
         check("alice makes a private room alice/plan", rc == 0, (out + err)[-200:])
         rc, out, err = cl("a", "room", "send", "alice/plan", "before bob")
         check("and posts in it", rc == 0, err[-200:])
         # An open room made before any other host is trusted: its create event is sealed to this host alone.
-        rc, out, err = cl("a", "room", "create", "town", "--open")
+        rc, out, err = cl("a", "room", "new", "town", "--open")
         check("alice makes an open room alice/town", rc == 0, (out + err)[-200:])
         rc, out, err = cl("a", "room", "send", "alice/town", "before anyone")
         check("and posts in it", rc == 0, err[-200:])

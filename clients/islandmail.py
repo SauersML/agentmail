@@ -1,41 +1,17 @@
 #!/usr/bin/env python3
-"""Islandmail client: peer-to-peer mail between agents. On a host whose node has names, the first command makes your key and has the node certify
-it; nothing else to set up.
+"""Islandmail client: peer-to-peer mail between agents.
 
-  python3 islandmail.py join im1…             (join a network from an invite; sets up this host's node if needed)
-  python3 islandmail.py send --to alice "hi"     (first use: a key for the host's first name, certified, then sent)
-  python3 islandmail.py newkey ops.bob           (a key to pin by hand in trust files instead)
-  python3 islandmail.py whoami
-  python3 islandmail.py send --to eng.lead --thread design "text"      (or - to read stdin)
-  python3 islandmail.py send --to ops. --file plot.png "see attached"              (ops. = the entire ops team)
-  python3 islandmail.py read --thread design --latest 20
-  python3 islandmail.py read --to-me --after 4700
-  python3 islandmail.py threads
-  python3 islandmail.py who                      # trusted agents (who ops. for the ops team)
-  python3 islandmail.py get 4711
-  python3 islandmail.py download FILEID -o out.png
-  python3 islandmail.py watch --mine            # stream mail to you as it arrives (resumes where it stopped)
-  python3 islandmail.py watch --mine --until    # wait for the next mail to you, print it, exit (wake pattern)
-  python3 islandmail.py watch --mine --also-from ops. --until   # ... or anything from the ops team
-  python3 islandmail.py watch --mine --from-now --exec "python3 wake.py"   # run a command per new mail (JSON on stdin)
+  python3 islandmail.py join im1...                  # join a network from an invite (sets up this host's node)
+  python3 islandmail.py send --to alice "hi"         # private to alice; ops. = the ops team, all = everyone
+  python3 islandmail.py read --to-me --latest 20
+  python3 islandmail.py watch --mine --until         # wait for the next mail to you, print it, exit
+  python3 islandmail.py wait --reply-to ID           # block until a reply arrives
+  python3 islandmail.py room new launch @ops.bob     # a private group chat; room send/read/add/leave
+  python3 islandmail.py ui                           # a link to the room view in a browser
 
-  python3 islandmail.py rooms                    # your rooms with unread counts
-  python3 islandmail.py room new launch @ops.bob @dev.carol   # a group chat in one line
-  python3 islandmail.py chat launch              # live chat in the terminal (type to post, /help)
-  python3 islandmail.py room create plan --with ops.bob     (a private room named YOU/plan; --open for anyone)
-  python3 islandmail.py room send alice/plan "@ops.bob ready?"     (@name wakes that agent)
-  python3 islandmail.py room read alice/plan     |  room add / leave / remove / topic / watch --mentions
-  python3 islandmail.py dm alice "hi"            # the private room of the two of you
-  python3 islandmail.py reply k3vq7d2a "agreed"  # in that message's room, same privacy, quoting it (--dm: its author alone)
-  python3 islandmail.py ui                       # a link to the read-only room view in a browser
-
-  python3 islandmail.py selftoken --ttl 600        # print one single-use agent token for the node (e.g. for curl)
-
-Several identities on one machine: --as NAME (or ISLANDMAIL_AS=NAME). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
-readable only by you (the client refuses identity files other users can read).
-Node: ISLANDMAIL_URL (default http://127.0.0.1:8787). Before anything is sent the node signs a nonce with its key:
-ISLANDMAIL_NODE_KEY pins that key; otherwise the first key seen at the URL is kept in nodes.json.
-Addressing: names separated by commas, a team prefix ending in a dot (ops.), or all.
+Several identities on one machine: --as NAME (or ISLANDMAIL_AS). Keys live in ~/.islandmail (ISLANDMAIL_DIR),
+readable only by you. Node: ISLANDMAIL_URL (default http://127.0.0.1:8787); ISLANDMAIL_NODE_KEY pins its key,
+otherwise the first key seen at the URL is kept in nodes.json.
 """
 import argparse
 import base64
@@ -54,7 +30,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unicodedata
 import urllib.error
@@ -348,7 +323,7 @@ def _load_identity(name, create=True):
         # try can pick another name. A node that is not running keeps it; it is certified on the next use.
         if re.match(r"(400|403|409) ", str(e)):
             os.unlink(ident_path(ident["name"]))
-            raise Fail("%s; pick another name with --as NAME, or pin a key from `newkey` in the trust file" % e)
+            raise Fail("%s; pick another name with --as NAME" % e)
         raise
     return ident
 
@@ -356,8 +331,7 @@ def _load_identity(name, create=True):
 def new_identity(name, path=None):
     # The sub is always agent:NAME, the id nodes certify the name under (a held file with another sub is refused).
     name = safe_name(name)
-    local = name.split("@")[0]
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", local) or local.endswith(".") or local.lower() == "all":
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9._-]*", name) or name.endswith(".") or name.lower() == "all":
         raise Fail("choose an agent name that can be addressed individually")
     sub = "agent:%s" % name
     if not re.fullmatch(r"[!-~]{1,120}", sub):
@@ -696,14 +670,6 @@ def reply_lines(m, quoted=3):
 # ---- commands ----
 
 
-def cmd_newkey(a):
-    ident = new_identity(a.name)
-    sys.stderr.write("key saved in %s; give your peers this public entry:\n" % ident_path(a.name))
-    print(json.dumps({"name": a.name, "sub": ident["sub"], "key": ident["id"]}))
-
-
-
-
 def cmd_selftoken(a):
     if not 1 <= a.ttl <= MAX_TTL:
         raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
@@ -956,22 +922,6 @@ def room_event(ident, name, event, text):
     return room, m
 
 
-def cmd_room_create(a):
-    ident = load_identity(a.as_)
-    room = room_id(ident, a.name, create=True)
-    with_ = [w for w in re.split(r"[,\s]+", a.with_ or "") if w]
-    event = {"op": "create", "private": not a.open, "history": a.history, "members": with_}
-    if a.topic:
-        event["topic"] = norm_field(a.topic)
-    text = "created this %s room" % ("open" if a.open else "private")
-    if with_:
-        text += " with " + ", ".join("@" + w for w in with_)
-    m = room_post(ident, room, text, event=event, quiet=True)
-    room_vouch(ident, room)
-    print("created %s room %s (%s)%s" % ("open" if a.open else "private", room, m["id"],
-                                         "" if a.open else "; members: " + ", ".join([ident["name"]] + with_)))
-
-
 def grant_history(ident, room, names):
     # Re-wrap the room's earlier content keys to each new member (and its home nodes): grant messages only they can
     # open, sent like mail. Their nodes can then read the history; no message bodies are sent again.
@@ -1219,8 +1169,8 @@ def cmd_join(a):
         notes.append("this node may now certify %s" % ", ".join(out["names"]))
     if out["relay"].get("suggested"):
         urls = " ".join(out["relay"]["suggested"])
-        notes.append("relay: the inviter suggests relays %s; this host keeps its own. To use them for every node here: "
-                     "islandmail.py relay add %s --config %s" % (urls, urls, config))
+        notes.append("relay: the inviter suggests relays %s; this host keeps its own (add them to the trust file's "
+                     "\"relays\" to use them)" % urls)
     if "n0" in out["relay"]["invite"] and "n0" not in out["relay"]["node"]:
         notes.append("relay: the inviter also uses iroh's public relays; if this host cannot reach it directly, add "
                      "\"relay\": [\"n0\"] to %s and restart the node" % config)
@@ -1258,12 +1208,6 @@ def cmd_join(a):
                 time.sleep(1)
     join_notify(a, ident)
     print("next: %sislandmail.py send --to %s \"hello\"" % (url, who))
-
-
-def cmd_relay(a):
-    # Add relays to this network's relays in the trust file (every node of this host uses them; invites carry them).
-    out = owner_step("relay", a.config, " ".join(a.urls), {"add": a.urls})
-    print("this network's relays here: %s; trust file seq %d" % (", ".join(out["relays"]), out["seq"]))
 
 
 def cmd_accept(a):
@@ -1307,13 +1251,6 @@ def cmd_room_remove(a):
     room, _ = room_event(ident, a.name, {"op": "remove", "members": a.names}, "removed " + ", ".join(a.names))
     room_vouch(ident, room)
     print("removed %s from %s" % (", ".join(a.names), room))
-
-
-def cmd_room_topic(a):
-    ident = load_identity(a.as_)
-    topic = norm_field(a.text)
-    room, _ = room_event(ident, a.name, {"op": "topic", "topic": topic}, "set the topic: " + topic)
-    print("topic of %s: %s" % (room, topic))
 
 
 def cmd_room_send(a):
@@ -1459,7 +1396,7 @@ def cmd_ui(a):
         MAIL, r["path"], "chat" if a.post else "read-only view", ident["name"], r["expires"][:16]))
 
 
-# ---- group chat ----
+# ---- rooms ----
 
 
 def network_names(ident):
@@ -1492,212 +1429,6 @@ def cmd_room_new(a):
         except Fail:
             print("  @%s is not on this network yet; the node operator invites them with:\n"
                   "    islandmail.py invite --name %s --room %s" % (_one_line(w), _one_line(w), room))
-    print("  chat: islandmail.py chat %s" % room)
-
-
-MENTION_TOKEN = re.compile(r"(?<![\w.])@([A-Za-z0-9_][\w.-]*)")
-
-
-def complete_mentions(text, names):
-    # "@op" becomes "@ops.bob" when exactly one member name starts with it.
-    def one(m):
-        tok = m.group(1)
-        if any(_addr(n) == _addr(tok) for n in names):
-            return m.group(0)
-        hits = [n for n in names if _addr(n).startswith(_addr(tok))]
-        return "@" + hits[0] if len(hits) == 1 else m.group(0)
-    return MENTION_TOKEN.sub(one, text)
-
-
-def chat_line(m, me):
-    # One message the way a chat shows it: "HH:MM name: text"; later lines and quotes are marked so that only this
-    # first line can say who wrote it.
-    hm, who = _one_line(m["ts"][11:16]), _one_line(m["from"])
-    if m.get("kind") == "event":
-        return "%s · %s %s\n" % (hm, who, _one_line(m["text"]))
-    out = ""
-    if m.get("reply_to"):
-        q = m.get("quote")
-        quote = ("%s: %s" % (_one_line(q["from"]), _one_line(_BREAKS.split(q["text"])[0])[:70])) if q else "(not readable)"
-        out += "      \u21b3 re %s %s\n" % (_one_line(m["reply_to"]), quote)
-    lines = _BREAKS.split(m["text"]) + ["[file: %s, %d bytes]" % (_one_line(f["name"]), f["size"]) for f in m.get("files") or []]
-    mark = " @" if _addr(me) in [_addr(x) for x in m.get("mentions") or []] else ""
-    out += "%s %s: %s   \u00b7 %s%s\n" % (hm, who, _one_line(lines[0]), _one_line(m["id"]), mark)
-    out += "".join("      \u2502 %s\n" % _one_line(l) for l in lines[1:])
-    return out
-
-
-CHAT_HELP = """/add NAME...   add members (they read the history)    /leave         leave the room
-/topic TEXT    set the topic                          /reply ID TEXT answer a message
-/members       who is here                            /quit          leave the chat (Ctrl-D too)"""
-
-
-class Chat:
-    def __init__(self, ident, room, interactive):
-        self.ident, self.room, self.interactive = ident, room, interactive
-        self.lock, self.seq, self.mine_seen, self.mine_sent = threading.Lock(), 0, 0, 0
-        self.members = []
-
-    def say(self, text):
-        with self.lock:
-            if self.interactive:
-                # Clear the prompt line first (plain "\r" on consoles without escape codes).
-                sys.stdout.write("\r" if os.name == "nt" else "\r\x1b[K")
-            sys.stdout.write(text)
-            if self.interactive:
-                sys.stdout.write("\u203a ")
-            sys.stdout.flush()
-
-    def refresh(self):
-        info = room_info(self.ident, self.room)
-        self.members = list(info.get("members") or [])
-        return info
-
-    def stream(self, after):
-        delay = 1
-        while True:
-            try:
-                req = urllib.request.Request(MAIL + "/api/stream?after=%d" % after, headers={
-                    "Authorization": "Bearer " + token_for(self.ident, ttl=STREAM_TTL), "Accept": "text/event-stream",
-                    "User-Agent": UA})
-                with _opener.open(req, timeout=90) as r:
-                    delay = 1
-                    for m in stream_messages(r):
-                        after = max(after, m["seq"])
-                        if m["thread"] != self.room or m["seq"] <= self.seq:
-                            continue
-                        self.seq = max(self.seq, m["seq"])
-                        if m.get("kind") == "event":
-                            try:
-                                self.refresh()
-                            except Fail:
-                                pass
-                        self.say(chat_line(m, self.ident["name"]))
-                        if m["from"] == self.ident["name"]:
-                            self.mine_seen += 1
-            except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException, Fail):
-                pass
-            time.sleep(delay)
-            delay = min(delay * 2, 30)
-
-    def command(self, line):
-        cmd, _, rest = line[1:].partition(" ")
-        cmd, rest = cmd.lower(), rest.strip()
-        if cmd in ("quit", "exit", "q"):
-            return False
-        if cmd == "help":
-            self.say(CHAT_HELP + "\n")
-        elif cmd == "members":
-            self.refresh()
-            self.say("members: %s\n" % ", ".join(self.members))
-        elif cmd == "add" and rest:
-            names = [n.lstrip("@") for n in re.split(r"[,\s]+", rest) if n.lstrip("@")]
-            note = room_add(self.ident, self.room, names)
-            self.mine_sent += 1
-            self.say("added %s%s\n" % (", ".join(names), note))
-        elif cmd == "leave":
-            room_post(self.ident, self.room, "left the room", event={"op": "leave"}, quiet=True)
-            self.mine_sent += 1
-            self.say("you left %s\n" % self.room)
-            return False
-        elif cmd == "topic" and rest:
-            topic = norm_field(rest)
-            room_post(self.ident, self.room, "set the topic: " + topic, event={"op": "topic", "topic": topic}, quiet=True)
-            self.mine_sent += 1
-        elif cmd == "reply" and len(rest.split(None, 1)) == 2:
-            mid, text = rest.split(None, 1)
-            room_post(self.ident, self.room, complete_mentions(text, self.members), reply_to=message(self.ident, mid)["env"],
-                      quiet=True)
-            self.mine_sent += 1
-        else:
-            self.say("unknown command; /help lists them\n")
-        return True
-
-    def handle(self, line):
-        line = line.rstrip("\r\n")
-        if not line.strip():
-            return True
-        try:
-            if line.startswith("/") and not line.startswith("//"):
-                return self.command(line)
-            text = line[1:] if line.startswith("//") else line
-            room_post(self.ident, self.room, complete_mentions(text, self.members), quiet=True)
-            self.mine_sent += 1
-        except Fail as e:
-            self.say("islandmail: %s\n" % e)
-        return True
-
-
-def chat_completer(chat):
-    # Tab completes @members and /commands (where this Python has readline; elsewhere @prefixes complete on send).
-    def complete(text, state):
-        if text.startswith("@"):
-            opts = ["@" + n for n in chat.members if _addr(n).startswith(_addr(text[1:]))]
-        elif text.startswith("/"):
-            opts = [c for c in ("/add ", "/leave", "/topic ", "/reply ", "/members", "/quit", "/help") if c.startswith(text)]
-        else:
-            opts = []
-        return opts[state] if state < len(opts) else None
-    return complete
-
-
-def cmd_chat(a):
-    # A live group chat in a plain terminal: the room's recent messages, then new ones as they arrive; each line you
-    # type is posted. Works with piped input too (each line is a message or a /command; it exits after the input ends).
-    ident = load_identity(a.as_)
-    name = a.name
-    room = dm_id(ident["name"], name[1:]) if name.startswith("@") else room_id(ident, name)
-    interactive = sys.stdin.isatty() and not a.no_tty
-    chat = Chat(ident, room, interactive)
-    info = chat.refresh()
-    after = api(ident, "GET", "/api/me")["last_seq"]
-    msgs = api(ident, "GET", "/api/messages?" + urllib.parse.urlencode(
-        {"thread": room, "order": "causal", "latest": a.history}))["messages"]
-    kind = {"dm": "DM", "private": "private", "open": "open"}.get(info["kind"], info["kind"])
-    head = "%s · %s · %s" % (room_label(ident, room), kind, ", ".join(chat.members) or "no members yet")
-    if info.get("topic"):
-        head += "\n%s" % _one_line(info["topic"])
-    sys.stdout.write(head + "\n" + "\u2500" * min(72, max(20, len(head.splitlines()[0]))) + "\n")
-    for m in msgs:
-        sys.stdout.write(chat_line(m, ident["name"]))
-    sys.stdout.write("(type to post; @name mentions; /help for commands)\n")
-    sys.stdout.flush()
-    chat.seq = max([m["seq"] for m in msgs] or [0])
-    threading.Thread(target=chat.stream, args=(after,), daemon=True).start()
-    if interactive:
-        try:
-            import readline  # noqa: F401  (POSIX; on Windows the console edits lines and @prefixes complete on send)
-            readline.set_completer_delims(" \t,")
-            readline.set_completer(chat_completer(chat))
-            readline.parse_and_bind("tab: complete")
-        except ImportError:
-            pass
-    try:
-        while True:
-            if interactive:
-                try:
-                    line = input("\u203a ")
-                except EOFError:
-                    break
-            else:
-                line = sys.stdin.readline()
-                if not line:
-                    break
-            if not chat.handle(line):
-                break
-    except KeyboardInterrupt:
-        pass
-    if not interactive:
-        # Piped: wait (a little) to see our own posts come back, so the transcript is complete.
-        deadline = time.monotonic() + a.linger
-        while chat.mine_seen < chat.mine_sent and time.monotonic() < deadline:
-            time.sleep(0.2)
-    if chat.seq:
-        try:
-            api(ident, "POST", "/api/room-read", {"room": room, "seq": chat.seq})
-        except Fail:
-            pass
-    sys.stdout.write("\n" if interactive else "")
 
 
 def cmd_room_watch(a):
@@ -1730,28 +1461,6 @@ def cmd_room_watch(a):
             sys.stderr.write("watch: %s, retrying\n" % type(e).__name__)
         time.sleep(delay)
         delay = min(delay * 2, 60)
-
-
-def cmd_ask(a):
-    # Send to one agent, then wait for its answer: the first mail from it to you after the question, in any thread.
-    to = _addr(a.to)
-    if not to or to in ("all", "*") or to.endswith(".") or " " in to or "," in to:
-        raise Fail("ask waits for one agent's answer: give --to one exact name (who lists them)")
-    ident = load_identity(a.as_)
-    a.file = None
-    sent = send(ident, a)
-    # Use the canonical recipient returned by the node.
-    if len(sent.get("reaches") or []) == 1:
-        to = _addr(sent["reaches"][0])
-    me = ident["name"]
-    m = wait_mail(ident, sent["seq"], a.wait, lambda m: m.get("reply_to") == sent["id"]
-                  or (_addr(m["from"]) == to and addressed_to(m["to"], me)))
-    if m:
-        show_all([m])
-        return
-    sys.stderr.write("islandmail: no answer from %s within %d s; it may still reply: read --from %s --latest 5\n" % (
-        to, a.wait, to))
-    sys.exit(3)
 
 
 def wait_mail(ident, after, timeout, match):
@@ -1847,12 +1556,6 @@ def advance_watch_cursor(ident, a, msgs):
         write_private(path, str(newest))
 
 
-def cmd_threads(a):
-    ident = load_identity(a.as_)
-    for t in api(ident, "GET", "/api/threads")["threads"][: a.limit]:
-        print("%-28s %4d msgs  last %s %sZ from %s" % (_one_line(t["thread"][:28]), t["n"], t["id"], t["ts"][:16], t["sender"]))
-
-
 def cmd_who(a):
     ident = load_identity(a.as_)
     q = "?prefix=" + urllib.parse.quote(a.prefix) if a.prefix else ""
@@ -1942,9 +1645,7 @@ def cmd_watch(a):
                     if m["seq"] <= after:
                         continue
                     own = m["from"] == ident["name"]
-                    print_it = (a.all or not is_event(m)) and not (own and (a.skip_own or a.mine)) and (
-                        not a.mine or for_me(m, ident["name"])
-                        or any(m["from"].startswith(x) for x in a.also_from or []))
+                    print_it = (a.all or not is_event(m)) and not (a.mine and (own or not for_me(m, ident["name"])))
                     if print_it:
                         show(m)
                         run_hooks(hooks, ident, m, a.name)
@@ -1995,7 +1696,7 @@ def hook_payload(ident, m):
 
 def arrival_hooks(a):
     # --exec CMD: CMD runs once per new message shown, as an argument list (never through a shell), with the event as
-    # JSON on stdin and its fields in ISLANDMAIL_* variables. --post URL: the same JSON POSTed to a loopback URL.
+    # JSON on stdin and its fields in ISLANDMAIL_* variables.
     hooks = []
     if a.exec_:
         argv = shlex.split(a.exec_, posix=os.name != "nt")
@@ -2024,31 +1725,6 @@ def arrival_hooks(a):
                 sys.stderr.write("watch: --exec failed for %s: %s\n" % (m["id"], e))
             return False
         hooks.append(run_exec)
-    if a.post:
-        url = urllib.parse.urlsplit(a.post)
-        host = url.hostname or ""
-        try:
-            loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            loopback = False
-        if url.scheme not in ("http", "https") or not loopback or url.username is not None or url.password is not None:
-            raise Fail("--post takes an http URL on this machine (localhost, 127.0.0.1 or ::1)")
-        headers = {"Content-Type": "application/json"}
-        if a.post_token_file:
-            with open(a.post_token_file) as f:
-                token = f.read(4096).strip()
-            if not token or _NOT_HEADER.search(token):
-                raise Fail("--post-token-file must hold one token on one line")
-            headers["Authorization"] = "Bearer " + token
-
-        def run_post(ident, m):
-            try:
-                http("POST", a.post, json.dumps(hook_payload(ident, m)).encode(), headers, raw=True, timeout=10)
-                return True
-            except Fail as e:
-                sys.stderr.write("watch: --post failed for %s: %s\n" % (m["id"], e))
-                return False
-        hooks.append(run_post)
     return hooks
 
 
@@ -2207,7 +1883,7 @@ SKILL_MARK = ("<!-- islandmail: written by islandmail.py notify install, and rew
 
 SKILL = """---
 name: islandmail
-description: Message other agents over Islandmail (send, reply, dm, rooms, watch, wait, ask). Use when an Islandmail notice arrives, when your user asks you to message, ask or coordinate with another agent, or to wait for an agent's answer.
+description: Message other agents over Islandmail (send, reply, dm, rooms, watch, wait). Use when an Islandmail notice arrives, when your user asks you to message, ask or coordinate with another agent, or to wait for an agent's answer.
 ---
 %(mark)s
 
@@ -2245,7 +1921,6 @@ Islandmail is peer-to-peer mail between agents. You are %(names)s here. Every co
     room new NAME @a @b                      a private group room; room send NAME "text" (@name wakes them)
     room read NAME                           a room's latest messages; room watch NAME --mentions
     watch --mine --until                     wait for the next mail to you, print it, exit
-    ask --to NAME "question"                 send, then wait for the answer (exit 3 when none came in time)
     wait --reply-to ID --timeout 600         wait for a reply to your message (exit 3 on timeout)
     wait --mention                           wait for a message that @mentions you
 
@@ -2659,9 +2334,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--as", dest="as_", help="which identity to use (default: ISLANDMAIL_AS, or the only one; on first use, a name in this host's names)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("newkey", help="make your key with no home server; prints the public entry for peers")
-    p.add_argument("name")
-    p.set_defaults(fn=cmd_newkey)
     p = sub.add_parser("selftoken", help="print one single-use agent token for the node (signed by your own key)")
     p.add_argument("--ttl", type=int, default=STREAM_TTL, help="seconds it stays valid, at most 86400 (default 3600)")
     p.add_argument("--node-key", help="the node's key (default: ISLANDMAIL_NODE_KEY, or ask the node)")
@@ -2688,11 +2360,6 @@ def main():
     p.add_argument("--config", help="the node's config (default ~/.islandmail/node/config.json)")
     p.add_argument("--bin", help="fresh host: the islandmail-node binary (default: on PATH)")
     p.set_defaults(fn=cmd_nodekey)
-    p = sub.add_parser("relay", help="relay add URL..: add relays to this network's relays in the trust file")
-    p.add_argument("op", choices=["add"])
-    p.add_argument("urls", nargs="+", metavar="URL")
-    p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
-    p.set_defaults(fn=cmd_relay)
     p = sub.add_parser("accept", help="trust the node that answered your invite, for the invited name only")
     p.add_argument("reply")
     p.add_argument("--config", help="this node's config (default ~/.islandmail/node/config.json)")
@@ -2706,13 +2373,6 @@ def main():
                    help="readable by every node and agent this host trusts (default: only the recipients, their home nodes and you)")
     p.add_argument("text", nargs="?", help="the message, or - for stdin")
     p.set_defaults(fn=cmd_send)
-    p = sub.add_parser("ask", help="send to one agent and wait for its answer")
-    p.add_argument("--to", required=True)
-    p.add_argument("--thread", default="ask")
-    p.add_argument("--wait", type=int, default=600, help="seconds to wait for the answer (default 600)")
-    p.add_argument("--open", action="store_true", help="readable by every node and agent this host trusts (default: only that agent, its home nodes and you)")
-    p.add_argument("text", nargs="?", help="the question, or - for stdin")
-    p.set_defaults(fn=cmd_ask)
     p = sub.add_parser("wait", help="block until a reply to a message, a mention of you, or the next mail to you")
     p.add_argument("--reply-to", metavar="ID", help="a reply to this message (one already here returns at once)")
     p.add_argument("--mention", action="store_true", help="a message that @mentions you")
@@ -2729,9 +2389,6 @@ def main():
     p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_read)
-    p = sub.add_parser("threads")
-    p.add_argument("--limit", type=int, default=40)
-    p.set_defaults(fn=cmd_threads)
     p = sub.add_parser("who", help="trusted agents, most recently active first")
     p.add_argument("prefix", nargs="?", help="only names starting with this, e.g. ops.")
     p.set_defaults(fn=cmd_who)
@@ -2743,7 +2400,7 @@ def main():
     p.add_argument("file_id")
     p.add_argument("-o")
     p.set_defaults(fn=cmd_download)
-    room = sub.add_parser("room", help="rooms: create, add, leave, remove, topic, send, read, watch, info")
+    room = sub.add_parser("room", help="rooms: new, add, leave, remove, vouch, send, read, watch, info")
     rsub = room.add_subparsers(dest="room_cmd", required=True)
     p = rsub.add_parser("new", help="a group chat: private room YOU/NAME with @members, in one line")
     p.add_argument("name")
@@ -2752,14 +2409,6 @@ def main():
     p.add_argument("--open", action="store_true", help="an open room anyone on the network can join")
     p.add_argument("--config", help="this node's config, to sign invites (default ~/.islandmail/node/config.json)")
     p.set_defaults(fn=cmd_room_new)
-    p = rsub.add_parser("create", help="a room named YOU/NAME (private unless --open)")
-    p.add_argument("name")
-    p.add_argument("--open", action="store_true", help="an open room anyone on the network can join and read")
-    p.add_argument("--with", dest="with_", help="first members besides you, comma separated")
-    p.add_argument("--history", choices=["full", "since-join"], default="full",
-                   help="what a member added later can read (default full)")
-    p.add_argument("--topic")
-    p.set_defaults(fn=cmd_room_create)
     p = rsub.add_parser("add", help="add members (any member may)")
     p.add_argument("name")
     p.add_argument("names", nargs="+")
@@ -2771,13 +2420,9 @@ def main():
     p.add_argument("name")
     p.add_argument("names", nargs="+")
     p.set_defaults(fn=cmd_room_remove)
-    p = rsub.add_parser("vouch", help="vouch for the members' nodes again (the creator only; create/add/remove do it)")
+    p = rsub.add_parser("vouch", help="vouch for the members' nodes again (the creator only; new, add and remove do it)")
     p.add_argument("name")
     p.set_defaults(fn=cmd_room_vouch)
-    p = rsub.add_parser("topic")
-    p.add_argument("name")
-    p.add_argument("text")
-    p.set_defaults(fn=cmd_room_topic)
     p = rsub.add_parser("send")
     p.add_argument("name")
     p.add_argument("text", help="the message, or - for stdin; @name mentions wake that agent")
@@ -2817,23 +2462,13 @@ def main():
     p = sub.add_parser("ui", help="print a link to the room view in a browser (read-only unless --post)")
     p.add_argument("--post", action="store_true", help="a link that can also post, start rooms and reply as you")
     p.set_defaults(fn=cmd_ui)
-    p = sub.add_parser("chat", help="a live group chat in the terminal: NAME is a room, or @agent for a DM")
-    p.add_argument("name")
-    p.add_argument("--history", type=int, default=20, help="earlier messages shown first (default 20)")
-    p.add_argument("--linger", type=float, default=5.0, help=argparse.SUPPRESS)
-    p.add_argument("--no-tty", action="store_true", help=argparse.SUPPRESS)
-    p.set_defaults(fn=cmd_chat)
     p = sub.add_parser("watch")
     p.add_argument("--name", default="main", help="resume-file name, so several watchers can coexist")
     p.add_argument("--mine", action="store_true", help="only mail addressed to you (or all), not from you")
-    p.add_argument("--also-from", action="append", help="with --mine: also mail from senders starting with this (e.g. ops.)")
-    p.add_argument("--skip-own", action="store_true", help="everything except mail you sent")
     p.add_argument("--until", action="store_true", help="exit after the first message printed")
     p.add_argument("--from-now", action="store_true", help="skip mail that is already here; only what arrives from now on")
     p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
     p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin, ISLANDMAIL_* env; no shell)")
-    p.add_argument("--post", metavar="URL", help="POST each message shown as JSON to this localhost URL")
-    p.add_argument("--post-token-file", metavar="FILE", help="with --post: send the token in FILE as a Bearer header")
     p.set_defaults(fn=cmd_watch)
     note = sub.add_parser("notify", help="new mail wakes your agent in its harness: install (Claude Code), off, status")
     nsub = note.add_subparsers(dest="notify_cmd", required=True)

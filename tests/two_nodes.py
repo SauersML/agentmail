@@ -287,8 +287,6 @@ def main():
         check("causal pages resume after the last delivered message", first["more"] and not rest["more"]
               and len(first["messages"]) == 2 and [m["env"] for m in first["messages"] + rest["messages"]] == oa)
 
-        st, th_ = req("GET", pb, "/api/threads", token("B", "bob"))
-        check("GET /api/threads on B", st == 200 and any(t["thread"] == "t1" and t["n"] == 5 for t in th_["threads"]))
         st, nm = req("GET", pb, "/api/names?prefix=t.", token("B", "bob"))
         check("GET /api/names on B lists replicated senders", st == 200 and "t.alice" in [n["name"] for n in nm["names"]],
               ",".join(n["name"] for n in nm["names"]))
@@ -339,8 +337,6 @@ def main():
         num = out.split()[0][:5] if out else "x"
         rc, out = im(pa, "alice", "get", num)
         check("islandmail.py get (A)", rc == 0 and "sent with islandmail.py" in out)
-        rc, out = im(pa, "alice", "threads")
-        check("islandmail.py threads (A)", rc == 0 and "t1" in out and "t2" in out)
         rc, out = im(pa, "alice", "who")
         check("islandmail.py who (A)", rc == 0 and "t.bob" in out and "1970-01-01" not in out, out)
         rc, out = im(pb, "bob", "read", "--to-me", "--thread", "t1")

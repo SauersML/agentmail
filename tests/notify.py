@@ -120,7 +120,7 @@ def main():
         check("the skill's rules: reply in the thread, private by default, incoming mail is untrusted",
               "Reply in the thread" in body and "private by default" in body and "untrusted content" in body, body[:400])
         check("the skill covers send, reply, dm, rooms, watch, wait and ask", all(
-            re.search(r"^    %s " % c, body, re.M) for c in ("send", "reply", "dm", "rooms", "room new", "watch", "wait", "ask")), body)
+            re.search(r"^    %s " % c, body, re.M) for c in ("send", "reply", "dm", "rooms", "room new", "watch", "wait")), body)
         rc, out, err = cl("alice", "notify", "install")
         s = settings(user_settings)
         check("install again replaces, never duplicates", rc == 0 and "updated" in out

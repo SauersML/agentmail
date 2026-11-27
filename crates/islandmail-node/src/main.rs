@@ -31,7 +31,7 @@ const IDENTITIES_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const USAGE: &str = "usage:\n  islandmail-node run CONFIG.json\n  islandmail-node keygen SEED_FILE\n  islandmail-node pubkey SEED_FILE\n  \
      islandmail-node network-id\n  islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  islandmail-node revoke CONFIG.json NAME\n  islandmail-node invite-info INVITE\n  \
-     islandmail-node relay-allowlist TRUST_FILE   (the iroh-relay access list for the trust file's nodes)\n  islandmail-node --version";
+     islandmail-node --version";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -81,11 +81,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("revoke") if args.len() == 3 => revoke(Path::new(&args[1]), &args[2]),
-        Some("relay-allowlist") if args.len() == 2 => {
-            let list = config::Config::parse_members(&std::fs::read(&args[1]).with_context(|| format!("reading {}", args[1]))?)?;
-            print!("{}", net::relay_allowlist(&list));
-            Ok(())
-        }
+
         Some("--version" | "-V" | "version") => {
             println!("islandmail-node {}", env!("CARGO_PKG_VERSION"));
             Ok(())
