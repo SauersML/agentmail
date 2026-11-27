@@ -402,7 +402,7 @@ impl Conn {
                 let room = params["channelId"].as_str().and_then(|c| c.strip_prefix("room:")).unwrap_or("").to_string();
                 let text: Vec<&str> = params["content"].as_array().map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect())
                     .unwrap_or_default();
-                match self.room_send(&room, &text.join("\n"), params["replyTo"].as_str()) {
+                match self.node.room_send(&self.who, &room, &text.join("\n"), params["replyTo"].as_str(), None) {
                     Ok(row) => reply(self, json!({ "delivered": true, "messageId": islandmail_core::short_id(&row.env_id) })),
                     Err(e) => fail(self, -32603, e.message),
                 }
@@ -431,12 +431,11 @@ impl Conn {
         let me = &self.who;
         match name {
             "send" => {
-                let body = json!({ "to": args["to"], "thread": args["thread"], "text": args["text"], "mode": args.get("mode").cloned().unwrap_or(Value::Null) });
-                let mut body = body;
-                if body["mode"].is_null() {
-                    body.as_object_mut().unwrap().remove("mode");
+                let mut body = json!({ "to": args["to"], "thread": args["thread"], "text": args["text"] });
+                if let Some(mode) = args.get("mode").filter(|m| !m.is_null()) {
+                    body["mode"] = mode.clone();
                 }
-                let p = n.post(&self.who, &body)?;
+                let p = n.post(me, &body)?;
                 let m = &p.row;
                 if p.repeated {
                     return Ok(format!(
@@ -543,12 +542,12 @@ impl Conn {
             "room_send" => {
                 let room = args["room"].as_str().unwrap_or("").to_string();
                 let reply_to = args["reply_to"].as_str();
-                let row = self.room_send(&room, args["text"].as_str().unwrap_or(""), reply_to)?;
+                let row = n.room_send(me, &room, args["text"].as_str().unwrap_or(""), reply_to, None)?;
                 Ok(format!("Posted {} in room {}.", islandmail_core::short_id(&row.env_id), room))
             }
             "get" => {
                 let id = args["id"].as_str().map(String::from).unwrap_or_else(|| args["id"].to_string());
-                Ok(self.node.fmt(&crate::api::resolve(n, &id, me)?, 100_000))
+                Ok(n.fmt_all(&[crate::api::resolve(n, &id, me)?], 100_000))
             }
             other => Err(ApiError::new(400, format!("no tool named {}", other.chars().take(80).collect::<String>()))),
         }
@@ -571,11 +570,6 @@ impl Conn {
 
     fn channels_allowed(&self) -> bool {
         self.mcpl && self.grant.as_ref().is_some_and(|g| ROOM_CAPS.iter().all(|c| capability_in(g, c)))
-    }
-
-    /// Post as the connected agent in a room (the node signs: the agent's identity file is in identities_dir).
-    fn room_send(&self, room: &str, text: &str, reply_to: Option<&str>) -> Result<Row, ApiError> {
-        self.node.room_send(&self.who, room, text, reply_to, None)
     }
 
     /// The channel descriptor of a room (from `Node::rooms`).
@@ -661,7 +655,7 @@ impl Conn {
         let (tags, meta) = self.tags(r);
         json!({ "channelId": format!("room:{}", r.thread), "messageId": islandmail_core::short_id(&r.env_id),
                 "author": { "id": r.sender_sub, "name": r.sender }, "timestamp": r.ts,
-                "content": [{ "type": "text", "text": self.node.fmt(r, PUSH_TEXT) }], "metadata": meta, "tags": tags })
+                "content": [{ "type": "text", "text": self.node.fmt_all(std::slice::from_ref(r), PUSH_TEXT) }], "metadata": meta, "tags": tags })
     }
 
     /// Deliver the next message after the cursor: on a channel the host has open, every room message (ambient
@@ -709,7 +703,7 @@ impl Conn {
     fn push(&mut self, r: &Row) {
         let event_id = format!("mail-{}", r.id);
         let rpc = format!("push-{event_id}-{}", islandmail_core::b64u(&islandmail_core::random_bytes::<6>()));
-        let text = self.node.fmt(r, PUSH_TEXT);
+        let text = self.node.fmt_all(std::slice::from_ref(r), PUSH_TEXT);
         let (tags, meta) = self.tags(r);
         let mut o = json!({ "server": "islandmail", "messageId": islandmail_core::short_id(&r.env_id), "seq": r.id, "thread": r.thread, "from": r.sender,
                             "to": r.recipient, "verified": true,

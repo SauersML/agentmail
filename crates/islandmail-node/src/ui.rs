@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use islandmail_core::now_millis;
 use serde_json::json;
 
-use crate::api::{json_resp, messages_json, params, AppState};
+use crate::api::{blocking, json_resp, messages_json, params, parse_json, AppState};
 use crate::node::{ApiError, Caller};
 use crate::store::{Query, MAX_TEXT};
 
@@ -105,30 +105,25 @@ pub async fn me(State(s): State<AppState>, Viewer(who): Viewer, headers: axum::h
                          "expires": islandmail_core::ts_from_millis(who.exp_ms), "post": post, "agents": agents }), 200))
 }
 
-fn body_json(body: &[u8]) -> Result<serde_json::Value, ApiError> {
-    serde_json::from_slice(body).map_err(|_| ApiError::new(400, "body is not valid JSON"))
-}
-
 /// POST /ui/api/messages {room, text, reply_to?}: post in a room as the key's agent.
 pub async fn post(State(s): State<AppState>, Poster(who): Poster, body: axum::body::Bytes) -> Result<Response, ApiError> {
-    let v = body_json(&body)?;
+    let v = parse_json(&body)?;
     let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?.to_string();
     let text = v["text"].as_str().unwrap_or("").to_string();
     if text.trim().is_empty() {
         return Err(ApiError::new(400, "nothing to send"));
     }
     let reply_to = v["reply_to"].as_str().map(String::from);
-    let node = s.node.clone();
-    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, ApiError> {
-        let row = node.room_send(&who, &room, &text, reply_to.as_deref(), None)?;
-        Ok(json!({ "message": messages_json(&node, &[row], &who).pop() }))
-    }).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let out = blocking(&s.node, move |n| {
+        let row = n.room_send(&who, &room, &text, reply_to.as_deref(), None)?;
+        Ok(json!({ "message": messages_json(n, &[row], &who).pop() }))
+    }).await?;
     Ok(json_resp(out, 201))
 }
 
 /// POST /ui/api/rooms/new {name, members: [..], topic?}: a private room NAME of the key's agent with those members.
 pub async fn new_room(State(s): State<AppState>, Poster(who): Poster, body: axum::body::Bytes) -> Result<Response, ApiError> {
-    let v = body_json(&body)?;
+    let v = parse_json(&body)?;
     let name = v["name"].as_str().unwrap_or("").to_string();
     let members: Vec<String> = match &v["members"] {
         serde_json::Value::Array(a) => a.iter().filter_map(|m| m.as_str().map(String::from)).collect(),
@@ -136,15 +131,13 @@ pub async fn new_room(State(s): State<AppState>, Poster(who): Poster, body: axum
         _ => Vec::new(),
     };
     let topic = v["topic"].as_str().unwrap_or("").to_string();
-    let node = s.node.clone();
-    let (room, unknown) = tokio::task::spawn_blocking(move || node.new_room(&who, &name, &members, &topic))
-        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let (room, unknown) = blocking(&s.node, move |n| n.new_room(&who, &name, &members, &topic)).await?;
     Ok(json_resp(json!({ "room": room, "unknown": unknown }), 201))
 }
 
 /// POST /ui/api/read {room, seq}: the viewer has seen the room up to `seq` (clears its unread count).
 pub async fn mark_read(State(s): State<AppState>, Viewer(who): Viewer, body: axum::body::Bytes) -> Result<Response, ApiError> {
-    let v = body_json(&body)?;
+    let v = parse_json(&body)?;
     let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?;
     let seq = v["seq"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "seq is required"))?;
     s.node.store.mark_read(&who, room, seq)?;
@@ -152,8 +145,7 @@ pub async fn mark_read(State(s): State<AppState>, Viewer(who): Viewer, body: axu
 }
 
 pub async fn rooms(State(s): State<AppState>, Viewer(who): Viewer) -> Result<Response, ApiError> {
-    let node = s.node.clone();
-    let rooms = tokio::task::spawn_blocking(move || node.rooms(&who)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let rooms = blocking(&s.node, move |n| n.rooms(&who)).await?;
     Ok(json_resp(json!({ "rooms": rooms }), 200))
 }
 
@@ -171,17 +163,11 @@ pub async fn messages(State(s): State<AppState>, Viewer(who): Viewer, RawQuery(r
         (None, Some(after)) => Query { after: Some(after), limit: Some(limit), ..Default::default() },
         (None, None) => Query { before: num("before"), latest: Some(limit), ..Default::default() },
     };
-    let node = s.node.clone();
-    let out = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, ApiError> {
-        let (rows, more) = if since.is_some() { node.store.query(&q, &who, MAX_TEXT)? }
-                           else { node.store.thread_causal(&room, &who, &q, MAX_TEXT)? };
-        let senders = node.store.room_senders(&room)?;
-        let info = node.room_info(&who, &room, &senders)?;
-        if crate::api::room_hidden(&info, &who) {
-            return Err(ApiError::new(404, node.room_absent(&who.name, &room)));
-        }
-        Ok(json!({ "room": info, "messages": messages_json(&node, &rows, &who), "more": more }))
-    }).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let out = blocking(&s.node, move |n| {
+        let (rows, more) = if since.is_some() { n.store.query(&q, &who, MAX_TEXT)? }
+                           else { n.store.thread_causal(&room, &who, &q, MAX_TEXT)? };
+        Ok(json!({ "room": n.room_view(&who, &room)?, "messages": messages_json(n, &rows, &who), "more": more }))
+    }).await?;
     Ok(json_resp(out, 200))
 }
 
@@ -190,10 +176,7 @@ pub async fn file(State(s): State<AppState>, Viewer(who): Viewer, axum::extract:
     if !islandmail_core::envelope::is_id(&id) {
         return Err(ApiError::new(404, "no such file"));
     }
-    let node = s.node.clone();
-    let (f, bytes) = tokio::task::spawn_blocking(move || node.download(&id, &who))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let (f, bytes) = blocking(&s.node, move |n| n.download(&id, &who)).await?;
     // Served only to the page's fetch (blob URLs), never rendered as a document.
     let mut r = (axum::http::StatusCode::OK, bytes).into_response();
     let h = r.headers_mut();

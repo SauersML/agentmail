@@ -88,8 +88,7 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// The Host header values this node answers to: the loopback names with the API's port (and the listen address as
-/// written). A page whose
-/// own name a DNS rebinding pointed at 127.0.0.1 sends that name, so it reads nothing, GETs included.
+/// written). A page whose own name a DNS rebinding pointed at 127.0.0.1 sends that name, so it reads nothing.
 pub fn allowed_hosts(listen: std::net::SocketAddr) -> Vec<String> {
     let port = listen.port();
     let mut out: Vec<String> = ["127.0.0.1", "localhost", "[::1]"].iter().map(|h| format!("{h}:{port}")).collect();
@@ -228,7 +227,6 @@ pub fn params(raw: &Option<String>) -> HashMap<String, String> {
     m
 }
 
-/// Parse a non-negative numeric query parameter.
 fn int_param(p: &HashMap<String, String>, name: &str) -> Result<Option<i64>, ApiError> {
     let Some(v) = p.get(name) else { return Ok(None) };
     let v = v.trim();
@@ -326,32 +324,44 @@ async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQu
     Ok(json_resp(json!({ "keys": keys.iter().map(|k| islandmail_core::b64u(k)).collect::<Vec<_>>(), "node_encryption_keys": node_keys }), 200))
 }
 
-/// The unauthenticated POSTs take JSON only (no simple cross-site form posts) and a loopback Host (no DNS rebinding).
+/// Run `f` on the blocking pool (it touches the store).
+pub async fn blocking<T: Send + 'static>(node: &Arc<Node>, f: impl FnOnce(&Node) -> Result<T, ApiError> + Send + 'static)
+                                        -> Result<T, ApiError> {
+    let node = node.clone();
+    tokio::task::spawn_blocking(move || f(&node)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))?
+}
+
+pub fn parse_json(body: &[u8]) -> Result<Value, ApiError> {
+    serde_json::from_slice(body).map_err(|_| ApiError::new(400, "body is not valid JSON"))
+}
+
+/// A JSON object body of at most `max` bytes, sent as JSON (no simple cross-site form posts).
+fn json_object(headers: &HeaderMap, body: &[u8], max: usize) -> Result<Value, ApiError> {
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    if !ct.starts_with("application/json") {
+        return Err(ApiError::new(415, "send Content-Type: application/json"));
+    }
+    if body.len() > max {
+        return Err(ApiError::new(413, format!("body is over {max} bytes")));
+    }
+    Some(parse_json(body)?).filter(|v| v.is_object()).ok_or_else(|| ApiError::new(400, "body must be a JSON object"))
+}
+
+/// The unauthenticated POSTs also take a loopback Host only (no DNS rebinding).
 fn local_json(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     let bare = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
     if !["127.0.0.1", "localhost", "[::1]"].contains(&bare) {
         return Err(ApiError::new(403, "this endpoint answers loopback requests only"));
     }
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-    if !ct.starts_with("application/json") {
-        return Err(ApiError::new(415, "send Content-Type: application/json"));
-    }
-    if body.len() > 16 * 1024 {
-        return Err(ApiError::new(413, "body is over 16384 bytes"));
-    }
-    serde_json::from_slice::<Value>(body).ok().filter(|v| v.is_object())
-        .ok_or_else(|| ApiError::new(400, "body must be a JSON object"))
+    json_object(headers, body, 16 * 1024)
 }
 
 /// POST /api/agents {name, key, ts, sig}: certify an agent of this host (proof of key; no token, since the agent
 /// has no certificate yet). 201 new, 200 already certified with this key.
 async fn certify(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
-    let node = s.node.clone();
-    let (status, out) = tokio::task::spawn_blocking(move || node.certify(&v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let (status, out) = blocking(&s.node, move |n| n.certify(&v)).await?;
     Ok(json_resp(out, status))
 }
 
@@ -369,10 +379,7 @@ async fn agents(State(s): State<AppState>, _: Caller) -> Result<Response, ApiErr
 /// POST /api/revocations {name, ts, sig}, signed with the node key (`islandmail-node revoke`).
 async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
-    let node = s.node.clone();
-    let revoked = tokio::task::spawn_blocking(move || node.revoke(&v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let revoked = blocking(&s.node, move |n| n.revoke(&v)).await?;
     Ok(json_resp(json!({ "revoked": revoked }), 200))
 }
 
@@ -380,11 +387,7 @@ async fn revoke(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> R
 async fn owner_step(State(s): State<AppState>, headers: HeaderMap, body: Bytes,
                     step: fn(&Node, &Value) -> Result<Value, ApiError>) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
-    let node = s.node.clone();
-    let out = tokio::task::spawn_blocking(move || step(&node, &v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    Ok(json_resp(out, 200))
+    Ok(json_resp(blocking(&s.node, move |n| step(n, &v)).await?, 200))
 }
 
 /// POST /api/joins {invite, ts, sig, wait_s?}: check the invite, present this node to the inviting node (up to wait_s,
@@ -392,14 +395,9 @@ async fn owner_step(State(s): State<AppState>, headers: HeaderMap, body: Bytes,
 async fn join(State(s): State<AppState>, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     let v = local_json(&headers, &body)?;
     let wait = Duration::from_secs(v.get("wait_s").and_then(|x| x.as_u64()).unwrap_or(60).clamp(1, 120));
-    let node = s.node.clone();
-    let plan = tokio::task::spawn_blocking(move || crate::invite::join_prepare(&node, &v))
-        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let plan = blocking(&s.node, move |n| crate::invite::join_prepare(n, &v)).await?;
     let outcome = crate::net::dial_join(&s.node, &plan.inv.node, &plan.reply, wait).await;
-    let node = s.node.clone();
-    let out = tokio::task::spawn_blocking(move || crate::invite::join_finish(&node, plan, outcome))
-        .await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
-    Ok(json_resp(out, 200))
+    Ok(json_resp(blocking(&s.node, move |n| crate::invite::join_finish(n, plan, outcome)).await?, 200))
 }
 
 async fn joined(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
@@ -412,12 +410,9 @@ async fn joined_seen(State(s): State<AppState>, who: Caller, body: Bytes) -> Res
 }
 
 async fn me(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
-    let island = s.node.members.read().unwrap().network.clone();
-    Ok(json_resp(
-        json!({ "name": who.name, "sub": who.sub, "island": island, "last_seq": s.node.store.last_id()?,
-                "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "members_seq": s.node.members_seq() }),
-        200,
-    ))
+    let (island, seq) = { let m = s.node.members.read().unwrap(); (m.network.clone(), m.seq) };
+    Ok(json_resp(json!({ "name": who.name, "sub": who.sub, "island": island, "last_seq": s.node.store.last_id()?,
+                         "node": islandmail_core::keys::fmt_key(&s.node.seed.public()), "members_seq": seq }), 200))
 }
 
 async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
@@ -439,28 +434,13 @@ async fn list(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
 }
 
 async fn post(State(s): State<AppState>, who: Caller, headers: HeaderMap, body: Bytes) -> Result<Response, ApiError> {
-    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
-    if !ct.starts_with("application/json") {
-        return Err(ApiError::new(415, "send Content-Type: application/json"));
-    }
-    if body.len() > 1024 * 1024 {
-        return Err(ApiError::new(413, "body is over 1048576 bytes"));
-    }
-    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
-    if !v.is_object() {
-        return Err(ApiError::new(400, "body must be a JSON object"));
-    }
-    let node = s.node.clone();
-    let p = tokio::task::spawn_blocking(move || node.post(&who, &v))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let v = json_object(&headers, &body, 1024 * 1024)?;
+    let p = blocking(&s.node, move |n| n.post(&who, &v)).await?;
     let mut out = json!({ "message": p.row.to_message(), "reaches": p.reaches });
     if p.repeated {
         out["repeated"] = json!(true);
-        Ok(json_resp(out, 200))
-    } else {
-        Ok(json_resp(out, 201))
     }
+    Ok(json_resp(out, if p.repeated { 200 } else { 201 }))
 }
 
 /// Messages as clients see them; a reply carries a short quote of the message it answers, when the viewer can see it.
@@ -496,36 +476,20 @@ pub fn resolve(node: &Node, id: &str, who: &Caller) -> Result<crate::store::Row,
 }
 
 async fn rooms(State(s): State<AppState>, who: Caller) -> Result<Response, ApiError> {
-    let node = s.node.clone();
-    let rooms = tokio::task::spawn_blocking(move || node.rooms(&who)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let rooms = blocking(&s.node, move |n| n.rooms(&who)).await?;
     Ok(json_resp(json!({ "rooms": rooms }), 200))
 }
 
 async fn room(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     let id = p.get("id").ok_or_else(|| ApiError::new(400, "missing id"))?;
-    let senders = s.node.store.room_senders(id)?;
-    let info = s.node.room_info(&who, id, &senders)?;
-    if room_hidden(&info, &who) {
-        return Err(ApiError::new(404, s.node.room_absent(&who.name, id)));
-    }
-    Ok(json_resp(json!({ "room": info }), 200))
-}
-
-/// An undiscoverable private room: only a member (or a former one) learns that it exists, its members or its topic.
-/// The node folds the events it can read for any of its agents, so every view of `room_info` must ask this first.
-pub fn room_hidden(info: &Value, who: &Caller) -> bool {
-    let me = islandmail_core::addr::norm(&who.name);
-    let private = info["kind"] != "open";
-    let known = info["member"] == true || info["former"].as_array().is_some_and(|f| f.iter().any(|n| n.as_str() == Some(me.as_str())));
-    (private && !known) || info["created"] == false
+    Ok(json_resp(json!({ "room": s.node.room_view(&who, id)? }), 200))
 }
 
 async fn room_keys(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -> Result<Response, ApiError> {
     let p = params(&raw);
     let id = p.get("room").ok_or_else(|| ApiError::new(400, "missing room"))?.clone();
-    let node = s.node.clone();
-    let keys = tokio::task::spawn_blocking(move || node.room_keys(&who, &id)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let keys = blocking(&s.node, move |n| n.room_keys(&who, &id)).await?;
     Ok(json_resp(json!({ "keys": keys }), 200))
 }
 
@@ -537,14 +501,13 @@ async fn room_vouch(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQu
     if !islandmail_core::room::creator_of(&id).is_some_and(|c| islandmail_core::addr::same(c, &who.name)) {
         return Err(ApiError::new(403, "only the room's creator vouches for its members"));
     }
-    let node = s.node.clone();
-    let members = tokio::task::spawn_blocking(move || node.vouch_entries(&id)).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let members = blocking(&s.node, move |n| n.vouch_entries(&id)).await?;
     Ok(json_resp(json!({ "members": members }), 200))
 }
 
 /// POST /api/room-read {room, seq}: the caller has read the room up to local seq `seq`.
 async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
-    let v: Value = serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?;
+    let v = parse_json(&body)?;
     let room = v["room"].as_str().ok_or_else(|| ApiError::new(400, "room is required"))?;
     let id = v["seq"].as_i64().filter(|&i| i >= 0).ok_or_else(|| ApiError::new(400, "seq is required"))?;
     s.node.store.mark_read(&who, room, id)?;
@@ -555,9 +518,7 @@ async fn room_read(State(s): State<AppState>, who: Caller, body: Bytes) -> Resul
 /// `{"post": true, "seed": HEX}` lends the node the caller's agent key so the page can post as the caller: it lives only
 /// in `Node::lent` (memory, never written to disk or logged; `Seed` does not print) until the view key expires.
 async fn ui_session(State(s): State<AppState>, who: Caller, body: Bytes) -> Result<Response, ApiError> {
-    let v: Value = if body.is_empty() { json!({}) } else {
-        serde_json::from_slice(&body).map_err(|_| ApiError::new(400, "body is not valid JSON"))?
-    };
+    let v = if body.is_empty() { json!({}) } else { parse_json(&body)? };
     let post = v["post"] == json!(true);
     let seed = if post {
         let hex = v["seed"].as_str().ok_or_else(|| ApiError::new(400, "a posting key needs the agent's seed"))?;
@@ -587,10 +548,7 @@ async fn upload(
     let p = params(&raw);
     let name = crate::node::file_name(p.get("name").map(|s| s.as_str()));
     let ty = crate::node::mime_type(headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()));
-    let node = s.node.clone();
-    let f = tokio::task::spawn_blocking(move || node.upload(&who, &name, &ty, &body))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let f = blocking(&s.node, move |n| n.upload(&who, &name, &ty, &body)).await?;
     Ok(json_resp(json!({ "file": f }), 201))
 }
 
@@ -605,10 +563,7 @@ async fn download(
     if !islandmail_core::envelope::is_id(&id) {
         return Err(ApiError::new(404, "no such file"));
     }
-    let node = s.node.clone();
-    let (f, bytes) = tokio::task::spawn_blocking(move || node.download(&id, &who))
-        .await
-        .map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;
+    let (f, bytes) = blocking(&s.node, move |n| n.download(&id, &who)).await?;
     let ty = f["type"].as_str().unwrap_or("application/octet-stream").to_string();
     let name = f["name"].as_str().unwrap_or("file").to_string();
     let inline = INLINE_TYPES.contains(&ty.as_str()) && params(&raw).get("download").map(|s| s.as_str()) != Some("1");
