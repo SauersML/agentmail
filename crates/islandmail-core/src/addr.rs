@@ -13,7 +13,6 @@ fn items(to: &str) -> impl Iterator<Item = String> + '_ {
     to.split(|c: char| c == ',' || c.is_whitespace()).map(norm).filter(|s| !s.is_empty())
 }
 
-/// Whether mail to `to` reaches an agent known by any of `names`.
 pub fn addressed_to(to: &str, names: &[&str]) -> bool {
     let ns: Vec<String> = names.iter().map(|n| norm(n)).collect();
     items(to).any(|i| i == "all" || i == "*" || ns.iter().any(|n| *n == i || (i.ends_with('.') && n.starts_with(&i))))

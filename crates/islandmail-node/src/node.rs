@@ -21,7 +21,6 @@ pub const MAX_FIELD: usize = 120;
 const REPEAT_MS: i64 = 10 * 60 * 1000;
 const RATE_WINDOW_MS: i64 = 3_600_000;
 
-/// An HTTP-style error: status and message, for API clients.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
@@ -66,7 +65,6 @@ pub struct Posted {
 pub struct Opts {
     /// Held identities (identities_dir), re-read while the node runs (Node::set_identities).
     pub identities: RwLock<Vec<(String, Seed)>>,
-    /// Base URL written into attachment links.
     pub public_url: String,
     /// The trust file this node may edit for invite, join and accept (none in unit tests).
     pub members_file: Option<std::path::PathBuf>,
@@ -344,7 +342,6 @@ impl Node {
         })
     }
 
-    /// The caller's entry in the roster.
     fn agent_of(&self, agents: &[Agent], who: &Caller) -> Result<Agent, ApiError> {
         parse_key(&who.key).ok().and_then(|k| members::find(agents, &who.name, &k)).filter(|a| a.sub == who.sub).cloned()
             .ok_or_else(|| ApiError::new(401, "session expired or membership changed"))
@@ -1149,7 +1146,6 @@ pub fn clean_text(v: Option<&Value>, allow_empty: bool) -> Result<String, ApiErr
 }
 
 impl Node {
-    /// The held identities as they are now.
     pub fn held(&self) -> Vec<(String, Seed)> {
         self.opts.identities.read().unwrap().clone()
     }
@@ -1277,7 +1273,6 @@ impl Node {
         Ok(keys.len())
     }
 
-    /// Where a post in `room` by `from` goes, with an optional membership event.
     pub fn room_plan(&self, room: &str, from: &str, event: Option<&islandmail_core::room::Event>, members: &MemberList,
                      agents: &[Agent]) -> Result<Plan, ApiError> {
         let state = self.room_state(room)?;
@@ -1765,7 +1760,6 @@ mod tests {
         let (rows, _) = node.store.query(&crate::store::Query::default(), &who, MAX_TEXT).unwrap();
         assert_eq!(rows.len(), 1);
         // The same signature in another base64 spelling is refused outright.
-        // The same signature in another base64 spelling is refused outright.
         let padded = seal(vec![], format!("{sig}=="));
         assert!(node.ingest(padded).unwrap_err().to_string().contains("canonical"));
     }
@@ -1909,7 +1903,6 @@ mod tests {
         let mallory = Seed::generate();
         let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "x", "signed": signed(&_l, &mallory, "all", "t", "x", &[], &ts) }));
         assert_eq!(bad.err().unwrap().status, 401);
-        // Old timestamps are refused.
         let old = ts_from_millis(now_millis() - 3_600_000);
         let bad = node.post(&who, &json!({ "to": "all", "mode": "members", "thread": "t", "text": "y", "signed": signed(&_l, &alice, "all", "t", "y", &[], &old) }));
         assert_eq!(bad.err().unwrap().status, 400);

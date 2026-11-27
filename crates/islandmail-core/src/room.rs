@@ -214,7 +214,6 @@ pub fn dm_id(a: &str, b: &str) -> String {
     format!("dm:{x}+{y}")
 }
 
-/// The two names of a DM room id.
 pub fn dm_pair(id: &str) -> Option<(String, String)> {
     let (a, b) = id.strip_prefix("dm:")?.split_once('+')?;
     (crate::cert::valid_name(a) && crate::cert::valid_name(b) && dm_id(a, b) == id).then(|| (a.to_string(), b.to_string()))

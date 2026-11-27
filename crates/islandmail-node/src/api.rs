@@ -107,7 +107,6 @@ pub fn host_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
     !host.is_empty() && allowed.contains(&host)
 }
 
-/// The router behind the Host check (see `allowed_hosts`).
 pub fn guarded(app: Router, allowed: Vec<String>) -> Router {
     let allowed = Arc::new(allowed);
     app.layer(axum::middleware::from_fn(move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -324,7 +323,6 @@ async fn recipients(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQu
     Ok(json_resp(json!({ "keys": keys.iter().map(|k| islandmail_core::b64u(k)).collect::<Vec<_>>(), "node_encryption_keys": node_keys }), 200))
 }
 
-/// Run `f` on the blocking pool (it touches the store).
 pub async fn blocking<T: Send + 'static>(node: &Arc<Node>, f: impl FnOnce(&Node) -> Result<T, ApiError> + Send + 'static)
                                         -> Result<T, ApiError> {
     let node = node.clone();

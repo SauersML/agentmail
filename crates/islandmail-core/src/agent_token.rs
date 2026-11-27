@@ -278,7 +278,6 @@ mod tests {
         for junk in ["", "v4.public.", "v4.public.AAAA", "v4.public.!!!", "aid1.x.y", &"v4.public.A".repeat(2000)] {
             assert!(verify(junk, &l, &node.public(), NOW).is_err(), "{junk:.40}");
         }
-        // Errors never echo the token.
         if let Err(e) = verify(&tampered, &l, &node.public(), NOW) {
             assert!(!e.to_string().contains(&tampered[10..40]));
         }

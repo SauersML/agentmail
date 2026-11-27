@@ -15,7 +15,6 @@ pub const MAX_PARENTS: usize = 16;
 /// nonce + tag + the largest padded body (512 KiB).
 pub const MAX_CIPHERTEXT: usize = 512 * 1024 + 40;
 pub const MAX_KEYS: usize = 1000;
-/// Attachments per message.
 pub const MAX_BLOBS: usize = 10;
 /// An envelope dated further than this past the receiver's clock is refused (peers fetch it again later).
 pub const FUTURE_SKEW_MS: i64 = 10 * 60 * 1000;
@@ -156,7 +155,6 @@ pub struct Envelope {
     /// that cannot read the body still replicate the blobs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blobs: Vec<String>,
-    /// The writing node's key.
     pub node: String,
     pub sig: String,
 }
@@ -197,7 +195,6 @@ impl Header {
     }
 }
 
-/// The encrypted part.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct Body {
     pub text: String,
@@ -236,7 +233,6 @@ fn outer_ad(v: u32, ts: &str, node: &str, blobs: &[String]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!([AD_CONTEXT, v, ts, node, blobs])).expect("json")
 }
 
-/// Most padded plaintext an envelope carries.
 pub const MAX_PADDED: usize = MAX_CIPHERTEXT - 40;
 
 impl Envelope {

@@ -868,7 +868,6 @@ mod tests {
         let flood: Vec<Value> = (0..8).map(|_| answer(&a, &d, "imr1junk")).collect();
         assert!(flood.iter().any(|v| v["error"].as_str().unwrap().contains("too many")));
         // Bogus attempts from many keys fill the overall limit, but a reply to an open invite still gets through
-        // (found by the fuzz/ protocol tests: 30 junk attempts a minute kept every invited node out).
         for _ in 0..8 {
             let d = fresh();
             for _ in 0..5 { answer(&a, &d, "imr1junk"); }

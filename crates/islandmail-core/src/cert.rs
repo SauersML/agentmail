@@ -88,7 +88,6 @@ pub struct Cert {
     pub v: u32,
     pub name: String,
     pub key: String,
-    /// The issuing node's key.
     pub node: String,
     pub issued: String,
     pub sig: String,

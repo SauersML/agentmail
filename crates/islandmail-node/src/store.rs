@@ -83,7 +83,6 @@ CREATE TRIGGER IF NOT EXISTS finish_blob AFTER INSERT ON blobs BEGIN
 END;
 ";
 
-/// The store format (SQLite `user_version`).
 const STORE_VERSION: i64 = islandmail_core::versions::STORE;
 
 /// What a reader sees of a row it may read; `text` is None only for rows this node cannot decrypt (never shown).
@@ -205,7 +204,6 @@ impl Row {
         m
     }
 
-    /// Whether this row mentions `name`.
     pub fn mentions_name(&self, name: &str) -> bool {
         self.mentions.as_deref().is_some_and(|m| m.contains(&format!(",{},", norm(name))))
     }
@@ -927,7 +925,6 @@ impl Store {
         Ok(rows)
     }
 
-    /// Move the viewer's read cursor of a room forward.
     pub fn mark_read(&self, viewer: &Caller, thread: &str, id: i64) -> Result<()> {
         let db = self.db.lock().unwrap();
         db.execute("INSERT INTO room_reads (viewer, thread, last_id) VALUES (?, ?, ?) ON CONFLICT(viewer, thread) \
@@ -1032,7 +1029,6 @@ impl Store {
         Ok(())
     }
 
-    /// Add names to a private row's readers.
     pub fn add_readers(&self, env_id: &str, names: &[String]) -> Result<()> {
         let db = self.db.lock().unwrap();
         let cur: Option<String> = db.query_row("SELECT readers FROM messages WHERE env_id = ?", [env_id], |r| r.get(0))

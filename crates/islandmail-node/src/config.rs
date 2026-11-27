@@ -67,7 +67,6 @@ impl Config {
         Self::parse_members(&raw)
     }
 
-    /// A trust file's bytes as a member list.
     pub fn parse_members(raw: &[u8]) -> Result<MemberList> {
         let list: MemberList = serde_json::from_slice(raw).context("member list is not valid")?;
         list.validate()?;

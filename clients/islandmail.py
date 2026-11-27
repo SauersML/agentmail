@@ -113,9 +113,6 @@ def agent_token(ident, node_key, ttl=REQUEST_TTL):
     return paseto_v4_public_sign(bytes.fromhex(ident["seed"]), msg, b"", AGENT_TOKEN_IMPLICIT)
 
 
-# ---- identities and tokens ----
-
-
 class Fail(Exception):
     pass
 
@@ -649,9 +646,6 @@ def reply_lines(m, quoted=3):
     return out + "".join("  | %s\n" % _one_line(l) for l in _BREAKS.split(q["text"])[:quoted])
 
 
-# ---- commands ----
-
-
 def cmd_selftoken(a):
     if not 1 <= a.ttl <= MAX_TTL:
         raise Fail("--ttl must be 1 to %d seconds" % MAX_TTL)
@@ -745,9 +739,6 @@ def send_note(reaches, to):
     if not reaches:
         return "; warning: no other trusted agent currently matches %s" % to
     return "; stored here for %s, copied to their nodes as they sync" % name_list(reaches)
-
-
-# ---- rooms ----
 
 
 def dm_id(a, b):

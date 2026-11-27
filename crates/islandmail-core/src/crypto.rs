@@ -57,7 +57,6 @@ pub fn identity_targets(keys: &[PublicKey]) -> Result<Vec<[u8; 32]>> {
     keys.iter().map(x25519_public).collect()
 }
 
-/// Slots for `n` recipients: the next power of two, at least MIN_SLOTS.
 pub fn slots_for(n: usize) -> usize {
     n.max(MIN_SLOTS).next_power_of_two()
 }

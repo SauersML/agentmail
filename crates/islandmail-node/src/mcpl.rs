@@ -572,7 +572,6 @@ impl Conn {
         self.mcpl && self.grant.as_ref().is_some_and(|g| ROOM_CAPS.iter().all(|c| capability_in(g, c)))
     }
 
-    /// The channel descriptor of a room (from `Node::rooms`).
     fn descriptor(r: &Value) -> Value {
         let id = r["id"].as_str().unwrap_or("");
         let kind = r["kind"].as_str().unwrap_or("open");

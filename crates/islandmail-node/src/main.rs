@@ -1,12 +1,4 @@
 //! Each host runs a direct peer and exposes a loopback API to its agents.
-//!
-//!   islandmail-node run CONFIG.json
-//!   islandmail-node keygen SEED_FILE                       (prints the public key; the seed stays in the file, mode 600)
-//!   islandmail-node pubkey SEED_FILE
-//!   islandmail-node network-id
-//!   islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]   (a single-use agent token from an islandmail.py identity)
-//!   islandmail-node invite-info INVITE                     (checks an invite and prints what it holds, as JSON)
-//!   islandmail-node revoke CONFIG.json NAME                (the running node revokes its certificates for NAME)
 
 mod api;
 mod config;
@@ -25,7 +17,6 @@ use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 use islandmail_core::keys::fmt_key;
 
-/// How often identities_dir is checked for added, removed or rewritten files.
 const IDENTITIES_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 const USAGE: &str = "usage:\n  islandmail-node run CONFIG.json\n  islandmail-node keygen SEED_FILE\n  islandmail-node pubkey SEED_FILE\n  \

@@ -15,7 +15,6 @@ use anyhow::{Context, Result};
 /// directory fsync; NTFS journals metadata).
 pub use imp::{check_file, check_writers, links, options, sync_dir};
 
-/// Make an open file owner-only.
 pub fn restrict_file(file: &File, path: &Path) -> Result<()> {
     imp::restrict_file(file, path).with_context(|| format!("restricting {} to its owner", path.display()))
 }

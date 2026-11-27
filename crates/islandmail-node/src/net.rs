@@ -28,10 +28,9 @@ pub const SYNC_ALPN: &[u8] = islandmail_core::versions::SYNC;
 /// The one protocol a key that is not on the trust file may use: present a reply to this node's invite (invite.rs).
 pub const JOIN_ALPN: &[u8] = b"islandmail/join/1";
 const MAX_GOSSIP: usize = 1 << 20;
-/// HyParView neighbour slots. iroh-gossip's default of 5 is below the node count of our networks (9 on the friends
-/// network), and every periodic join from a node outside a full view evicts a random neighbour, which rejoins and evicts
-/// another: neighbours flap several times a second. Above the node count every node is a neighbour of every other and
-/// none is evicted; larger networks keep HyParView's partial views. Local only: no message carries these sizes.
+/// HyParView neighbour slots. iroh-gossip's default of 5 is below our networks' node counts, and every periodic join
+/// from a node outside a full view evicts a random neighbour, which rejoins and evicts another: neighbours flap. Above
+/// the node count none is evicted; larger networks keep partial views. Local only: no message carries these sizes.
 const ACTIVE_VIEW: usize = 32;
 const PASSIVE_VIEW: usize = 64;
 const MAX_REQ: usize = 1 << 20;
@@ -141,7 +140,6 @@ struct JoinProto {
     slots: Arc<tokio::sync::Semaphore>,
 }
 
-/// Join connections served at once.
 const MAX_JOINS: usize = 16;
 
 impl JoinProto {
@@ -285,7 +283,6 @@ fn get_within(node: &Node, ids: &[String], budget: usize) -> Result<(Vec<String>
     Ok((out, ids.len()))
 }
 
-/// Connecting to a peer gives up after this long.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// A request gives up when the peer sends nothing for this long; a slow but moving transfer (a large attachment over
 /// a thin link) continues.
@@ -505,7 +502,6 @@ impl Ctx {
     }
 }
 
-/// How often the trust file is checked for changes.
 pub const TRUST_POLL: Duration = Duration::from_secs(1);
 
 /// Re-reads the trust file every TRUST_POLL and adopts a change (Node::reload_members wakes open sessions);
@@ -902,8 +898,7 @@ mod tests {
         let who = reader.verify(&tok).map_err(|e| anyhow::anyhow!(e.message))?;
         assert_eq!(reader.store.get(1, &who)?.unwrap().text.as_deref(), Some("relay delivery"));
         // Peers reach each other at the trust file's relay URL, so nothing here waits for iroh to pick a home relay:
-        // that needs a net report whose one HTTP latency probe (3 s budget) answered, and a miss is retried only 20-26 s
-        // later (iroh 1.4 socket.rs new_re_stun_timer), which is what made this test time out now and then on CI.
+        // that needs a net report whose one HTTP latency probe (3 s budget) answered, and a miss is retried only 20-26 s later.
         let remote = &net.endpoint;
         assert!(remote.addr().ip_addrs().next().is_none());
         let at_relay = EndpointAddr::new(remote.id()).with_relay_url(url.parse()?);

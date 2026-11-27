@@ -67,7 +67,6 @@ fn parse_rfc3339(s: &str) -> Option<i64> {
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
-/// Characters in a message's short id.
 pub const SHORT_ID: usize = 8;
 
 /// A message's shared id: its envelope hash (64 lowercase hex) in lowercase base32 (RFC 4648 alphabet, no padding),

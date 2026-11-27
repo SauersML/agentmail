@@ -16,7 +16,6 @@ pub struct Member {
     pub name: String,
     /// Durable principal id (the token's `sub`)
     pub sub: String,
-    /// The agent's public signing key.
     pub key: String,
 }
 
@@ -39,7 +38,6 @@ impl NodeEntry {
     }
 }
 
-/// Max namespace entries per node.
 pub const MAX_NAMES: usize = 64;
 
 /// An agent this host accepts: pinned in the trust file, or certified by a trusted node within its namespace.
@@ -55,12 +53,10 @@ pub struct Agent {
     pub pinned: bool,
 }
 
-/// The agents named `name`.
 pub fn named<'a>(agents: &'a [Agent], name: &'a str) -> impl Iterator<Item = &'a Agent> + 'a {
     agents.iter().filter(move |a| addr::same(&a.name, name))
 }
 
-/// The agent named `name` with this key.
 pub fn find<'a>(agents: &'a [Agent], name: &str, key: &PublicKey) -> Option<&'a Agent> {
     agents.iter().find(|a| addr::same(&a.name, name) && a.key == *key)
 }
