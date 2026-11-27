@@ -521,7 +521,7 @@ async fn room(State(s): State<AppState>, who: Caller, RawQuery(raw): RawQuery) -
     let senders = s.node.store.room_senders(id)?;
     let info = s.node.room_info(&who, id, &senders)?;
     if room_hidden(&info, &who) {
-        return Err(ApiError::new(404, format!("no room {id} here (private rooms are invite-only)")));
+        return Err(ApiError::new(404, s.node.room_absent(&who.name, id)));
     }
     Ok(json_resp(json!({ "room": info }), 200))
 }

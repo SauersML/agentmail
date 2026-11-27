@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from two_nodes import RESULTS, Node, check, free_port, run, work_directory  # noqa: E402
 
 EVENT = re.compile(r"gossip neighbor (up|down) (\S+)")
+# Neighbours coming and going are routine, so the node logs them at debug: turn that on for this test's nodes.
+os.environ.setdefault("ISLANDMAIL_NODE_LOG", "islandmail_node=info,islandmail_node::net=debug,iroh=warn,iroh_gossip=warn")
 
 
 def events(path):

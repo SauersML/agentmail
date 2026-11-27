@@ -160,6 +160,16 @@ def main():
         check("a member (not the creator) adds carol with full history", rc == 0 and "earlier messages" in out, out[-200:])
         got, t = wait_for(lambda: {"secret one", "secret two"} <= set(texts("dev.carol", "alice/plan")), timeout=25)
         check("the joiner reads the earlier history through the grant", got, "%.1fs" % t)
+        # Membership notices: out of read by default (--all shows them), one summary line in room read.
+        plain = js("alice", "read", "--thread", "alice/plan") or []
+        every = js("alice", "read", "--thread", "alice/plan", "--all") or []
+        check("read hides membership notices; read --all shows them", plain and not any(m.get("kind") == "event" for m in plain)
+              and any(m.get("kind") == "event" and "dev.carol" in m["text"] for m in every), json.dumps(every)[-300:])
+        rc, out = cl("alice", "room", "read", "alice/plan")
+        check("room read folds them into one membership line", rc == 0 and re.search(r"^membership: \d+ changes? here, latest \S+ ", out, re.M)
+              and " \u2014 " not in out, out[:400])
+        rc, out = cl("alice", "room", "read", "alice/plan", "--all")
+        check("room read --all lists them", rc == 0 and " \u2014 " in out and "added @dev.carol" in out and "membership:" not in out, out[:400])
         info = js("dev.carol", "room", "info", "alice/plan")
         check("room state: members, topic, creator", info and info["members"] == ["alice", "dev.carol", "ops.bob"]
               and info["topic"] == "ship it" and info["creator"] == "alice", json.dumps(info)[:240])

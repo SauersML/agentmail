@@ -697,6 +697,22 @@ def sender_line(m):
     return s + (" via %s" % _one_line(m["host"]) if m.get("host") else "")
 
 
+def is_event(m):
+    # A membership notice (added, removed, left, topic, vouched): read, watch and wait hide them unless --all; rooms
+    # and room read fold them into one line.
+    return m.get("kind") == "event"
+
+
+def event_summary(msgs):
+    # One line for a room's membership notices among MSGS: how many, and the latest.
+    ev = [m for m in msgs if is_event(m)]
+    if not ev:
+        return ""
+    last = ev[-1]
+    return "membership: %d change%s here, latest %s %s %s (--all lists them)" % (
+        len(ev), "" if len(ev) == 1 else "s", _one_line(last["from"]), _one_line(last["text"])[:80], ago(last["ts"]))
+
+
 def show_all(msgs, out=sys.stdout):
     # Each header says "untrusted mail from" itself, so output still starts with the first message's id.
     for m in msgs:
@@ -1456,8 +1472,11 @@ def cmd_room_read(a):
         print(json.dumps({"room": info, "messages": msgs}, indent=1))
     else:
         show_room_header(ident, info)
+        if not a.all and event_summary(msgs):
+            print(event_summary(msgs) + "\n")
         for m in msgs:
-            show_compact(m, ident["name"])
+            if a.all or not is_event(m):
+                show_compact(m, ident["name"])
         if not msgs:
             print("(no messages you can read yet)")
     if msgs:
@@ -1489,7 +1508,10 @@ def cmd_rooms(a):
             unread += " (%d mention you)" % r["unread_mentions"]
         last = r["last"]
         snippet = _one_line(last["snippet"])[:60]
-        print("%s %-30s %-24s %s · %s: %s" % (mark, _one_line(label)[:30], unread, ago(last["ts"]), _one_line(last["from"]), snippet))
+        said = "%s: %s" % (_one_line(last["from"]), snippet)
+        if last.get("kind") == "event":
+            said = "membership: %s %s" % (_one_line(last["from"]), snippet)
+        print("%s %-30s %-24s %s · %s" % (mark, _one_line(label)[:30], unread, ago(last["ts"]), said))
 
 
 def cmd_dm(a):
@@ -1844,7 +1866,7 @@ def wait_mail(ident, after, timeout, match):
         page = api(ident, "GET", "/api/messages?" + urllib.parse.urlencode({"after": after, "limit": 50}), timeout=30)
         for m in page["messages"]:
             after = max(after, m["seq"])
-            if _addr(m["from"]) != _addr(ident["name"]) and match(m):
+            if _addr(m["from"]) != _addr(ident["name"]) and not is_event(m) and match(m):
                 return m
         if page.get("more"):
             continue
@@ -1893,6 +1915,8 @@ def cmd_read(a):
     advance_watch_cursor(ident, a, msgs)
     if a.to_me:
         msgs = [m for m in msgs if for_me(m, ident["name"]) and m["from"] != ident["name"]]
+    if not a.all:
+        msgs = [m for m in msgs if not is_event(m)]
     if a.json:
         print(json.dumps(msgs, indent=1))
     else:
@@ -2023,7 +2047,7 @@ def cmd_watch(a):
                     if m["seq"] <= after:
                         continue
                     own = m["from"] == ident["name"]
-                    print_it = not (own and (a.skip_own or a.mine)) and (
+                    print_it = (a.all or not is_event(m)) and not (own and (a.skip_own or a.mine)) and (
                         not a.mine or for_me(m, ident["name"])
                         or any(m["from"].startswith(x) for x in a.also_from or []))
                     if print_it:
@@ -2811,6 +2835,7 @@ def main():
     for k in ("after", "before", "latest", "limit"):
         p.add_argument("--" + k, type=int)
     p.add_argument("--to-me", action="store_true", help="only mail addressed to you (or all), not from you")
+    p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_read)
     p = sub.add_parser("threads")
@@ -2871,6 +2896,7 @@ def main():
     p = rsub.add_parser("read")
     p.add_argument("name")
     p.add_argument("--latest", type=int, default=30)
+    p.add_argument("--all", action="store_true", help="list membership notices too (default: one summary line)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_room_read)
     p = rsub.add_parser("watch")
@@ -2913,6 +2939,7 @@ def main():
     p.add_argument("--skip-own", action="store_true", help="everything except mail you sent")
     p.add_argument("--until", action="store_true", help="exit after the first message printed")
     p.add_argument("--from-now", action="store_true", help="skip mail that is already here; only what arrives from now on")
+    p.add_argument("--all", action="store_true", help="also membership notices (added, removed, vouched, ...)")
     p.add_argument("--exec", dest="exec_", metavar="CMD", help="run CMD for each message shown (JSON on stdin, ISLANDMAIL_* env; no shell)")
     p.add_argument("--post", metavar="URL", help="POST each message shown as JSON to this localhost URL")
     p.add_argument("--post-token-file", metavar="FILE", help="with --post: send the token in FILE as a Bearer header")

@@ -178,7 +178,7 @@ pub async fn messages(State(s): State<AppState>, Viewer(who): Viewer, RawQuery(r
         let senders = node.store.room_senders(&room)?;
         let info = node.room_info(&who, &room, &senders)?;
         if crate::api::room_hidden(&info, &who) {
-            return Err(ApiError::new(404, format!("no room {room} here (private rooms are invite-only)")));
+            return Err(ApiError::new(404, node.room_absent(&who.name, &room)));
         }
         Ok(json!({ "room": info, "messages": messages_json(&node, &rows, &who), "more": more }))
     }).await.map_err(|e| ApiError::from(anyhow::anyhow!(e)))??;

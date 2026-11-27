@@ -140,7 +140,8 @@ def main():
         time.sleep(SYNC * 3)
         check("east has no room yet: its create event has no key for east", not usable("e.dave"), info("e.dave"))
         rc, out = cl("e.dave", "room", "send", room, "too early")
-        check("and dave cannot post there", rc != 0 and "no room" in out, out[-200:])
+        check("and dave cannot post there, told where the room will come from", rc != 0 and "no room" in out
+              and "room vouch " + room in out, out[-200:])
         rc, out = cl("alice", "room", "vouch", room)
         check("alice vouches again", rc == 0, out[-200:])
         got, t = wait_for(lambda: usable("e.dave"), timeout=60)

@@ -1437,8 +1437,9 @@ impl Node {
     pub fn room_plan(&self, room: &str, from: &str, event: Option<&islandmail_core::room::Event>, members: &MemberList,
                      agents: &[Agent]) -> Result<Plan, ApiError> {
         let state = self.room_state(room)?;
-        let (private, names) = islandmail_core::room::plan(room, state.as_ref(), from, event)
-            .map_err(|e| ApiError::new(if e.to_string().contains("no room") { 404 } else { 403 }, format!("{e}")))?;
+        let (private, names) = islandmail_core::room::plan(room, state.as_ref(), from, event).map_err(|e| {
+            if e.to_string().contains("no room") { ApiError::new(404, self.room_absent(from, room)) } else { ApiError::new(403, format!("{e}")) }
+        })?;
         // Members this host knows only through the creator's vouch: sealed to as well, in this room only.
         let vouched = self.room_vouched(room, members)?;
         if !private {
@@ -1589,6 +1590,35 @@ impl Node {
                             "members": senders, "participants": true, "member": senders.iter().any(|n| norm(n) == me),
                             "created": islandmail_core::room::creator_of(room).is_none() }),
         })
+    }
+
+    /// Why `name` cannot see room `id` here, in words that say where to look: a room whose membership events name it
+    /// but whose keys this host has not received yet (an open room's create is sealed to the hosts its creator trusted
+    /// then; a later add or vouch brings the keys), else a room unknown here (which a private room a non-member asks
+    /// about also is: it never learns that one exists).
+    pub fn room_absent(&self, name: &str, id: &str) -> String {
+        use islandmail_core::room::{creator_of, Event, Meta};
+        let me = norm(name);
+        let listed = self.store.room_events(id).unwrap_or_default().iter().any(|(_, _, _, raw)| {
+            match Meta::parse(raw).ok().and_then(|m| m.event) {
+                Some(Event::Create { members, .. }) | Some(Event::Add { members }) => members.iter().any(|m| norm(m) == me),
+                Some(Event::Vouch { members }) => members.iter().any(|v| norm(&v.name) == me),
+                _ => false,
+            }
+        });
+        let creator = creator_of(id).unwrap_or("its creator");
+        let unknown = format!(
+            "no room {id} on this host: check the id (islandmail rooms lists yours); private rooms are invite-only, and if \
+             {creator} added you, this host hasn't received it yet: it comes as the nodes sync, or ask {creator} to run: \
+             islandmail room vouch {id}");
+        match self.room_state(id).ok().flatten() {
+            // A private room says nothing to a non-member, not even that it exists (`api::room_hidden`).
+            Some(s) if s.created => unknown,
+            _ if listed => format!(
+                "{name} is a member of {id}, but this host hasn't received the room's keys yet; they come when {creator} \
+                 next adds someone or vouches (or ask {creator} to run: islandmail room vouch {id})"),
+            _ => unknown,
+        }
     }
 
     /// The caller's rooms, latest activity first, with unread counts.
@@ -1769,6 +1799,19 @@ mod tests {
         let row = node.store.get(reply.id, &viewer).unwrap().unwrap();
         assert_eq!(row.meta.as_deref(), Some(meta.as_str()));
         assert_eq!(node.reread_stored().unwrap(), (0, 0), "nothing left to read again");
+    }
+
+    #[test]
+    fn a_missing_room_says_why() {
+        let (node, alice, writer, list, _rx) = setup();
+        let unknown = node.room_absent("a.alice", "dana/x");
+        assert!(unknown.starts_with("no room dana/x on this host") && unknown.contains("room vouch dana/x"), "{unknown}");
+        // An add that names a.alice, readable here, while the room's create is not: listed, keys still to come.
+        let meta = r#"{"event":{"members":["a.alice"],"op":"add"},"room":"dana/x"}"#;
+        node.ingest(envelope_in(&writer, &list, &alice, "added @a.alice", now_ts(), meta, ("room:dana/x", "dana/x"))).unwrap();
+        let listed = node.room_absent("a.alice", "dana/x");
+        assert!(listed.starts_with("a.alice is a member of dana/x, but this host hasn't received the room's keys yet"), "{listed}");
+        assert!(node.room_absent("b.bob", "dana/x").starts_with("no room dana/x"), "a name the events do not list");
     }
 
     #[test]

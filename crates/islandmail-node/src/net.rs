@@ -847,10 +847,10 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                     }
                 }
                 Ok(Event::NeighborUp(peer)) => {
-                    tracing::info!("gossip neighbor up {}", peer.fmt_short());
+                    tracing::debug!("gossip neighbor up {}", peer.fmt_short());
                 }
-                Ok(Event::NeighborDown(peer)) => tracing::info!("gossip neighbor down {}", peer.fmt_short()),
-                Ok(Event::Lagged) => tracing::warn!("gossip receiver lagged; anti-entropy fills the gap"),
+                Ok(Event::NeighborDown(peer)) => tracing::debug!("gossip neighbor down {}", peer.fmt_short()),
+                Ok(Event::Lagged) => tracing::debug!("gossip receiver lagged; anti-entropy fills the gap"),
                 Ok(_) => {}
                 Err(e) => {
                     tracing::warn!("gossip receive error: {e}");
@@ -869,7 +869,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                 continue; // anti-entropy carries it
             }
             if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
-                tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
+                tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
             }
         }
     }));
@@ -894,7 +894,7 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
             match trust_out.recv().await {
                 Ok(msg) => {
                     if let Err(e) = c.sender.broadcast(Bytes::from(msg)).await {
-                        tracing::warn!("gossip broadcast failed (anti-entropy carries it): {e}");
+                        tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}

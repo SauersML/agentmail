@@ -130,7 +130,11 @@ async fn run(path: &Path) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "islandmail_node=info,iroh=warn,iroh_gossip=warn".into()),
+                // Routine on any network, so not warnings here (README "Logs"): gossip dials to peers that are offline,
+                // refused or failed handshakes from keys that are not members, relay throttling at start.
+                .unwrap_or_else(|_| "islandmail_node=info,iroh=warn,iroh_gossip=warn,iroh_gossip::net=error,\
+                                     iroh::protocol=error,iroh::socket::transports::relay::actor=error,\
+                                     iroh::socket::remote_map=error".into()),
         )
         .init();
     let open_files = raise_open_files();
