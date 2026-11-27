@@ -53,17 +53,11 @@ impl Config {
         }
         let mut c: Config = serde_json::from_value(v.into()).context("config is not valid")?;
         let base = path.parent().unwrap_or(Path::new("."));
-        let fix = |p: &mut PathBuf| {
-            if p.is_relative() {
-                *p = base.join(&*p);
-            }
-        };
+        let fix = |p: &mut PathBuf| if p.is_relative() { *p = base.join(&*p) };
         fix(&mut c.data_dir);
         fix(&mut c.node_key_file);
         fix(&mut c.members_file);
-        if let Some(d) = c.identities_dir.as_mut() {
-            fix(d);
-        }
+        if let Some(d) = c.identities_dir.as_mut() { fix(d) }
         Ok(c)
     }
 
@@ -80,52 +74,31 @@ impl Config {
         Ok(list)
     }
 
-    pub fn node_seed(&self) -> Result<Seed> {
-        read_or_create_seed(&self.node_key_file)
-    }
-
-    /// (name, sub, path, seed) of each local identity file. Files that do not parse, and files other users could read
-    /// (group or world bits set), are skipped with a warning.
-    pub fn identities(&self) -> Vec<(String, String, PathBuf, Seed)> {
+    /// (name, seed) of each identity file the node may hold: those whose sub is the one this host knows the name by
+    /// (its pin's, else agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known
+    /// here with another sub"), so it is refused here with a log line naming the file and the fix. Files that do not
+    /// parse, and files other users could read (group or world bits set), are skipped with a warning.
+    pub fn held(&self, members: &MemberList) -> Vec<(String, Seed)> {
         let Some(dir) = &self.identities_dir else { return vec![] };
         let Ok(rd) = std::fs::read_dir(dir) else { return vec![] };
+        let norm = islandmail_core::addr::norm;
         let mut out = Vec::new();
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = match read_private(&p) {
+        for path in rd.flatten().map(|e| e.path()) {
+            if path.extension().and_then(|x| x.to_str()) != Some("json") { continue; }
+            let raw = match read_private(&path) {
                 Ok(raw) => raw,
-                Err(e) => {
-                    tracing::warn!("skipping identity file: {e:#}");
-                    continue;
-                }
+                Err(e) => { tracing::warn!("skipping identity file: {e:#}"); continue; }
             };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
-            let (Some(name), Some(seed)) = (v["name"].as_str(), v["seed"].as_str()) else { continue };
-            if let Ok(s) = Seed::from_hex(seed) {
-                out.push((name.to_string(), v["sub"].as_str().unwrap_or("").to_string(), p.clone(), s));
-            }
-        }
-        out
-    }
-}
-
-impl Config {
-    /// The identity files the node may hold: those whose sub is the one this host knows the name by (its pin's, else
-    /// agent:NAME, what the node certifies). Any other would sign tokens the node then refuses ("known here with
-    /// another sub"), so it is refused here with a log line naming the file and the fix.
-    pub fn held(&self, members: &MemberList) -> Vec<(String, Seed)> {
-        self.identities().into_iter().filter_map(|(name, sub, path, seed)| {
-            let norm = islandmail_core::addr::norm;
-            let pin = members.members.iter().find(|m| norm(&m.name) == norm(&name));
-            let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(&name), |m| m.sub.clone());
-            if sub == want { return Some((name, seed)); }
+            let (Some(name), Some(Ok(seed))) = (v["name"].as_str(), v["seed"].as_str().map(Seed::from_hex)) else { continue };
+            let sub = v["sub"].as_str().unwrap_or("");
+            let pin = members.members.iter().find(|m| norm(&m.name) == norm(name));
+            let want = pin.map_or_else(|| islandmail_core::cert::agent_sub(name), |m| m.sub.clone());
+            if sub == want { out.push((name.to_string(), seed)); continue; }
             tracing::warn!("refusing identity file {}: its sub is {sub:?}, but {name}'s must be {want:?}; rewrite \"sub\" \
                             to {want:?} (the node re-reads identities_dir within seconds)", path.display());
-            None
-        }).collect()
+        }
+        out
     }
 
     /// Names, sizes and modification times in identities_dir: a change means the files need reading again.

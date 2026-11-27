@@ -13,7 +13,6 @@ mod config;
 mod encryption_keys;
 mod invite;
 mod mcpl;
-
 mod net;
 mod node;
 mod private_fs;
@@ -33,30 +32,18 @@ const USAGE: &str = "usage:\n  islandmail-node run CONFIG.json\n  islandmail-nod
      islandmail-node network-id\n  islandmail-node agent-token IDENTITY_FILE NODE_KEY [TTL_SECS]\n  islandmail-node revoke CONFIG.json NAME\n  islandmail-node invite-info INVITE\n  \
      islandmail-node --version";
 
-fn usage() -> ! {
-    eprintln!("{USAGE}");
-    std::process::exit(2)
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(|s| s.as_str()) {
-        Some("run") if args.len() == 2 => run(Path::new(&args[1])).await,
+    let out = match args.first().map(|s| s.as_str()) {
+        Some("run") if args.len() == 2 => return run(Path::new(&args[1])).await,
         Some("keygen") if args.len() == 2 => {
             let s = islandmail_core::keys::Seed::generate();
             config::write_seed(Path::new(&args[1]), &s)?;
-            println!("{}", fmt_key(&s.public()));
-            Ok(())
+            fmt_key(&s.public())
         }
-        Some("pubkey") if args.len() == 2 => {
-            println!("{}", fmt_key(&config::read_seed(Path::new(&args[1]))?.public()));
-            Ok(())
-        }
-        Some("network-id") if args.len() == 1 => {
-            println!("{}", islandmail_core::b64u(&islandmail_core::random_bytes::<32>()));
-            Ok(())
-        }
+        Some("pubkey") if args.len() == 2 => fmt_key(&config::read_seed(Path::new(&args[1]))?.public()),
+        Some("network-id") if args.len() == 1 => islandmail_core::b64u(&islandmail_core::random_bytes::<32>()),
         Some("agent-token") if args.len() == 3 || args.len() == 4 => {
             // An islandmail.py identity file ({name, sub, seed}); refused if other users could read it.
             let path = Path::new(&args[1]);
@@ -73,25 +60,19 @@ async fn main() -> Result<()> {
             if !(1..=islandmail_core::agent_token::MAX_LIFETIME_S).contains(&ttl) {
                 bail!("TTL_SECS must be 1 to {}", islandmail_core::agent_token::MAX_LIFETIME_S);
             }
-            println!("{}", islandmail_core::agent_token::mint(&seed, name, sub, &node, islandmail_core::now_millis(), ttl));
-            Ok(())
+            islandmail_core::agent_token::mint(&seed, name, sub, &node, islandmail_core::now_millis(), ttl)
         }
-        Some("invite-info") if args.len() == 2 => {
-            println!("{}", invite::info(&args[1]).map_err(anyhow::Error::msg)?);
-            Ok(())
+        Some("invite-info") if args.len() == 2 => invite::info(&args[1]).map_err(anyhow::Error::msg)?.to_string(),
+        Some("revoke") if args.len() == 3 => return revoke(Path::new(&args[1]), &args[2]),
+        Some("--version" | "-V" | "version") => format!("islandmail-node {}", env!("CARGO_PKG_VERSION")),
+        Some("--help" | "-h" | "help") => format!("islandmail-node {}: Islandmail node (see README.md)\n{USAGE}", env!("CARGO_PKG_VERSION")),
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2)
         }
-        Some("revoke") if args.len() == 3 => revoke(Path::new(&args[1]), &args[2]),
-
-        Some("--version" | "-V" | "version") => {
-            println!("islandmail-node {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        Some("--help" | "-h" | "help") => {
-            println!("islandmail-node {}: Islandmail node (see README.md)\n{USAGE}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
-        _ => usage(),
-    }
+    };
+    println!("{out}");
+    Ok(())
 }
 
 /// Asks the running node (whose key file this host owner can read) to revoke its certificates for `name`.
@@ -143,7 +124,7 @@ async fn run(path: &Path) -> Result<()> {
     private_fs::create_dir(&cfg.data_dir)?;
     anyhow::ensure!(cfg.data_dir.symlink_metadata()?.is_dir(), "data_dir must be a directory");
     private_fs::restrict_dir(&cfg.data_dir)?;
-    let seed = cfg.node_seed()?;
+    let seed = config::read_or_create_seed(&cfg.node_key_file)?;
     let members = cfg.members()?;
     if !members.is_node(&seed.public()) {
         bail!("this node's key {} is not on the member list; add it to this host's trust file", fmt_key(&seed.public()));

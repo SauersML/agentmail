@@ -189,10 +189,7 @@ pub async fn dial_join(node: &Node, to: &islandmail_core::NodeEntry, reply: &str
     let Ok(id) = parse_key(&to.key).map_err(|_| ()).and_then(|k| EndpointId::from_bytes(&k).map_err(|_| ())) else {
         return Outcome::Unreachable("invalid node key".into());
     };
-    let mut a = EndpointAddr::new(id);
-    for addr in to.addrs.iter().filter_map(|x| x.parse::<SocketAddr>().ok()) { a = a.with_ip_addr(addr); }
-    for url in &d.relays { a = a.with_relay_url(url.clone()); }
-    d.lookup.set_endpoint_info(a);
+    d.lookup.set_endpoint_info(addr_of(id, &to.addrs, &d.relays));
     let attempt = async {
         let conn = d.endpoint.connect(EndpointAddr::new(id), JOIN_ALPN).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -312,10 +309,6 @@ async fn call(conn: &Connection, network: &str, req: &Req) -> Result<Resp> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-async fn connect_sync(endpoint: &Endpoint, peer: EndpointId) -> Result<Connection> {
-    Ok(endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN).await?)
-}
-
 /// Kept alive for the node's lifetime (dropping the router stops accepting).
 #[allow(dead_code)]
 pub struct Net {
@@ -385,7 +378,6 @@ impl Ctx {
     }
 }
 
-
 /// The relays a node uses: its network's (trust file "relays"), then its own config "relay" ("n0" = iroh's public
 /// relays, only when the host opts in).
 pub fn relay_entries(list: &islandmail_core::MemberList, local: &[String]) -> Vec<String> {
@@ -396,30 +388,29 @@ pub fn relay_entries(list: &islandmail_core::MemberList, local: &[String]) -> Ve
 
 /// Other member nodes, with their listed addresses added to the address book.
 fn peers(node: &Node, lookup: &MemoryLookup, relays: &[RelayUrl]) -> Vec<EndpointId> {
-    {
-        let me = node.seed.public();
-        let members = node.members.read().unwrap().clone();
-        let mut out = Vec::new();
-        for n in &members.nodes {
-            let Ok(key) = parse_key(&n.key) else { continue };
-            if key == me {
-                continue;
-            }
-            let Ok(id) = EndpointId::from_bytes(&key) else { continue };
-            let mut a = EndpointAddr::new(id);
-            for addr in &n.addrs {
-                if let Ok(sa) = addr.parse::<SocketAddr>() {
-                    a = a.with_ip_addr(sa);
-                }
-            }
-            for url in relays {
-                a = a.with_relay_url(url.clone());
-            }
-            lookup.set_endpoint_info(a);
-            out.push(id);
-        }
-        out
-    }
+    let me = node.seed.public();
+    let members = node.members.read().unwrap().clone();
+    members.nodes.iter().filter_map(|n| {
+        let key = parse_key(&n.key).ok().filter(|k| *k != me)?;
+        let id = EndpointId::from_bytes(&key).ok()?;
+        lookup.set_endpoint_info(addr_of(id, &n.addrs, relays));
+        Some(id)
+    }).collect()
+}
+
+/// A node's dialing address: its listed socket addresses and the relays in use.
+fn addr_of(id: EndpointId, addrs: &[String], relays: &[RelayUrl]) -> EndpointAddr {
+    let mut a = EndpointAddr::new(id);
+    for sa in addrs.iter().filter_map(|x| x.parse::<SocketAddr>().ok()) { a = a.with_ip_addr(sa); }
+    for url in relays { a = a.with_relay_url(url.clone()); }
+    a
+}
+
+/// Stores `env` from `source` unless it was refused and nothing changed since; remembers a refusal.
+fn take(node: &Node, env: Envelope, source: &str) -> Option<Arc<crate::store::Row>> {
+    let id = env.id.clone();
+    if node.refused_now(&id) { return None; }
+    node.ingest(env).unwrap_or_else(|e| { node.note_refused(&id, source, &e); None })
 }
 
 impl Ctx {
@@ -440,11 +431,8 @@ impl Ctx {
     /// Pulls everything `peer` has that we lack. Returns how many envelopes were new here.
     async fn sync_with(&self, peer: EndpointId, blob_after: &mut String) -> Result<usize> {
         let node = &self.node;
-        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, connect_sync(&self.endpoint, peer))
-            .await.context("connect timed out")? {
-            Ok(c) => c,
-            Err(e) => return Err(e),
-        };
+        let conn = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(EndpointAddr::new(peer), SYNC_ALPN))
+            .await.context("connect timed out")??;
         let network = node.members.read().unwrap().network.clone();
         let trust = call(&conn, &network, &Req::Certs).await?;
         if let Some(record) = &trust.encryption_key {
@@ -472,6 +460,7 @@ impl Ctx {
         let mine = tokio::task::spawn_blocking(move || n2.store.day_hashes()).await??;
         let differ: Vec<String> = theirs.iter().filter(|(d, h)| mine.get(*d) != Some(*h)).map(|(d, _)| d.clone()).collect();
         let mut added = 0;
+        let source = format!("sync from {}", peer.fmt_short());
         for day in differ {
             let mut after = String::new();
             loop {
@@ -494,12 +483,7 @@ impl Ctx {
                     for raw in resp.envelopes {
                         let env: Envelope = serde_json::from_str(&raw)?;
                         anyhow::ensure!(rest[..taken].contains(&env.id), "unsolicited envelope");
-                        let id = env.id.clone();
-                        match node.ingest(env) {
-                            Ok(Some(_)) => added += 1,
-                            Ok(None) => {}
-                            Err(e) => node.note_refused(&id, &format!("sync from {}", peer.fmt_short()), &e),
-                        }
+                        added += take(node, env, &source).is_some() as usize;
                     }
                     rest = &rest[taken..];
                 }
@@ -677,19 +661,11 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
                         Ok(env) => env,
                         Err(e) => { tracing::debug!("gossip: not an envelope: {e}"); continue; }
                     };
-                    let id = env.id.clone();
-                    if c.node.refused_now(&id) { continue; }
-                    match c.node.ingest(env) {
-                        Ok(Some(r)) => {
-                            tracing::info!("gossip: stored #{} {}", r.id, &r.env_id[..12]);
-                        }
-                        Ok(None) => {}
-                        Err(e) => c.node.note_refused(&id, "gossip", &e),
+                    if let Some(r) = take(&c.node, env, "gossip") {
+                        tracing::info!("gossip: stored #{} {}", r.id, &r.env_id[..12]);
                     }
                 }
-                Ok(Event::NeighborUp(peer)) => {
-                    tracing::debug!("gossip neighbor up {}", peer.fmt_short());
-                }
+                Ok(Event::NeighborUp(peer)) => tracing::debug!("gossip neighbor up {}", peer.fmt_short()),
                 Ok(Event::NeighborDown(peer)) => tracing::debug!("gossip neighbor down {}", peer.fmt_short()),
                 Ok(Event::Lagged) => tracing::debug!("gossip receiver lagged; anti-entropy fills the gap"),
                 Ok(_) => {}
@@ -701,33 +677,25 @@ async fn start_with(builder: iroh::endpoint::Builder, cfg: &Config, node: Arc<No
         }
     }));
 
-    // Gossip out: every envelope this node writes, and member lists it adopts.
-    let c = ctx.clone();
-    tasks.push(tokio::spawn(async move {
-        while let Some(env) = outbound.recv().await {
-            let Ok(bytes) = serde_json::to_vec(&env) else { continue };
-            if bytes.len() > MAX_GOSSIP {
-                continue; // anti-entropy carries it
-            }
-            if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
-                tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
-            }
-        }
-    }));
-
-    // Certificates and revocations this node signs.
+    // Gossip out: every envelope this node writes, and the certificates and revocations it signs.
     let c = ctx.clone();
     let mut trust_out = node.trust_out.subscribe();
     tasks.push(tokio::spawn(async move {
         loop {
-            match trust_out.recv().await {
-                Ok(msg) => {
-                    if let Err(e) = c.sender.broadcast(Bytes::from(msg)).await {
-                        tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
-                    }
-                }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
+            let bytes = tokio::select! {
+                env = outbound.recv() => match env.map(|e| serde_json::to_vec(&e)) {
+                    None => break,
+                    Some(Ok(b)) if b.len() <= MAX_GOSSIP => b,
+                    Some(_) => continue, // anti-entropy carries it
+                },
+                msg = trust_out.recv() => match msg {
+                    Ok(m) => m.into_bytes(),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if let Err(e) = c.sender.broadcast(Bytes::from(bytes)).await {
+                tracing::debug!("gossip broadcast failed (anti-entropy carries it): {e}");
             }
         }
     }));

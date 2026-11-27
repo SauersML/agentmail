@@ -313,11 +313,10 @@ pub fn operator_statement(action: &str, node_key: &str, ts: &str, arg: &str) -> 
 }
 
 fn operator(node: &Node, body: &Value, action: &str, arg: &str) -> Result<(), ApiError> {
-    let f = |k: &str| body.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    let me = node.seed.public();
-    let ok = islandmail_core::parse_ts(f("ts")).is_some_and(|t| (t - now_millis()).abs() <= SKEW_MS)
-        && islandmail_core::keys::verify(&me, operator_statement(action, &fmt_key(&me), f("ts"), arg).as_bytes(),
-                                          &b64u_decode(f("sig")).unwrap_or_default());
+    let (me, ts) = (node.seed.public(), arg_str(body, "ts"));
+    let ok = islandmail_core::parse_ts(ts).is_some_and(|t| (t - now_millis()).abs() <= SKEW_MS)
+        && islandmail_core::keys::verify(&me, operator_statement(action, &fmt_key(&me), ts, arg).as_bytes(),
+                                          &b64u_decode(arg_str(body, "sig")).unwrap_or_default());
     if ok { Ok(()) } else {
         Err(ApiError::new(401, format!("{action} requests are signed by this node's key (islandmail.py {action} --config CONFIG)")))
     }
@@ -333,13 +332,7 @@ fn holder(list: &MemberList, name: &str, except: Option<&str>) -> Option<String>
 
 /// Whether two namespace entries can cover a common name (an exact name, or a prefix ending in '.').
 fn overlaps(a: &str, b: &str) -> bool {
-    let (a, b) = (islandmail_core::addr::norm(a), islandmail_core::addr::norm(b));
-    match (a.ends_with('.'), b.ends_with('.')) {
-        (false, false) => a == b,
-        (true, false) => b.starts_with(&a),
-        (false, true) => a.starts_with(&b),
-        (true, true) => a.starts_with(&b) || b.starts_with(&a),
-    }
+    cert::entry_covers(a, b) || cert::entry_covers(b, a) || islandmail_core::addr::norm(a) == islandmail_core::addr::norm(b)
 }
 
 /// An inviting node signs its own `names` into the invite. Trusting them as given would let it certify (impersonate,
@@ -357,19 +350,32 @@ fn claims_held(list: &MemberList, inviter: &NodeEntry) -> Option<String> {
     None
 }
 
+/// The invited names, unless the inviting node claims one of them itself, or one is held here by another node, or
+/// the inviting node claims a name held here.
+fn check_join(list: &MemberList, inv: &Invite, me: &str) -> Result<Vec<String>, ApiError> {
+    let names = split_names(&inv.name).map_err(|e| ApiError::new(400, e))?;
+    for n in &names {
+        if inv.node.covers(n) {
+            return Err(ApiError::new(409, format!("the inviting node claims {n} itself")));
+        }
+        if let Some(h) = holder(list, n, Some(me)) {
+            return Err(ApiError::new(409, format!("{n} is held here by {h}")));
+        }
+    }
+    match claims_held(list, &inv.node) {
+        Some(c) => Err(ApiError::new(409, format!("the inviting node claims a name held here: {c}"))),
+        None => Ok(names),
+    }
+}
+
 static EDIT: Mutex<()> = Mutex::new(());
 
 /// Edits the trust file on disk (the source of truth) and adopts the result: seq one above both the file and the
-/// list in use. `f` may refuse.
-fn edit_trust(node: &Node, f: impl FnOnce(&mut MemberList, &str) -> Result<(), ApiError>) -> Result<MemberList, ApiError> {
-    edit_trust_with(node, |list, me, _| f(list, me))
-}
-
-/// `edit_trust` with a store transaction for `f`'s own writes (an invite's spend), committed only once the edited
-/// trust file is valid and on disk: a refused edit spends nothing. A crash between the two leaves the trust file
+/// list in use. `f` may refuse. Its own store writes (an invite's spend) go in a transaction committed only once the
+/// edited trust file is valid and on disk: a refused edit spends nothing. A crash between the two leaves the trust file
 /// edited and the invite unspent, which the same node completes on its next try (its names are already its own, so
 /// no other node can use the invite).
-fn edit_trust_with(node: &Node, f: impl FnOnce(&mut MemberList, &str, &rusqlite::Transaction) -> Result<(), ApiError>)
+fn edit_trust(node: &Node, f: impl FnOnce(&mut MemberList, &str, &rusqlite::Transaction) -> Result<(), ApiError>)
     -> Result<MemberList, ApiError> {
     let _g = EDIT.lock().unwrap();
     let path = node.opts.members_file.as_deref().ok_or_else(|| ApiError::new(503, "this node has no trust file to edit"))?;
@@ -501,17 +507,7 @@ pub fn join_prepare(node: &Node, body: &Value) -> Result<JoinPlan, ApiError> {
         return Err(ApiError::new(409, format!("this invite is for another node key (starting {}), not this node's {me_key}",
                                                b64u(&inv.for_key.unwrap()))));
     }
-    for n in split_names(&inv.name).map_err(|e| ApiError::new(400, e))? {
-        if inv.node.covers(&n) {
-            return Err(ApiError::new(409, format!("the inviting node claims {n} itself")));
-        }
-        if let Some(h) = holder(&node.members.read().unwrap(), &n, Some(&me_key)) {
-            return Err(ApiError::new(409, format!("{n} is held here by {h}")));
-        }
-    }
-    if let Some(c) = claims_held(&node.members.read().unwrap(), &inv.node) {
-        return Err(ApiError::new(409, format!("the inviting node claims a name held here: {c}")));
-    }
+    check_join(&node.members.read().unwrap(), &inv, &me_key)?;
     let mut mine = own_entry(node)?;
     mine.name = inv.name.clone();
     let reply = encode_reply(&Reply { network, node: mine, name: inv.name.clone(), nonce: inv.nonce }, node);
@@ -529,20 +525,13 @@ pub fn join_finish(node: &Node, plan: JoinPlan, outcome: Outcome) -> Result<Valu
     let inv = plan.inv;
     let mut added_name = false;
     let mut suggested: Vec<String> = Vec::new();
-    let names = split_names(&inv.name).map_err(|e| ApiError::new(400, e))?;
-    let list = edit_trust(node, |list, me| {
+    let mut names = Vec::new();
+    let list = edit_trust(node, |list, me, _| {
         // A fresh host (this node alone on its trust file) takes the inviter's relays: it has no others and may need
         // them to reach the inviter. An existing host keeps its own: an inviter must not route all of its traffic
         // through relays of the inviter's choosing. Those it lacks are suggested.
         let fresh = list.nodes.iter().all(|n| n.key == me);
-        for n in &names {
-            if let Some(h) = holder(list, n, Some(me)) {
-                return Err(ApiError::new(409, format!("{n} is held here by {h}")));
-            }
-        }
-        if let Some(c) = claims_held(list, &inv.node) {
-            return Err(ApiError::new(409, format!("the inviting node claims a name held here: {c}")));
-        }
+        names = check_join(list, &inv, me)?;
         let mine = list.nodes.iter_mut().find(|n| n.key == me).expect("own entry");
         for n in &names {
             if !mine.covers(n) {
@@ -583,7 +572,7 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
     let nonce = b64u(&r.nonce);
     let name = r.name.clone();
     let mut row: Option<(String, String)> = None;
-    let list = edit_trust_with(node, |list, _, db| {
+    let list = edit_trust(node, |list, _, db| {
         type InviteRow = (String, String, String, i64, Option<String>, Option<String>);
         let got: Option<InviteRow> = db.query_row(
             "SELECT name, room, from_, exp, spent_by, for_key FROM join_invites WHERE nonce = ?", [&nonce],
@@ -621,7 +610,7 @@ fn admit(node: &Node, reply: &str, peer: Option<&str>) -> Result<Value, ApiError
         for n in &names {
             if !entry.names.iter().any(|e| e.eq_ignore_ascii_case(n)) { entry.names.push(n.clone()); }
         }
-        // Spent in the transaction that commits only with the trust file written (edit_trust_with).
+        // Spent in the transaction that commits only with the trust file written (edit_trust).
         let n = db.execute("UPDATE join_invites SET spent_by = ?, spent_ms = ? WHERE nonce = ? AND spent_by IS NULL",
                            rusqlite::params![r.node.key, now_millis(), nonce]).map_err(anyhow::Error::from)?;
         if n != 1 { return Err(ApiError::new(409, "this invite was already used")); }
@@ -730,12 +719,11 @@ pub fn complete_held(node: &Node) {
 /// then the creator's vouch, as `room_send` and the client do after an add. In an open CREATOR/NAME room the vouch
 /// carries on with the grant of its membership events (`Node::grant_open_events`); another member's add sends it here.
 fn add_as(node: &Node, who: &crate::node::Caller, room: &str, names: &[String]) -> Result<String, ApiError> {
-    let event = json!({ "op": "add", "members": names });
-    let ev: islandmail_core::room::Event = serde_json::from_value(event.clone()).map_err(|e| ApiError::new(400, format!("{e}")))?;
+    let ev = islandmail_core::room::Event::Add { members: names.to_vec() };
     let (members, agents) = (node.members.read().unwrap().clone(), node.agents());
     let plan = node.room_plan(room, &who.name, Some(&ev), &members, &agents)?;
     let text = format!("added {}", names.iter().map(|n| format!("@{n}")).collect::<Vec<_>>().join(", "));
-    node.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": event }))?;
+    node.post(who, &json!({ "to": plan.to, "thread": room, "text": text, "mode": plan.mode.as_str(), "room": room, "event": ev }))?;
     let mut note = String::new();
     if plan.mode == islandmail_core::Mode::Private {
         let keys = node.room_keys(who, room)?;
@@ -858,7 +846,7 @@ mod tests {
         raw[1 + 32 + 32 + 16 + 1] ^= 1;
         assert!(answer(&a, &d, &format!("imr1{}", b58(&raw)))["error"].as_str().unwrap().contains("signature"));
         // carol becomes ours before the join: refused.
-        edit_trust(&a, |list, me| { list.nodes.iter_mut().find(|n| n.key == me).unwrap().names.push("carol".into()); Ok(()) }).unwrap();
+        edit_trust(&a, |list, me, _| { list.nodes.iter_mut().find(|n| n.key == me).unwrap().names.push("carol".into()); Ok(()) }).unwrap();
         let d = fresh();
         assert!(answer(&a, &d, &reply_of(&d, &inv2, "carol"))["error"].as_str().unwrap().contains("already held"));
         // Key-bound: only that node may join, and the invite lasts a week (key-less: a day).
@@ -897,7 +885,7 @@ mod tests {
         // b is trusted here already, for as many names as a node may hold: one more makes the trust file invalid.
         let full: Vec<String> = (0..islandmail_core::members::MAX_NAMES).map(|i| format!("b{i}")).collect();
         let bkey = fmt_key(&b.seed.public());
-        edit_trust(&a, |list, _| {
+        edit_trust(&a, |list, _, _| {
             list.nodes.push(NodeEntry { name: "b".into(), key: bkey.clone(), addrs: vec![], names: full.clone() });
             Ok(())
         }).unwrap();
@@ -911,7 +899,7 @@ mod tests {
         assert_eq!(unspent(&a), 1, "the refused join left the invite unspent");
         assert_eq!(a.members.read().unwrap().seq, seq, "and the trust file as it was");
         // Room made: the same invite works.
-        edit_trust(&a, |list, _| { list.nodes.iter_mut().find(|n| n.key == bkey).unwrap().names.pop(); Ok(()) }).unwrap();
+        edit_trust(&a, |list, _, _| { list.nodes.iter_mut().find(|n| n.key == bkey).unwrap().names.pop(); Ok(()) }).unwrap();
         assert_eq!(answer(&a, &b, &r)["ok"], true);
         assert_eq!(unspent(&a), 0);
         assert!(a.members.read().unwrap().node_by_key(&b.seed.public()).unwrap().names.contains(&"bob".to_string()));
@@ -936,7 +924,7 @@ mod tests {
         // An existing host (it trusts another node already) keeps its relays; the inviter's are only suggested.
         let old = node_on([6u8; 32], &["carol"]);
         let other = islandmail_core::keys::Seed::generate();
-        edit_trust(&old, |list, _| {
+        edit_trust(&old, |list, _, _| {
             list.nodes.push(NodeEntry { name: "x".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec!["x".into()] });
             Ok(())
         }).unwrap();
@@ -952,7 +940,7 @@ mod tests {
         let a = node_on([5u8; 32], &["carol", "ops.x"]);
         let j = node_on([5u8; 32], &["carol"]);
         let other = islandmail_core::keys::Seed::generate();
-        edit_trust(&j, |list, _| {
+        edit_trust(&j, |list, _, _| {
             list.nodes.push(NodeEntry { name: "ops".into(), key: fmt_key(&other.public()), addrs: vec![], names: vec!["ops.".into()] });
             Ok(())
         }).unwrap();
