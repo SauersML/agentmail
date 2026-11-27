@@ -1,6 +1,6 @@
 # Fuzzing
 
-`fuzz/` is its own workspace (its own `Cargo.lock`), so the node's build never depends on it. `harness/` compiles
+`fuzz/` is its own workspace, so the node's build never depends on it (CI starts it from the root `Cargo.lock`). `harness/` compiles
 the `islandmail-node` modules as a library and holds a fixed world: seeds, a trust file, nodes on temporary stores.
 
 One target per parser of untrusted bytes:

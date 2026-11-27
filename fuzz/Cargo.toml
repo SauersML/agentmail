@@ -18,7 +18,7 @@ blake3 = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 
-# Separate from the main workspace: the fuzz crates build only here, with their own lock file.
+# Separate from the main workspace: the fuzz crates build only here (CI copies the root Cargo.lock in first).
 [workspace]
 members = [".", "harness"]
 

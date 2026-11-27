@@ -24,6 +24,7 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - run: cp Cargo.lock fuzz/
       - name: Fuzz each target for 5 minutes
         working-directory: fuzz
         env:

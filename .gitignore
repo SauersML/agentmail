@@ -5,3 +5,4 @@ dist/
 *.seed
 *.sqlite*
 /data/
+fuzz/Cargo.lock

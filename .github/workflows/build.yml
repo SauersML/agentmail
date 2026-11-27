@@ -64,25 +64,7 @@ jobs:
           "$host_python" -m venv "$RUNNER_TEMP/mail-test"
           if [ -d "$RUNNER_TEMP/mail-test/Scripts" ]; then py="$RUNNER_TEMP/mail-test/Scripts/python"; else py="$RUNNER_TEMP/mail-test/bin/python"; fi
           "$py" -m pip install -r clients/requirements.txt 'websockets>=12,<17'
-          "$py" tests/client_paseto.py
-          "$py" tests/client_show.py
-          "$py" tests/client_local.py
-          "$py" tests/client_reprove.py
-          node_bin="target/${{ matrix.target }}/release/islandmail-node$EXE"
-          "$py" tests/two_nodes.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/two-peers"
-          "$py" tests/phase2.py --bin "$node_bin" --repo . --workdir "$RUNNER_TEMP/three-peers"
-          "$py" tests/network.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certified"
-          "$py" tests/client_wake.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/wake"
-          "$py" tests/big_files.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/big-files"
-          "$py" tests/sync_peers.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/sync-peers"
-          "$py" tests/certify_held.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/certify-held"
-          "$py" tests/rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/rooms"
-          "$py" tests/invite.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/invite"
-          "$py" tests/hub_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/hub-rooms"
-          "$py" tests/late_rooms.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/late-rooms"
-          "$py" tests/privacy.py --bin "$node_bin" --islandmail clients/islandmail.py --workdir "$RUNNER_TEMP/privacy"
-          "$py" tests/api_guard.py --bin "$node_bin" --workdir "$RUNNER_TEMP/api-guard"
-          "$py" tests/gossip_churn.py --bin "$node_bin" --workdir "$RUNNER_TEMP/gossip-churn"
+          "$py" tests/run.py --bin "target/${{ matrix.target }}/release/islandmail-node$EXE"
       - name: Package
         run: |
           mkdir -p out
